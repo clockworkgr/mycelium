@@ -8,6 +8,7 @@ import '../screens/conversations_screen.dart';
 import '../screens/chat_screen.dart';
 import '../screens/contacts_screen.dart';
 import '../screens/debug_screen.dart';
+import '../screens/groups_screen.dart';
 import '../screens/settings_screen.dart';
 
 final _rootNavigatorKey = GlobalKey<NavigatorState>();
@@ -45,6 +46,12 @@ final appRouter = GoRouter(
         ]),
         StatefulShellBranch(routes: [
           GoRoute(
+            path: '/groups',
+            builder: (context, state) => const GroupsScreen(),
+          ),
+        ]),
+        StatefulShellBranch(routes: [
+          GoRoute(
             path: '/settings',
             builder: (context, state) => const SettingsScreen(),
           ),
@@ -72,6 +79,7 @@ class ScaffoldWithNav extends ConsumerWidget {
     final destinations = <NavigationDestination>[
       const NavigationDestination(icon: Icon(Icons.chat), label: 'Chats'),
       const NavigationDestination(icon: Icon(Icons.contacts), label: 'Contacts'),
+      const NavigationDestination(icon: Icon(Icons.group), label: 'Groups'),
       const NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
       if (devMode)
         const NavigationDestination(icon: Icon(Icons.bug_report), label: 'Debug'),
@@ -79,11 +87,12 @@ class ScaffoldWithNav extends ConsumerWidget {
 
     // If dev mode was turned off while on the debug tab, go back to settings
     final currentIndex = navigationShell.currentIndex;
-    final effectiveIndex = (!devMode && currentIndex >= 3) ? 2 : currentIndex;
+    final maxIndex = devMode ? 4 : 3;
+    final effectiveIndex = (currentIndex > maxIndex) ? 3 : currentIndex;
 
     if (effectiveIndex != currentIndex) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
-        navigationShell.goBranch(2);
+        navigationShell.goBranch(3);
       });
     }
 

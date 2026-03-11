@@ -99,6 +99,30 @@ pub struct ContactResponse {
     pub last_seen: Option<u64>,
 }
 
+// --- Groups ---
+
+#[derive(Debug, Serialize)]
+pub struct GroupSummary {
+    pub group_id: String,
+    pub member_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AddGroupMemberRequest {
+    pub node_id: String, // hex
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendGroupMessageRequest {
+    pub data: String,
+    pub content_type: Option<u8>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateGroupResponse {
+    pub group_id: String,
+}
+
 // --- Network / Diagnostics ---
 
 #[derive(Debug, Serialize)]

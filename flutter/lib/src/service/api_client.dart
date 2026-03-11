@@ -30,6 +30,57 @@ class ApiClient {
     return _decodeList(response);
   }
 
+  // --- Groups ---
+
+  Future<List<dynamic>> getGroups() async {
+    final response = await _client.get(Uri.parse('$_baseUrl/v1/groups'));
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> createGroup() async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/groups'),
+      headers: {'Content-Type': 'application/json'},
+    );
+    return _decodeCreated(response);
+  }
+
+  Future<List<dynamic>> getGroupMembers(String groupId) async {
+    final response =
+        await _client.get(Uri.parse('$_baseUrl/v1/groups/$groupId/members'));
+    return _decodeList(response);
+  }
+
+  Future<void> addGroupMember(String groupId, String nodeIdHex) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/groups/$groupId/members'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'node_id': nodeIdHex}),
+    );
+    if (response.statusCode != 201 && response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}: ${response.body}');
+    }
+  }
+
+  Future<void> removeGroupMember(String groupId, String memberIdHex) async {
+    final response = await _client.delete(
+      Uri.parse('$_baseUrl/v1/groups/$groupId/members/$memberIdHex'),
+    );
+    if (response.statusCode != 204 && response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}: ${response.body}');
+    }
+  }
+
+  Future<Map<String, dynamic>> sendGroupMessage(
+      String groupId, String text) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/groups/$groupId/messages'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'data': text, 'content_type': 0}),
+    );
+    return _decodeCreated(response);
+  }
+
   Map<String, dynamic> _decode(http.Response response) {
     if (response.statusCode != 200) {
       throw ApiException('HTTP ${response.statusCode}: ${response.body}');
@@ -42,6 +93,13 @@ class ApiClient {
       throw ApiException('HTTP ${response.statusCode}: ${response.body}');
     }
     return jsonDecode(response.body) as List<dynamic>;
+  }
+
+  Map<String, dynamic> _decodeCreated(http.Response response) {
+    if (response.statusCode != 201 && response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}: ${response.body}');
+    }
+    return jsonDecode(response.body) as Map<String, dynamic>;
   }
 
   void dispose() {

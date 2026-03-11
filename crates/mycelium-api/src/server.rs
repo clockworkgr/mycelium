@@ -12,7 +12,7 @@ use tracing::info;
 use mycelium_node::config::ApiConfig;
 use mycelium_node::node::Node;
 
-use crate::routes::{contacts, conversations, messages, network, node};
+use crate::routes::{contacts, conversations, groups, messages, network, node};
 use crate::state::AppState;
 use crate::ws;
 
@@ -34,6 +34,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/contacts", get(contacts::list_contacts))
         .route("/v1/contacts", post(contacts::add_contact))
         .route("/v1/contacts/{node_id}", delete(contacts::delete_contact))
+        // Groups
+        .route("/v1/groups", get(groups::list_groups).post(groups::create_group))
+        .route("/v1/groups/{group_id}/members", get(groups::list_members).post(groups::add_member))
+        .route("/v1/groups/{group_id}/members/{member_id}", delete(groups::remove_member))
+        .route("/v1/groups/{group_id}/messages", post(groups::send_group_message))
         // Network diagnostics
         .route("/v1/network/status", get(network::get_status))
         .route("/v1/network/routes", get(network::get_routes))

@@ -796,6 +796,7 @@ dependencies = [
  "mycelium-node",
  "mycelium-protocol",
  "mycelium-storage",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror",
