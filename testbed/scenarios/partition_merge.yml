@@ -1,0 +1,62 @@
+# Partition and merge scenario
+# Tests DTN store-and-forward delivery
+
+name: partition_merge
+description: "Two clusters of 5, separated, then connected. Verify DTN delivery after merge."
+
+nodes:
+  - id: nodeA1
+    type: phone
+  - id: nodeA2
+    type: phone
+  - id: nodeA3
+    type: phone
+  - id: nodeA4
+    type: phone
+  - id: nodeA5
+    type: supernode
+  - id: nodeB1
+    type: phone
+  - id: nodeB2
+    type: phone
+  - id: nodeB3
+    type: phone
+  - id: nodeB4
+    type: phone
+  - id: nodeB5
+    type: supernode
+
+links:
+  # Cluster A
+  - { from: nodeA1, to: nodeA2, latency_ms: 5 }
+  - { from: nodeA2, to: nodeA3, latency_ms: 5 }
+  - { from: nodeA3, to: nodeA4, latency_ms: 5 }
+  - { from: nodeA4, to: nodeA5, latency_ms: 5 }
+  # Cluster B
+  - { from: nodeB1, to: nodeB2, latency_ms: 5 }
+  - { from: nodeB2, to: nodeB3, latency_ms: 5 }
+  - { from: nodeB3, to: nodeB4, latency_ms: 5 }
+  - { from: nodeB4, to: nodeB5, latency_ms: 5 }
+
+steps:
+  - action: send_message
+    from: nodeA1
+    to: nodeB1
+    content: "Cross-partition message"
+    at: 0s
+
+  - action: wait
+    duration: 10s
+    expect:
+      message_status: dtn_pending
+
+  - action: add_link
+    from: nodeA5
+    to: nodeB5
+    latency_ms: 20
+    at: 10s
+
+  - action: wait
+    duration: 30s
+    expect:
+      message_status: delivered

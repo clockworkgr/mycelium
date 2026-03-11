@@ -1,0 +1,84 @@
+# Linear chain topology: 10 nodes in a line
+# Tests multi-hop AODV routing
+
+name: linear_chain
+description: "10 nodes in a linear chain, message from node 1 to node 10"
+
+nodes:
+  - id: node1
+    type: phone
+  - id: node2
+    type: phone
+  - id: node3
+    type: phone
+  - id: node4
+    type: phone
+  - id: node5
+    type: supernode
+  - id: node6
+    type: phone
+  - id: node7
+    type: phone
+  - id: node8
+    type: phone
+  - id: node9
+    type: phone
+  - id: node10
+    type: phone
+
+links:
+  - from: node1
+    to: node2
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node2
+    to: node3
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node3
+    to: node4
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node4
+    to: node5
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node5
+    to: node6
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node6
+    to: node7
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node7
+    to: node8
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node8
+    to: node9
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+  - from: node9
+    to: node10
+    latency_ms: 10
+    bandwidth_mbps: 50
+    loss_pct: 0
+
+test:
+  action: send_message
+  from: node1
+  to: node10
+  content: "Hello from the other end!"
+  expect:
+    delivered: true
+    max_latency_ms: 5000
+    routing: aodv

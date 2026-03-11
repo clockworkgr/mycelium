@@ -1,0 +1,62 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Editor
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+.idea/
+.vscode/
+
+# Databases (SQLCipher)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Secrets and keys
+.env
+.env.*
+*.key
+identity.key
+*.keystore
+*.jks
+
+# Auto-generated Cargo config (build-android.sh writes this)
+/.cargo/config.toml
+
+# Pre-built Android native libraries (built from source)
+/android-libs/
+
+# Legacy Android directory (Flutter android is at /flutter/android/)
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+
+# Claude AI project settings (contains local paths)
+/.claude/
+
+# Flutter
+/flutter/build/
+/flutter/.dart_tool/
+/flutter/.flutter-plugins
+/flutter/.flutter-plugins-dependencies
+/flutter/.pub-cache/
+/flutter/ephemeral/
+/flutter/ios/Flutter/ephemeral/
+/flutter/macos/Flutter/ephemeral/
+/flutter/android/local.properties
+/flutter/android/.gradle/
+/flutter/android/.kotlin/
+/flutter/android/app/build/
+/flutter/android/build/
+
+# Platform-specific generated files
+/flutter/ios/Pods/
+/flutter/macos/Pods/
+/flutter/linux/flutter/ephemeral/
+/flutter/windows/flutter/ephemeral/

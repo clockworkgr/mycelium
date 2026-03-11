@@ -1,0 +1,10 @@
+[package]
+name = "mycelium-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
