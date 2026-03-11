@@ -1,4 +1,5 @@
 pub mod ble;
+pub mod internet;
 pub mod mock;
 pub mod manager;
 pub mod wifi_direct;

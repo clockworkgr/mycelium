@@ -565,6 +565,7 @@ impl Node {
     /// Register transports based on config. Call before `start()`.
     pub async fn register_transports(&self) {
         use mycelium_core::transport::ble::BleTransport;
+        use mycelium_core::transport::internet::{InternetConfig, InternetTransport};
         use mycelium_core::transport::wifi_direct::WifiDirectTransport;
 
         if self.config.transports.ble {
@@ -579,7 +580,26 @@ impl Node {
             *self.wifi_transport.write().await = Some(wifi);
             info!("Registered Wi-Fi Direct transport");
         }
-        // Mock transport is only used in tests, not registered here
+        if self.config.transports.internet_tunnel {
+            let inet_cfg = &self.config.transports.internet;
+            let bootstrap: Vec<std::net::SocketAddr> = inet_cfg
+                .bootstrap_nodes
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            let internet = Arc::new(InternetTransport::new(
+                self.node_id,
+                InternetConfig {
+                    listen_addr: format!("0.0.0.0:{}", inet_cfg.listen_port)
+                        .parse()
+                        .unwrap(),
+                    bootstrap_nodes: bootstrap,
+                    max_connections: 64,
+                },
+            ));
+            self.transport_manager.add_transport(internet).await;
+            info!("Registered Internet transport on port {}", inet_cfg.listen_port);
+        }
     }
 
     /// Stop the node gracefully.

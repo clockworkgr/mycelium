@@ -54,6 +54,27 @@ pub struct TransportConfig {
     pub lora: bool,
     pub internet_tunnel: bool,
     pub mock: bool,
+    /// Internet transport settings (only used when internet_tunnel=true).
+    #[serde(default)]
+    pub internet: InternetTransportConfig,
+}
+
+/// Settings for the TCP-based internet overlay transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternetTransportConfig {
+    /// Port to listen on for incoming TCP connections.
+    pub listen_port: u16,
+    /// Bootstrap node addresses to connect to on startup.
+    pub bootstrap_nodes: Vec<String>,
+}
+
+impl Default for InternetTransportConfig {
+    fn default() -> Self {
+        Self {
+            listen_port: 9736,
+            bootstrap_nodes: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +97,7 @@ impl Default for NodeConfig {
                 lora: false,
                 internet_tunnel: false,
                 mock: true,
+                internet: InternetTransportConfig::default(),
             },
             dtn: DtnStorageConfig {
                 max_storage_mb: 256,
