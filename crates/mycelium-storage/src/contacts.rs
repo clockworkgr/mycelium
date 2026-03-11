@@ -56,6 +56,15 @@ impl Database {
             .map_err(|_| StorageError::NotFound)
     }
 
+    /// Delete a contact by node ID.
+    pub fn delete_contact(&self, node_id: &NodeId) -> Result<(), StorageError> {
+        self.conn().execute(
+            "DELETE FROM contacts WHERE node_id = ?1",
+            params![node_id.as_bytes().as_slice()],
+        )?;
+        Ok(())
+    }
+
     /// List all contacts.
     pub fn list_contacts(&self) -> Result<Vec<ContactRecord>, StorageError> {
         let conn = self.conn();

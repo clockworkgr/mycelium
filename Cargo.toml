@@ -6,6 +6,7 @@ members = [
     "crates/mycelium-core",
     "crates/mycelium-storage",
     "crates/mycelium-node",
+    "crates/mycelium-api",
     "crates/mycelium-ffi",
 ]
 
@@ -57,3 +58,4 @@ mycelium-crypto = { path = "crates/mycelium-crypto" }
 mycelium-core = { path = "crates/mycelium-core" }
 mycelium-storage = { path = "crates/mycelium-storage" }
 mycelium-node = { path = "crates/mycelium-node" }
+mycelium-api = { path = "crates/mycelium-api" }

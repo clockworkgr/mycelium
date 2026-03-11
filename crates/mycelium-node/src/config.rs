@@ -15,6 +15,30 @@ pub struct NodeConfig {
     pub dtn: DtnStorageConfig,
     /// Beacon interval in seconds.
     pub beacon_interval_secs: u64,
+    /// Local API server configuration.
+    #[serde(default)]
+    pub api: ApiConfig,
+}
+
+/// Local API server configuration (REST + WebSocket). See ADR-001.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Whether to start the API server.
+    pub enabled: bool,
+    /// Bind address (default: 127.0.0.1).
+    pub bind_address: String,
+    /// Port (default: 9735).
+    pub port: u16,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind_address: "127.0.0.1".to_string(),
+            port: 9735,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +84,7 @@ impl Default for NodeConfig {
                 spray_copies: 8,
             },
             beacon_interval_secs: 10,
+            api: ApiConfig::default(),
         }
     }
 }
@@ -89,7 +114,6 @@ impl NodeConfig {
                 ttl_hours: 72,
                 spray_copies: 8,
             },
-            beacon_interval_secs: 10,
             ..Default::default()
         }
     }

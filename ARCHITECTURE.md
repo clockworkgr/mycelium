@@ -17,15 +17,16 @@
 7. [mycelium-core](#7-mycelium-core)
 8. [mycelium-storage](#8-mycelium-storage)
 9. [mycelium-node](#9-mycelium-node)
-10. [mycelium-ffi](#10-mycelium-ffi)
-11. [Flutter App](#11-flutter-app)
-12. [Android BLE Stack](#12-android-ble-stack)
-13. [Build System](#13-build-system)
-14. [Wire Format Reference](#14-wire-format-reference)
-15. [Cryptographic Architecture](#15-cryptographic-architecture)
-16. [Routing Architecture](#16-routing-architecture)
-17. [Test Coverage](#17-test-coverage)
-18. [Spec Compliance Matrix](#18-spec-compliance-matrix)
+10. [mycelium-api](#10-mycelium-api)
+11. [mycelium-ffi](#11-mycelium-ffi)
+12. [Flutter App](#12-flutter-app)
+13. [Android BLE Stack](#13-android-ble-stack)
+14. [Build System](#14-build-system)
+15. [Wire Format Reference](#15-wire-format-reference)
+16. [Cryptographic Architecture](#16-cryptographic-architecture)
+17. [Routing Architecture](#17-routing-architecture)
+18. [Test Coverage](#18-test-coverage)
+19. [Spec Compliance Matrix](#19-spec-compliance-matrix)
 
 ---
 
@@ -115,6 +116,20 @@ mycelium/
 │   │   ├── src/rate_limiter.rs         # Trust-based rate limiting
 │   │   ├── src/battery.rs              # Battery management
 │   │   └── tests/                      # Integration tests (4 files)
+│   ├── mycelium-api/                   # Local REST + WebSocket API server
+│   │   ├── src/lib.rs                  # Public API
+│   │   ├── src/server.rs               # axum router + server startup
+│   │   ├── src/state.rs                # Shared AppState (Node + broadcast)
+│   │   ├── src/types.rs                # Request/response JSON types
+│   │   ├── src/ws.rs                   # WebSocket handler
+│   │   ├── src/util.rs                 # Parsing helpers
+│   │   ├── src/routes/                 # REST endpoint handlers
+│   │   │   ├── node.rs                 # /v1/node/*
+│   │   │   ├── messages.rs             # /v1/messages/*
+│   │   │   ├── conversations.rs        # /v1/conversations/*
+│   │   │   ├── contacts.rs             # /v1/contacts/*
+│   │   │   └── network.rs              # /v1/network/* (diagnostics)
+│   │   └── tests/api_test.rs           # Integration tests (11 tests)
 │   └── mycelium-ffi/                   # C FFI bindings
 │       ├── src/lib.rs                  # 48 extern "C" functions (~1500 lines)
 │       └── include/mycelium.h          # C header
@@ -169,8 +184,9 @@ mycelium-storage   (rusqlite[bundled-sqlcipher-vendored-openssl],
 mycelium-core      (tokio, async-trait)
        ↑
 mycelium-node      (tracing-subscriber, anyhow, toml)
-       ↑
-mycelium-ffi       (crate-type: cdylib + staticlib)
+       ↑            ↑
+mycelium-ffi       mycelium-api   (axum, tower-http, hex)
+(cdylib+staticlib)  (REST + WebSocket API server)
 ```
 
 All crates share workspace-level dependency versions. Key version constraints:
@@ -752,7 +768,67 @@ pub struct NodeConfig {
 
 ---
 
-## 10. mycelium-ffi
+## 10. mycelium-api
+
+**Purpose:** Local REST + WebSocket API server for interacting with a Mycelium node. Any app (including the Flutter chat app in the future) connects to this API instead of using direct FFI. See ADR-001.
+
+### Architecture
+
+```
+Client Apps ──▶ REST (axum)     ──▶ Node methods / Database queries
+             ──▶ WebSocket (axum) ──▶ Event broadcast + bidirectional messaging
+```
+
+### Technology Stack
+
+- **HTTP/WS server:** `axum` 0.8 with built-in WebSocket support
+- **Serialization:** `serde_json` (Phase 1). Protobuf via `prost` planned for Phase 2.
+- **CORS:** `tower-http` CorsLayer (permissive for localhost)
+- **Default bind:** `127.0.0.1:9735` (configured via `NodeConfig.api`)
+
+### REST Endpoints
+
+| Group | Endpoints | Description |
+|-------|-----------|-------------|
+| `/v1/node/` | `status`, `identity` | Node ID, uptime, public key |
+| `/v1/messages/` | CRUD + mark-read | Send messages, get conversation, delete |
+| `/v1/conversations/` | list, unread count | Conversation summaries with display names |
+| `/v1/contacts/` | CRUD | Add/list/delete contacts |
+| `/v1/network/` | status, routes, dtn | Diagnostics: AODV table, DTN queue, neighbor count |
+
+### WebSocket API
+
+Connect to `/v1/ws`. JSON-framed messages:
+
+**Client → Server:**
+- `subscribe` — Filter incoming messages by protocol IDs
+- `send` — Send data to a destination node
+
+**Server → Client:**
+- `message` — Incoming message (filtered by subscription)
+- `peer` — Neighbor discovered/lost events
+- `network` — Periodic network status
+- `receipt` — Delivery receipt status changes
+
+### Key Types
+
+- `AppState` — Shared state: `Arc<Node>` + `broadcast::Sender<WsServerMessage>` + start time
+- `WsServerMessage` — Enum of all server-pushed event types (Clone for broadcast)
+- `ApiConfig` — Bind address, port, enabled flag (in `NodeConfig`)
+
+### Integration Points
+
+- `Node.send_message()` — Called by message POST and WebSocket send
+- `Node.db.*` — Direct database queries for messages, contacts, conversations
+- `Node.routing.read().aodv().routes()` — AODV routing table inspection
+- `Node.routing.read().dtn().bundles()` — DTN bundle queue inspection
+- `Node.pending_messages_count()` / `Node.pending_routes_count()` — Pending queue sizes
+
+**Tests:** 11 integration tests covering all REST endpoints, error handling, contact CRUD, and 404s.
+
+---
+
+## 11. mycelium-ffi
 
 **Purpose:** C FFI bridge between Rust and mobile platforms. Exposes 48 `extern "C"` functions.
 
@@ -814,7 +890,7 @@ Defines:
 
 ---
 
-## 11. Flutter App
+## 12. Flutter App
 
 **Purpose:** Android mobile UI. Uses Flutter with Riverpod for state management, GoRouter for navigation, and dart:ffi for native library access.
 
@@ -881,7 +957,7 @@ mobile_scanner: ^6.0.2         # QR code scanning
 
 ---
 
-## 12. Android BLE Stack
+## 13. Android BLE Stack
 
 **Purpose:** Full dual-role BLE implementation (GATT server + client) in Kotlin. Handles peer discovery, data exchange, fragmentation, and identity mapping.
 
@@ -965,7 +1041,7 @@ private val writeQueue = ConcurrentLinkedQueue<WriteOperation>()
 
 ---
 
-## 13. Build System
+## 14. Build System
 
 ### Workspace Build
 
@@ -1009,7 +1085,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 14. Wire Format Reference
+## 15. Wire Format Reference
 
 ### Envelope Layout (106-byte header)
 
@@ -1047,7 +1123,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 15. Cryptographic Architecture
+## 16. Cryptographic Architecture
 
 ### Key Hierarchy
 
@@ -1090,7 +1166,7 @@ Group Messaging (Sender Keys):
 
 ---
 
-## 16. Routing Architecture
+## 17. Routing Architecture
 
 ### Decision Flow
 
@@ -1133,7 +1209,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 17. Test Coverage
+## 18. Test Coverage
 
 ### By Crate
 
@@ -1144,8 +1220,9 @@ BLE scan finds device with Mycelium service UUID
 | mycelium-core | 3 modules | ~20 | AODV routing, DTN spray/deliver/quota/eviction, transport mock/manager |
 | mycelium-storage | 2 modules | 5 | Message CRUD, mark-read/unread, conversation queries, vouch CRUD |
 | mycelium-node | 4 test files | ~40 | Lifecycle, 2-node exchange, multi-hop, DTN fallback, receipts, beacons, persistence (12), session/prekey roundtrips |
+| mycelium-api | 1 test file | 11 | REST endpoints, JSON responses, error handling, contact CRUD |
 | mycelium-ffi | — | 0 | No unit tests (integration via Flutter) |
-| **Total** | | **~133** | |
+| **Total** | | **~144** | |
 
 ### Integration Test Highlights
 
@@ -1157,7 +1234,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 18. Spec Compliance Matrix
+## 19. Spec Compliance Matrix
 
 | Spec Section | Feature | Status | Notes |
 |-------------|---------|--------|-------|

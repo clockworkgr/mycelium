@@ -43,7 +43,7 @@ make flutter-apk      # flutter build apk --debug
 
 ### Running Tests
 
-- `cargo test` runs all 133+ workspace tests
+- `cargo test` runs all 144+ workspace tests
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback tests)
 - Use `cargo test -p <crate>` to test a single crate
 - Use `RUST_LOG=debug cargo test` for tracing output
@@ -88,7 +88,7 @@ make flutter-apk      # flutter build apk --debug
 - Ed25519 signing keys + X25519 DH keys (converted via SHA-512 of seed)
 - X3DH KDF info string: `"MyceliumX3DH"`
 - Double Ratchet AEAD info string: `"MyceliumAEAD"`
-- 7 HKDF info strings for domain separation (see ARCHITECTURE.md section 15)
+- 7 HKDF info strings for domain separation (see ARCHITECTURE.md section 16)
 
 ### Database
 
@@ -126,15 +126,19 @@ mycelium-core (depends on protocol, crypto, storage)
 mycelium-storage (depends on protocol, crypto)
     ↓
 mycelium-node (depends on all above)
-    ↓
-mycelium-ffi (depends on all above)
+    ↓         ↓
+mycelium-ffi  mycelium-api (depends on all above; axum, tower-http, hex)
 ```
 
 ## Current State
 
-- 6 Rust crates with 133+ passing tests
+- 7 Rust crates with 144+ passing tests
+- `mycelium-api` crate: Local REST + WebSocket API server (axum, JSON, See ADR-001)
+  - REST: `/v1/node/*`, `/v1/messages/*`, `/v1/conversations/*`, `/v1/contacts/*`, `/v1/network/*`
+  - WebSocket: `/v1/ws` with event streaming and protocol subscriptions
+  - Default bind: `127.0.0.1:9735`
 - Flutter app with BLE transport working between 2 phones
 - AODV routing implemented but multi-hop untested with real devices
 - DTN spray-and-wait implemented with 72h TTL, L=8 spray copies
 - Delivery receipts implemented in Rust but not confirmed working end-to-end in Flutter
-- Next: WebSocket + REST API (see IMPLEMENTATION_SPEC.md Phase 1)
+- Next: Debug panel in Flutter, receipt fix (see IMPLEMENTATION_SPEC.md Phase 2+)

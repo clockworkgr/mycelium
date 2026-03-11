@@ -282,6 +282,16 @@ impl DtnEngine {
         self.bundles.get(message_id)
     }
 
+    /// Return all stored bundles (for diagnostics).
+    pub fn bundles(&self) -> &HashMap<MessageId, DtnBundle> {
+        &self.bundles
+    }
+
+    /// Get maximum storage capacity in bytes.
+    pub fn max_storage_bytes(&self) -> usize {
+        self.config.max_storage_bytes
+    }
+
     /// Evict oldest bundles to make room for `needed_bytes`.
     fn evict_if_needed(&mut self, needed_bytes: usize) -> Result<(), DtnError> {
         // First expire anything past TTL

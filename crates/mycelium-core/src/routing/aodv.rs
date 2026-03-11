@@ -392,6 +392,11 @@ impl AodvRouter {
         })
     }
 
+    /// Return all routes in the routing table (for diagnostics).
+    pub fn routes(&self) -> &HashMap<NodeId, RouteEntry> {
+        &self.routes
+    }
+
     fn cleanup_seen_rreqs(&mut self) {
         let cutoff = Instant::now() - self.rreq_dedup_window;
         self.seen_rreqs.retain(|r| r.received_at > cutoff);

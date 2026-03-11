@@ -2504,6 +2504,18 @@ impl Node {
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
+
+    /// Count of pending messages waiting for session establishment.
+    pub async fn pending_messages_count(&self) -> usize {
+        let pm = self.pending_messages.read().await;
+        pm.values().map(|v| v.len()).sum()
+    }
+
+    /// Count of pending route discoveries.
+    pub async fn pending_routes_count(&self) -> usize {
+        let pr = self.pending_routes.read().await;
+        pr.values().map(|v| v.len()).sum()
+    }
 }
 
 // --- Helpers ---

@@ -63,7 +63,7 @@ export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 ```bash
 make build          # Debug build
 make build-release  # Release build
-make test           # Run all 133 workspace tests
+make test           # Run all 144 workspace tests
 make lint           # cargo fmt --check + cargo clippy
 ```
 
@@ -166,6 +166,7 @@ mycelium/
 │   ├── mycelium-core/        # Transport trait, BLE/WiFi/Mock, AODV, DTN
 │   ├── mycelium-storage/     # SQLCipher database, CRUD operations
 │   ├── mycelium-node/        # Node daemon, event loop, message pipeline
+│   ├── mycelium-api/         # Local REST + WebSocket API server (See ADR-001)
 │   └── mycelium-ffi/         # C FFI bindings for mobile
 ├── flutter/                  # Flutter mobile app
 │   ├── lib/src/

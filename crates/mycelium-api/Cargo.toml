@@ -1,0 +1,25 @@
+[package]
+name = "mycelium-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mycelium-core = { workspace = true }
+mycelium-crypto = { workspace = true }
+mycelium-protocol = { workspace = true }
+mycelium-storage = { workspace = true }
+mycelium-node = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower-http = { version = "0.6", features = ["cors"] }
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tower = { version = "0.5", features = ["util"] }
+serde_json = { workspace = true }
