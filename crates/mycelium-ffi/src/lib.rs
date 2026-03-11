@@ -11,6 +11,8 @@ use std::os::raw::c_char;
 use std::sync::{Arc, OnceLock};
 
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
+use tracing::info;
 
 use mycelium_crypto::identity::Identity;
 use mycelium_node::config::NodeConfig;
@@ -85,7 +87,9 @@ pub extern "C" fn mycelium_clear_error() {
 
 /// Opaque handle to a MyceliumNode.
 pub struct MyceliumNode {
-    node: Node,
+    node: Arc<Node>,
+    /// Handle to the API server task (started with the node).
+    api_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 /// Data record returned to FFI callers.
@@ -183,27 +187,62 @@ pub unsafe extern "C" fn mycelium_node_new(
         Err(_) => return std::ptr::null_mut(),
     };
 
-    let node = Node::new(config, db, identity);
-    Box::into_raw(Box::new(MyceliumNode { node }))
+    let node = Arc::new(Node::new(config, db, identity));
+    Box::into_raw(Box::new(MyceliumNode {
+        node,
+        api_handle: std::sync::Mutex::new(None),
+    }))
 }
 
-/// Start the node.
+/// Start the node and the local API server.
 ///
 /// # Safety
 /// `handle` must be a valid pointer from `mycelium_node_new`.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_node_start(handle: *mut MyceliumNode) -> bool {
-    let node = &(*handle).node;
-    runtime().block_on(async { node.start().await.is_ok() })
+    let mycelium = &(*handle);
+    let node = &mycelium.node;
+    let started = runtime().block_on(async { node.start().await.is_ok() });
+
+    if started {
+        // Start the API server on localhost:9735
+        let api_config = &node.config.api;
+        if api_config.enabled {
+            let node_clone = Arc::clone(node);
+            let config = api_config.clone();
+            match runtime().block_on(mycelium_api::start_server(node_clone, &config)) {
+                Ok(api_task) => {
+                    info!("API server started on {}:{}", config.bind_address, config.port);
+                    if let Ok(mut guard) = mycelium.api_handle.lock() {
+                        *guard = Some(api_task);
+                    }
+                }
+                Err(e) => {
+                    info!("API server failed to start: {}", e);
+                }
+            }
+        }
+    }
+
+    started
 }
 
-/// Stop the node.
+/// Stop the node and API server.
 ///
 /// # Safety
 /// `handle` must be a valid pointer from `mycelium_node_new`.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_node_stop(handle: *mut MyceliumNode) {
-    let node = &(*handle).node;
+    let mycelium = &(*handle);
+
+    // Abort the API server
+    if let Ok(mut guard) = mycelium.api_handle.lock() {
+        if let Some(api_task) = guard.take() {
+            api_task.abort();
+        }
+    }
+
+    let node = &mycelium.node;
     runtime().block_on(async { node.stop().await });
 }
 

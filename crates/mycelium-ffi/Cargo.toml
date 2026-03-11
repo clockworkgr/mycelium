@@ -13,7 +13,9 @@ mycelium-crypto = { workspace = true }
 mycelium-protocol = { workspace = true }
 mycelium-storage = { workspace = true }
 mycelium-node = { workspace = true }
+mycelium-api = { workspace = true }
 rand = { workspace = true }
+tracing = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

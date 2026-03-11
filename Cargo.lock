@@ -843,6 +843,7 @@ dependencies = [
 name = "mycelium-ffi"
 version = "0.1.0"
 dependencies = [
+ "mycelium-api",
  "mycelium-core",
  "mycelium-crypto",
  "mycelium-node",
@@ -852,6 +853,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

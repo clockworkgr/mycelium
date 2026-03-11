@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../models/node_id.dart';
+import '../providers/developer_mode_provider.dart';
 import '../screens/conversations_screen.dart';
 import '../screens/chat_screen.dart';
 import '../screens/contacts_screen.dart';
+import '../screens/debug_screen.dart';
 import '../screens/settings_screen.dart';
 
 final _rootNavigatorKey = GlobalKey<NavigatorState>();
@@ -46,30 +49,52 @@ final appRouter = GoRouter(
             builder: (context, state) => const SettingsScreen(),
           ),
         ]),
+        StatefulShellBranch(routes: [
+          GoRoute(
+            path: '/debug',
+            builder: (context, state) => const DebugScreen(),
+          ),
+        ]),
       ],
     ),
   ],
 );
 
-class ScaffoldWithNav extends StatelessWidget {
+class ScaffoldWithNav extends ConsumerWidget {
   final StatefulNavigationShell navigationShell;
 
   const ScaffoldWithNav({super.key, required this.navigationShell});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final devMode = ref.watch(developerModeProvider);
+
+    final destinations = <NavigationDestination>[
+      const NavigationDestination(icon: Icon(Icons.chat), label: 'Chats'),
+      const NavigationDestination(icon: Icon(Icons.contacts), label: 'Contacts'),
+      const NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
+      if (devMode)
+        const NavigationDestination(icon: Icon(Icons.bug_report), label: 'Debug'),
+    ];
+
+    // If dev mode was turned off while on the debug tab, go back to settings
+    final currentIndex = navigationShell.currentIndex;
+    final effectiveIndex = (!devMode && currentIndex >= 3) ? 2 : currentIndex;
+
+    if (effectiveIndex != currentIndex) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        navigationShell.goBranch(2);
+      });
+    }
+
     return Scaffold(
       body: navigationShell,
       bottomNavigationBar: NavigationBar(
-        selectedIndex: navigationShell.currentIndex,
+        selectedIndex: effectiveIndex,
         onDestinationSelected: (index) {
           navigationShell.goBranch(index, initialLocation: index == navigationShell.currentIndex);
         },
-        destinations: const [
-          NavigationDestination(icon: Icon(Icons.chat), label: 'Chats'),
-          NavigationDestination(icon: Icon(Icons.contacts), label: 'Contacts'),
-          NavigationDestination(icon: Icon(Icons.settings), label: 'Settings'),
-        ],
+        destinations: destinations,
       ),
     );
   }

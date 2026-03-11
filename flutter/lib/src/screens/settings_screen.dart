@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
+import '../providers/developer_mode_provider.dart';
 import '../providers/network_status_provider.dart';
 import '../providers/service_provider.dart';
 import '../widgets/network_status_card.dart';
@@ -123,6 +124,19 @@ class SettingsScreen extends ConsumerWidget {
                 padding: const EdgeInsets.all(16),
                 child: Text('Network error: $err'),
               ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Developer mode toggle
+          Card(
+            child: SwitchListTile(
+              title: const Text('Developer Mode'),
+              subtitle: const Text('Show debug panel tab'),
+              secondary: const Icon(Icons.developer_mode),
+              value: ref.watch(developerModeProvider),
+              onChanged: (value) =>
+                  ref.read(developerModeProvider.notifier).state = value,
             ),
           ),
           const SizedBox(height: 16),
