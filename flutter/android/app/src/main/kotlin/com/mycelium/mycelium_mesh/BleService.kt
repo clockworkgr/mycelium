@@ -52,6 +52,13 @@ class BleService(private val context: Context) {
         // Connection retry settings
         const val MAX_CONNECT_RETRIES = 3
         const val BASE_RETRY_DELAY_MS = 1000L
+
+        // Scan cycling: Android kills LOW_LATENCY scans after ~30s.
+        // Restart periodically to stay under the limit.
+        const val SCAN_CYCLE_MS = 25_000L
+
+        // Auto-reconnect delay after a known peer disconnects
+        const val RECONNECT_DELAY_MS = 2000L
     }
 
     interface EventListener {
@@ -89,6 +96,9 @@ class BleService(private val context: Context) {
 
     // Per-device negotiated MTU (default 23)
     private val deviceMtus = ConcurrentHashMap<String, Int>()
+
+    // Addresses of known peers that disconnected — eligible for auto-reconnect
+    private val disconnectedPeers = ConcurrentHashMap<String, BluetoothDevice>()
 
     // Fragment reassembly: device address -> partial buffer
     private val reassemblyBuffers = ConcurrentHashMap<String, ByteArray>()
@@ -153,6 +163,7 @@ class BleService(private val context: Context) {
         connectRetryCounts.clear()
         pendingConnections.clear()
         deviceMtus.clear()
+        disconnectedPeers.clear()
 
         Log.i(TAG, "BLE service stopped")
     }
@@ -502,12 +513,19 @@ class BleService(private val context: Context) {
 
     // --- Central Role ---
 
+    private val scanCycleRunnable = Runnable { restartScan() }
+
     private fun startCentral() {
         scanner = bluetoothAdapter?.bluetoothLeScanner
         if (scanner == null) {
             Log.w(TAG, "BLE scanning not supported")
             return
         }
+        doStartScan()
+    }
+
+    private fun doStartScan() {
+        if (!running) return
 
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(SERVICE_UUID))
@@ -517,11 +535,50 @@ class BleService(private val context: Context) {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        scanner?.startScan(listOf(filter), settings, scanCallback)
-        Log.i(TAG, "BLE scanning started")
+        try {
+            scanner?.startScan(listOf(filter), settings, scanCallback)
+            Log.i(TAG, "BLE scanning started")
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to start scan: ${e.message}")
+        }
+
+        // Schedule scan restart before Android kills it (~30s limit)
+        handler.removeCallbacks(scanCycleRunnable)
+        handler.postDelayed(scanCycleRunnable, SCAN_CYCLE_MS)
+    }
+
+    private fun restartScan() {
+        if (!running) return
+        try {
+            scanner?.stopScan(scanCallback)
+        } catch (_: Exception) {}
+
+        // Brief pause then restart
+        handler.postDelayed({
+            if (running) {
+                doStartScan()
+                // Also retry any disconnected peers
+                retryDisconnectedPeers()
+            }
+        }, 500)
+    }
+
+    private fun retryDisconnectedPeers() {
+        val toRetry = ArrayList(disconnectedPeers.entries)
+        for ((address, device) in toRetry) {
+            if (connectedGatts.containsKey(address) || pendingConnections.containsKey(address)) {
+                disconnectedPeers.remove(address)
+                continue
+            }
+            Log.d(TAG, "Auto-reconnecting to previously known peer at $address")
+            disconnectedPeers.remove(address)
+            pendingConnections[address] = true
+            connectToDevice(device, 0)
+        }
     }
 
     private fun stopCentral() {
+        handler.removeCallbacks(scanCycleRunnable)
         try {
             scanner?.stopScan(scanCallback)
         } catch (e: Exception) {
@@ -694,7 +751,12 @@ class BleService(private val context: Context) {
         ) {
             if (characteristic.uuid == IDENTITY_UUID) {
                 Log.d(TAG, "Identity write completed: status=$status for ${gatt.device.address}")
-                // Don't interfere with write queue — this was a setup write
+                // Identity handshake done — NOW emit peerDiscovered so Rust
+                // can safely send data without conflicting with our setup writes.
+                val nodeId = peerNodeIds[gatt.device.address]
+                if (nodeId != null) {
+                    listener?.onPeerDiscovered(nodeId)
+                }
                 return
             }
             Log.d(TAG, "onCharacteristicWrite: status=$status for ${gatt.device.address}")
@@ -707,23 +769,14 @@ class BleService(private val context: Context) {
             descriptor: BluetoothGattDescriptor,
             status: Int
         ) {
-            if (descriptor.uuid == CCCD_UUID && status == BluetoothGatt.GATT_SUCCESS) {
-                // CCCD write completed → now write our node ID to the server's
-                // Identity characteristic so the server can map our address
-                val service = gatt.getService(SERVICE_UUID)
-                val identityChar = service?.getCharacteristic(IDENTITY_UUID)
-                if (identityChar != null) {
-                    Log.d(TAG, "Writing our node ID to server identity char at ${gatt.device.address}")
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        gatt.writeCharacteristic(
-                            identityChar, localNodeId,
-                            BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                        )
-                    } else {
-                        identityChar.value = localNodeId
-                        identityChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-                        gatt.writeCharacteristic(identityChar)
-                    }
+            if (descriptor.uuid == CCCD_UUID) {
+                if (status == BluetoothGatt.GATT_SUCCESS) {
+                    // CCCD write completed → now write our node ID to the server's
+                    // Identity characteristic so the server can map our address
+                    writeIdentityOrEmitDiscovered(gatt)
+                } else {
+                    Log.w(TAG, "CCCD write failed (status=$status), emitting peerDiscovered anyway")
+                    emitPeerDiscoveredForAddress(gatt.device.address)
                 }
             }
         }
@@ -755,6 +808,36 @@ class BleService(private val context: Context) {
         }
     }
 
+    @Suppress("DEPRECATION")
+    private fun writeIdentityOrEmitDiscovered(gatt: BluetoothGatt) {
+        val service = gatt.getService(SERVICE_UUID)
+        val identityChar = service?.getCharacteristic(IDENTITY_UUID)
+        if (identityChar != null) {
+            Log.d(TAG, "Writing our node ID to server identity char at ${gatt.device.address}")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(
+                    identityChar, localNodeId,
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                )
+            } else {
+                identityChar.value = localNodeId
+                identityChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                gatt.writeCharacteristic(identityChar)
+            }
+            // peerDiscovered will be emitted from onCharacteristicWrite
+        } else {
+            Log.w(TAG, "No identity characteristic, emitting peerDiscovered directly")
+            emitPeerDiscoveredForAddress(gatt.device.address)
+        }
+    }
+
+    private fun emitPeerDiscoveredForAddress(address: String) {
+        val nodeId = peerNodeIds[address]
+        if (nodeId != null) {
+            listener?.onPeerDiscovered(nodeId)
+        }
+    }
+
     private fun handleNodeIdRead(
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
@@ -781,7 +864,10 @@ class BleService(private val context: Context) {
             nodeIdToAddress[value.toHex()] = address
             Log.i(TAG, "Peer discovered: ${value.toHex().take(16)}... at $address")
 
-            // Subscribe to RX notifications
+            // Subscribe to RX notifications, then write identity, then emit peerDiscovered.
+            // peerDiscovered is deferred to onCharacteristicWrite (after identity write)
+            // to prevent a GATT write race condition where Rust tries to send data
+            // while the identity write is still in flight.
             val service = gatt.getService(SERVICE_UUID)
             val rxChar = service?.getCharacteristic(DATA_RX_UUID)
             if (rxChar != null) {
@@ -792,10 +878,14 @@ class BleService(private val context: Context) {
                     cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                     @Suppress("DEPRECATION")
                     gatt.writeDescriptor(cccd)
+                } else {
+                    // No CCCD → can't subscribe, but still try identity write
+                    writeIdentityOrEmitDiscovered(gatt)
                 }
+            } else {
+                // No RX characteristic → skip subscription, try identity write
+                writeIdentityOrEmitDiscovered(gatt)
             }
-
-            listener?.onPeerDiscovered(value)
         } else {
             Log.w(TAG, "Node ID read: unexpected size ${value.size} or wrong UUID")
         }
@@ -866,6 +956,21 @@ class BleService(private val context: Context) {
         nodeIdToAddress.remove(nodeId.toHex())
         Log.i(TAG, "Peer lost: ${nodeId.toHex().take(16)}...")
         listener?.onPeerLost(nodeId)
+
+        // Schedule auto-reconnect if we have a device reference
+        val device = bluetoothAdapter?.getRemoteDevice(address)
+        if (device != null && running) {
+            disconnectedPeers[address] = device
+            handler.postDelayed({
+                if (running && disconnectedPeers.containsKey(address) &&
+                    !connectedGatts.containsKey(address) && !pendingConnections.containsKey(address)) {
+                    Log.d(TAG, "Auto-reconnecting to lost peer at $address")
+                    disconnectedPeers.remove(address)
+                    pendingConnections[address] = true
+                    connectToDevice(device, 0)
+                }
+            }, RECONNECT_DELAY_MS)
+        }
     }
 }
 

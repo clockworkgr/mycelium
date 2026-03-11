@@ -182,10 +182,13 @@ impl DtnEngine {
                 continue;
             }
 
-            // Is the neighbor the destination?
+            // Is the neighbor the destination? Send the bundle directly to them.
             if bundle.destination == neighbor {
-                let bundle = bundle.clone();
-                actions.push(DtnAction::DeliverLocal { bundle });
+                let relay_bundle = bundle.clone();
+                actions.push(DtnAction::SendToPeer {
+                    peer: neighbor,
+                    bundle: relay_bundle,
+                });
                 continue;
             }
 
@@ -385,13 +388,19 @@ mod tests {
             .store_outgoing(msg_id, node(3), node(1), b"blob".to_vec())
             .unwrap();
 
-        // Encounter the actual destination
+        // Encounter the actual destination — should SendToPeer, not DeliverLocal
         let actions = engine.on_neighbor_encountered(node(3), &node(1));
-        let deliver_actions: Vec<_> = actions
+        let send_actions: Vec<_> = actions
             .iter()
-            .filter(|a| matches!(a, DtnAction::DeliverLocal { .. }))
+            .filter(|a| matches!(a, DtnAction::SendToPeer { .. }))
             .collect();
-        assert_eq!(deliver_actions.len(), 1);
+        assert_eq!(send_actions.len(), 1);
+
+        // Verify the bundle is sent to the destination peer
+        if let DtnAction::SendToPeer { peer, bundle } = &send_actions[0] {
+            assert_eq!(*peer, node(3));
+            assert_eq!(bundle.destination, node(3));
+        }
     }
 
     #[test]

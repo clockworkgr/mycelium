@@ -104,6 +104,9 @@ void mycelium_node_id(const MyceliumNode *handle, uint8_t out[32]);
 /** Free the node handle. Call exactly once. */
 void mycelium_node_free(MyceliumNode *handle);
 
+/** Get the existing node handle (if still alive). Returns NULL if none. */
+MyceliumNode *mycelium_node_get_existing(void);
+
 /* --- Messaging --- */
 
 /** Send a message. Returns 0 on success, fills out_message_id. */

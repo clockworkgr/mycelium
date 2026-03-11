@@ -34,6 +34,7 @@ class MyceliumService {
   BleManager? _bleManager;
   WsService? _wsService;
   NodeId? _cachedNodeId;
+  bool _reconnected = false;
 
   MyceliumService._();
 
@@ -79,7 +80,7 @@ class MyceliumService {
   /// Start the node event loop, daemon service, BLE, and WebSocket.
   Future<bool> start() async {
     // If reconnecting to existing daemon, just start WS + BLE
-    if (_handle == null && _cachedNodeId != null) {
+    if (_reconnected) {
       _startWebSocket();
       await _startBle();
       await _startDaemonService();
@@ -104,10 +105,34 @@ class MyceliumService {
       final identity = await _api.getNodeIdentity();
       final hex = identity['node_id'] as String;
       _cachedNodeId = NodeId.fromHex(hex);
-      debugPrint('Mycelium: Reconnected, node_id=$hex');
+      _reconnected = true;
+
+      // Recover FFI handle from the still-running native library
+      _recoverFfiHandle();
+
+      debugPrint('Mycelium: Reconnected, node_id=$hex, handle=${_handle != null ? "recovered" : "null"}');
     } catch (e) {
       debugPrint('Mycelium: Reconnect failed: $e');
       rethrow;
+    }
+  }
+
+  /// Try to recover the FFI node handle from the native library.
+  /// The Rust static ACTIVE_NODE holds the pointer even after Flutter restarts.
+  void _recoverFfiHandle() {
+    try {
+      final lib = defaultTargetPlatform == TargetPlatform.android
+          ? DynamicLibrary.open('libmycelium_ffi.so')
+          : DynamicLibrary.process();
+      final getExisting = lib.lookupFunction<
+          Pointer<ffi.MyceliumNode> Function(),
+          Pointer<ffi.MyceliumNode> Function()>('mycelium_node_get_existing');
+      final handle = getExisting();
+      if (handle != nullptr) {
+        _handle = handle;
+      }
+    } catch (e) {
+      debugPrint('Mycelium: Could not recover FFI handle: $e');
     }
   }
 
@@ -279,8 +304,11 @@ class MyceliumService {
     return NetworkStatus(
       neighborCount: (result['neighbor_count'] as num).toInt(),
       isConnected: result['is_connected'] as bool,
-      batteryLevel: (result['battery_level'] as num).toInt(),
       dtnQueueSize: (result['dtn_queue_size'] as num).toInt(),
+      dtnStorageUsed: (result['dtn_storage_used'] as num?)?.toInt() ?? 0,
+      dtnStorageMax: (result['dtn_storage_max'] as num?)?.toInt() ?? 0,
+      pendingMessages: (result['pending_messages'] as num?)?.toInt() ?? 0,
+      pendingRoutes: (result['pending_routes'] as num?)?.toInt() ?? 0,
     );
   }
 
@@ -294,6 +322,7 @@ class MyceliumService {
       _handle = null;
     }
     _cachedNodeId = null;
+    _reconnected = false;
     _instance = null;
   }
 

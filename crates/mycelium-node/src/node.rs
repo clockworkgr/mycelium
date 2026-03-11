@@ -1059,15 +1059,32 @@ impl Node {
                                 payload,
                             };
                             let data = envelope.serialize();
-                            let _ = transport_manager.send(&target, &data).await;
-                            // Update DB with new copies_remaining for our copy
-                            {
-                                let r = routing.read().await;
-                                if let Some(our) = r.dtn().get_bundle(&bundle.message_id) {
-                                    let _ = db.update_dtn_copies(&bundle.message_id, our.copies_remaining);
+                            match transport_manager.send(&target, &data).await {
+                                Ok(()) => {
+                                    if bundle.destination == target {
+                                        // Sent directly to the destination — delivery complete,
+                                        // remove bundle from both in-memory engine and DB.
+                                        {
+                                            let mut r = routing.write().await;
+                                            r.dtn_mut().remove_bundle(&bundle.message_id);
+                                        }
+                                        let _ = db.remove_dtn_bundle(&bundle.message_id);
+                                        debug!("DTN delivered bundle {} to destination {}", bundle.message_id, target);
+                                    } else {
+                                        // Sprayed to a relay — update copies_remaining
+                                        {
+                                            let r = routing.read().await;
+                                            if let Some(our) = r.dtn().get_bundle(&bundle.message_id) {
+                                                let _ = db.update_dtn_copies(&bundle.message_id, our.copies_remaining);
+                                            }
+                                        }
+                                        debug!("DTN spray: sent bundle {} to relay {}", bundle.message_id, target);
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!("DTN send to {} failed: {}, keeping bundle", target, e);
                                 }
                             }
-                            debug!("DTN spray: sent bundle {} to {}", bundle.message_id, target);
                         }
                         DtnAction::DeliverLocal { bundle } => {
                             debug!("DTN deliver local: bundle {}", bundle.message_id);
@@ -1142,33 +1159,9 @@ impl Node {
                 });
             }
             TransportEvent::DataReceived { peer, data, .. } => {
-                // Rate limit check with dynamic WoT trust distance
-                {
-                    let trust_hops = {
-                        let tg = trust_graph.read().await;
-                        let score = tg.trust_score(&local_id, peer);
-                        if score.value > 0.0 {
-                            score.hops
-                        } else {
-                            u8::MAX // No trust path → strictest rate limit
-                        }
-                    };
-                    let mut rl = rate_limiter.write().await;
-                    if rl.is_blacklisted(peer) {
-                        debug!("Dropping data from blacklisted peer {}", peer);
-                        return;
-                    }
-                    if !rl.check_message(peer, trust_hops) {
-                        if rl.record_violation(peer) {
-                            warn!("Auto-blacklisted peer {} after repeated rate violations", peer);
-                        } else {
-                            debug!("Rate limited peer {} (trust_hops={})", peer, trust_hops);
-                        }
-                        return;
-                    }
-                }
-
-                // Deserialize envelope
+                // Deserialize envelope first so we can exempt protocol messages
+                // from rate limiting (AODV, prekey, session init are required
+                // for establishing connectivity with new peers).
                 let envelope = match Envelope::deserialize(data) {
                     Ok(env) => env,
                     Err(e) => {
@@ -1181,6 +1174,13 @@ impl Node {
                 {
                     let mut clock = lamport_clock.write().await;
                     clock.merge(LamportClock(envelope.lamport_clock));
+                }
+
+                // Refresh the direct neighbor route on every received packet
+                // so the route stays alive as long as the BLE connection is active.
+                {
+                    let mut r = routing.write().await;
+                    r.aodv_mut().refresh_neighbor_route(*peer);
                 }
 
                 // If the envelope was forwarded (source != peer), learn a reverse
@@ -1215,6 +1215,46 @@ impl Node {
                 };
 
                 let body = &envelope.payload[1..];
+
+                // Exempt protocol messages (AODV, prekey, session init, DTN relay,
+                // beacon) from rate limiting — these are required for mesh
+                // infrastructure and establishing sessions with new peers.
+                let is_protocol_message = matches!(
+                    payload_type,
+                    WirePayloadType::AodvRreq
+                        | WirePayloadType::AodvRrep
+                        | WirePayloadType::AodvRerr
+                        | WirePayloadType::PrekeyRequest
+                        | WirePayloadType::PrekeyResponse
+                        | WirePayloadType::SessionInit
+                        | WirePayloadType::Beacon
+                        | WirePayloadType::DtnRelay
+                );
+
+                if !is_protocol_message {
+                    let trust_hops = {
+                        let tg = trust_graph.read().await;
+                        let score = tg.trust_score(&local_id, peer);
+                        if score.value > 0.0 {
+                            score.hops
+                        } else {
+                            u8::MAX
+                        }
+                    };
+                    let mut rl = rate_limiter.write().await;
+                    if rl.is_blacklisted(peer) {
+                        debug!("Dropping data from blacklisted peer {}", peer);
+                        return;
+                    }
+                    if !rl.check_message(peer, trust_hops) {
+                        if rl.record_violation(peer) {
+                            warn!("Auto-blacklisted peer {} after repeated rate violations", peer);
+                        } else {
+                            debug!("Rate limited peer {} (trust_hops={})", peer, trust_hops);
+                        }
+                        return;
+                    }
+                }
 
                 // For non-AODV messages not addressed to us, forward via routing
                 let is_aodv = matches!(
@@ -1360,11 +1400,14 @@ impl Node {
                             body,
                             routing,
                             session_manager,
+                            prekey_state,
                             rate_limiter,
                             trust_graph,
+                            transport_manager,
                             db,
                             local_id,
                             lamport_clock,
+                            event_tx,
                         )
                         .await;
                     }
@@ -2136,11 +2179,14 @@ impl Node {
         body: &[u8],
         routing: &RwLock<RoutingCoordinator>,
         session_manager: &RwLock<SessionManager>,
+        prekey_state: &RwLock<PrekeyState>,
         rate_limiter: &RwLock<RateLimiter>,
         trust_graph: &RwLock<TrustGraph>,
+        transport_manager: &TransportManager,
         db: &Database,
         local_id: NodeId,
         _lamport_clock: &RwLock<LamportClock>,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
     ) {
         let (msg_id, payload) = match wire::deserialize_dtn_relay(body) {
             Ok(v) => v,
@@ -2151,12 +2197,29 @@ impl Node {
         };
 
         if envelope.destination == local_id {
-            // We are the final destination — deliver locally
+            // We are the final destination — deliver locally.
+            // The payload is the original serialized Envelope; deserialize it
+            // to recover the inner encrypted payload and original metadata.
             debug!("DTN relay delivered locally: {}", msg_id);
 
-            // The payload is the encrypted blob; try to find the encrypted payload within
-            if !payload.is_empty() && payload[0] == WirePayloadType::EncryptedMessage as u8 {
-                let enc = match EncryptedPayload::deserialize_body(&payload[1..]) {
+            let inner_envelope = match Envelope::deserialize(&payload) {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!("DTN: failed to deserialize inner envelope: {}", e);
+                    return;
+                }
+            };
+
+            let inner = &inner_envelope.payload;
+            if inner.is_empty() {
+                return;
+            }
+
+            let payload_type = inner[0];
+            let inner_body = &inner[1..];
+
+            if payload_type == WirePayloadType::EncryptedMessage as u8 {
+                let enc = match EncryptedPayload::deserialize_body(inner_body) {
                     Ok(e) => e,
                     Err(_) => return,
                 };
@@ -2167,11 +2230,11 @@ impl Node {
                     message_number: enc.header.message_number,
                 };
 
-                let ad = build_ad(envelope.source, local_id);
+                let ad = build_ad(inner_envelope.source, local_id);
                 let plaintext = {
                     let mut sm = session_manager.write().await;
                     match sm.decrypt_from(
-                        &envelope.source,
+                        &inner_envelope.source,
                         &ratchet_header,
                         &enc.ciphertext,
                         &ad,
@@ -2185,20 +2248,36 @@ impl Node {
                 };
 
                 // Persist session after ratchet state advance
-                Self::persist_session(session_manager, db, &envelope.source).await;
+                Self::persist_session(session_manager, db, &inner_envelope.source).await;
 
                 let record = MessageRecord {
                     message_id: msg_id,
-                    source: envelope.source,
+                    source: inner_envelope.source,
                     destination: local_id,
                     content_type: content_type_from_byte(enc.content_type),
                     plaintext,
-                    lamport_clock: envelope.lamport_clock,
-                    device_timestamp: envelope.device_timestamp,
+                    lamport_clock: inner_envelope.lamport_clock,
+                    device_timestamp: inner_envelope.device_timestamp,
                     status: "received".to_string(),
                     is_incoming: true,
                 };
                 let _ = db.insert_message(&record);
+            } else if payload_type == WirePayloadType::SessionInit as u8 {
+                // DTN-delivered SessionInit: create session and decrypt first message
+                debug!("DTN: processing SessionInit from {}", inner_envelope.source);
+                Self::handle_session_init(
+                    &inner_envelope,
+                    inner_body,
+                    session_manager,
+                    prekey_state,
+                    transport_manager,
+                    routing,
+                    db,
+                    local_id,
+                    _lamport_clock,
+                    event_tx,
+                )
+                .await;
             }
         } else {
             // Check DTN relay quota before storing
@@ -2247,11 +2326,26 @@ impl Node {
         local_id: NodeId,
         _lamport_clock: &RwLock<LamportClock>,
     ) {
-        // Try to decrypt the bundle payload
-        if !bundle.payload.is_empty()
-            && bundle.payload[0] == WirePayloadType::EncryptedMessage as u8
-        {
-            let enc = match EncryptedPayload::deserialize_body(&bundle.payload[1..]) {
+        // The bundle payload is the full serialized Envelope; deserialize it
+        // to recover the inner encrypted payload and original metadata.
+        let inner_envelope = match Envelope::deserialize(&bundle.payload) {
+            Ok(e) => e,
+            Err(e) => {
+                debug!("DTN local delivery: failed to deserialize inner envelope: {}", e);
+                return;
+            }
+        };
+
+        let inner = &inner_envelope.payload;
+        if inner.is_empty() {
+            return;
+        }
+
+        let payload_type = inner[0];
+        let inner_body = &inner[1..];
+
+        if payload_type == WirePayloadType::EncryptedMessage as u8 {
+            let enc = match EncryptedPayload::deserialize_body(inner_body) {
                 Ok(e) => e,
                 Err(_) => return,
             };
@@ -2262,11 +2356,11 @@ impl Node {
                 message_number: enc.header.message_number,
             };
 
-            let ad = build_ad(bundle.source, local_id);
+            let ad = build_ad(inner_envelope.source, local_id);
             let plaintext = {
                 let mut sm = session_manager.write().await;
                 match sm.decrypt_from(
-                    &bundle.source,
+                    &inner_envelope.source,
                     &ratchet_header,
                     &enc.ciphertext,
                     &ad,
@@ -2280,16 +2374,16 @@ impl Node {
             };
 
             // Persist session after ratchet state advance
-            Self::persist_session(session_manager, db, &bundle.source).await;
+            Self::persist_session(session_manager, db, &inner_envelope.source).await;
 
             let record = MessageRecord {
                 message_id: bundle.message_id,
-                source: bundle.source,
+                source: inner_envelope.source,
                 destination: local_id,
                 content_type: content_type_from_byte(enc.content_type),
                 plaintext,
-                lamport_clock: 0,
-                device_timestamp: 0,
+                lamport_clock: inner_envelope.lamport_clock,
+                device_timestamp: inner_envelope.device_timestamp,
                 status: "received".to_string(),
                 is_incoming: true,
             };

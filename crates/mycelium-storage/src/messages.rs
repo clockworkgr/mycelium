@@ -82,7 +82,8 @@ impl Database {
         Ok(())
     }
 
-    /// Get conversation messages between two nodes, ordered by Lamport clock.
+    /// Get conversation messages between two nodes, returning the *latest* N
+    /// messages in chronological (oldest-first) order.
     pub fn get_conversation(
         &self,
         local_id: &NodeId,
@@ -94,10 +95,14 @@ impl Database {
         let mut stmt = conn.prepare(
             "SELECT message_id, source, destination, content_type, plaintext,
                     lamport_clock, device_timestamp, status, is_incoming
-             FROM messages
-             WHERE (source = ?1 AND destination = ?2) OR (source = ?2 AND destination = ?1)
-             ORDER BY lamport_clock ASC, device_timestamp ASC
-             LIMIT ?3 OFFSET ?4",
+             FROM (
+                SELECT *
+                FROM messages
+                WHERE (source = ?1 AND destination = ?2) OR (source = ?2 AND destination = ?1)
+                ORDER BY device_timestamp DESC, lamport_clock DESC
+                LIMIT ?3 OFFSET ?4
+             )
+             ORDER BY device_timestamp ASC, lamport_clock ASC",
         )?;
 
         let rows = stmt.query_map(
@@ -389,8 +394,8 @@ mod tests {
 
         let conversation = db.get_conversation(&alice, &bob, 100, 0).unwrap();
         assert_eq!(conversation.len(), 5);
-        // Should be ordered by lamport clock
-        assert_eq!(conversation[0].lamport_clock, 0);
+        // Should be ordered by device_timestamp ascending (oldest first)
+        assert_eq!(conversation[0].device_timestamp, 1000);
         assert_eq!(conversation[4].lamport_clock, 4);
     }
 }

@@ -32,7 +32,6 @@ class NetworkStatusNotifier extends AsyncNotifier<NetworkStatus> {
       return const NetworkStatus(
         neighborCount: 0,
         isConnected: false,
-        batteryLevel: 100,
         dtnQueueSize: 0,
       );
     }

@@ -50,6 +50,30 @@ impl TransportManager {
         transports.push(transport);
     }
 
+    /// Replace any existing transport of the same type (removing stale entries),
+    /// then register the new one. Used when the app restarts and needs a fresh
+    /// BLE transport while the old one's outbox is orphaned.
+    pub async fn replace_transport(&self, transport: Arc<dyn Transport>) {
+        let transport_type = transport.transport_type();
+
+        // Remove old transports of the same type
+        {
+            let mut transports = self.transports.write().await;
+            transports.retain(|t| t.transport_type() != transport_type);
+        }
+
+        // Clear stale peer entries for this transport type
+        {
+            let mut pt = self.peer_transports.write().await;
+            for infos in pt.values_mut() {
+                infos.retain(|i| i.transport_type != transport_type);
+            }
+            pt.retain(|_, infos| !infos.is_empty());
+        }
+
+        self.add_transport(transport).await;
+    }
+
     /// Start all transports and begin forwarding events.
     pub async fn start(&self) -> Result<(), TransportError> {
         let transports = self.transports.read().await;

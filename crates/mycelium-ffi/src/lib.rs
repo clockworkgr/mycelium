@@ -8,11 +8,13 @@
 use std::cell::RefCell;
 use std::ffi::CStr;
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::info;
+use std::sync::Once;
 
 use mycelium_crypto::identity::Identity;
 use mycelium_node::config::NodeConfig;
@@ -34,6 +36,11 @@ fn set_last_error(msg: impl Into<String>) {
 }
 
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static TRACING_INIT: Once = Once::new();
+
+/// Stores the active node pointer so the Dart layer can recover it
+/// after the Flutter engine restarts (process stayed alive via daemon service).
+static ACTIVE_NODE: AtomicPtr<MyceliumNode> = AtomicPtr::new(std::ptr::null_mut());
 
 fn runtime() -> &'static Runtime {
     RUNTIME.get_or_init(|| {
@@ -131,6 +138,22 @@ pub unsafe extern "C" fn mycelium_node_new(
     data_dir: *const c_char,
     display_name: *const c_char,
 ) -> *mut MyceliumNode {
+    // Initialize tracing → Android logcat (once)
+    TRACING_INIT.call_once(|| {
+        #[cfg(target_os = "android")]
+        {
+            use tracing_subscriber::layer::SubscriberExt;
+            if let Ok(layer) = tracing_android::layer("Mycelium") {
+                let subscriber = tracing_subscriber::registry().with(layer);
+                let _ = tracing::subscriber::set_global_default(subscriber);
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = tracing_subscriber::fmt::try_init();
+        }
+    });
+
     let data_dir = match CStr::from_ptr(data_dir).to_str() {
         Ok(s) => s.to_string(),
         Err(_) => {
@@ -188,10 +211,12 @@ pub unsafe extern "C" fn mycelium_node_new(
     };
 
     let node = Arc::new(Node::new(config, db, identity));
-    Box::into_raw(Box::new(MyceliumNode {
+    let ptr = Box::into_raw(Box::new(MyceliumNode {
         node,
         api_handle: std::sync::Mutex::new(None),
-    }))
+    }));
+    ACTIVE_NODE.store(ptr, Ordering::Release);
+    ptr
 }
 
 /// Start the node and the local API server.
@@ -263,8 +288,18 @@ pub unsafe extern "C" fn mycelium_node_id(handle: *const MyceliumNode, out: *mut
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_node_free(handle: *mut MyceliumNode) {
     if !handle.is_null() {
+        ACTIVE_NODE.store(std::ptr::null_mut(), Ordering::Release);
         drop(Box::from_raw(handle));
     }
+}
+
+/// Get the existing node handle (if the node is still alive in this process).
+///
+/// Returns NULL if no node has been created, or if it was freed.
+/// Used by the Dart layer to recover the handle after the Flutter engine restarts.
+#[no_mangle]
+pub extern "C" fn mycelium_node_get_existing() -> *mut MyceliumNode {
+    ACTIVE_NODE.load(Ordering::Acquire)
 }
 
 // --- Messaging API ---
@@ -945,7 +980,7 @@ pub unsafe extern "C" fn mycelium_register_ble_transport(handle: *mut MyceliumNo
     let node = &(*handle).node;
     let ble = Arc::new(mycelium_core::transport::ble::BleTransport::new(node.node_id));
     runtime().block_on(async {
-        node.transport_manager.add_transport(ble.clone()).await;
+        node.transport_manager.replace_transport(ble.clone()).await;
         *node.ble_transport.write().await = Some(ble);
     });
     0

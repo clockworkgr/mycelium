@@ -100,7 +100,7 @@ impl AodvRouter {
             sequence_number: 0,
             next_rreq_id: 0,
             seen_rreqs: Vec::new(),
-            route_lifetime: Duration::from_secs(30),
+            route_lifetime: Duration::from_secs(300),
             rreq_dedup_window: Duration::from_secs(10),
         }
     }
