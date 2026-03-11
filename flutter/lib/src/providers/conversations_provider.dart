@@ -18,9 +18,9 @@ class ConversationListNotifier
   Future<List<ConversationSummary>> build() async {
     ref.onDispose(() => _refreshTimer?.cancel());
 
-    // Auto-refresh every 2 seconds to pick up new messages
+    // Fallback poll — primary updates come via WebSocket events
     _refreshTimer = Timer.periodic(
-      const Duration(seconds: 2),
+      const Duration(seconds: 10),
       (_) => refresh(),
     );
 

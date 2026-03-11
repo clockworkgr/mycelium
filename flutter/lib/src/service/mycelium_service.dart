@@ -16,6 +16,7 @@ import '../models/enums.dart';
 import 'ble_manager.dart';
 import 'mycelium_exception.dart';
 import 'ffi_helpers.dart';
+import 'ws_service.dart';
 
 class MyceliumService {
   static MyceliumService? _instance;
@@ -24,6 +25,7 @@ class MyceliumService {
   final _messageController = StreamController<Message>.broadcast();
   int _lastKnownUnread = 0;
   BleManager? _bleManager;
+  WsService? _wsService;
 
   MyceliumService._();
 
@@ -53,15 +55,25 @@ class MyceliumService {
     }
   }
 
+  /// Access the WebSocket service (available after start).
+  WsService? get wsService => _wsService;
+
   /// Start the node event loop.
   Future<bool> start() async {
     _ensureHandle();
     final ok = bindings.mycelium_node_start(_handle!);
     if (ok) {
       _startPolling();
+      _startWebSocket();
       await _startBle();
     }
     return ok;
+  }
+
+  /// Connect WebSocket for real-time events.
+  void _startWebSocket() {
+    _wsService = WsService();
+    _wsService!.connect();
   }
 
   /// Register BLE transport and start the BLE manager.
@@ -80,6 +92,8 @@ class MyceliumService {
   /// Stop the node.
   Future<void> stop() async {
     _stopPolling();
+    _wsService?.dispose();
+    _wsService = null;
     await _bleManager?.stop();
     _bleManager = null;
     if (_handle != null) {
@@ -326,6 +340,8 @@ class MyceliumService {
   /// Dispose the service and free native resources.
   void dispose() {
     _stopPolling();
+    _wsService?.dispose();
+    _wsService = null;
     _messageController.close();
     if (_handle != null) {
       bindings.mycelium_node_free(_handle!);

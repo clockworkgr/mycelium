@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import 'src/providers/ws_events_provider.dart';
 import 'src/router/app_router.dart';
 import 'src/service/mycelium_service.dart';
 
@@ -35,11 +36,14 @@ Future<void> _requestPermissions() async {
   ].request();
 }
 
-class MyceliumApp extends StatelessWidget {
+class MyceliumApp extends ConsumerWidget {
   const MyceliumApp({super.key});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    // Activate the WebSocket event bridge for real-time updates
+    ref.watch(wsEventBridgeProvider);
+
     return MaterialApp.router(
       title: 'Mycelium Mesh',
       debugShowCheckedModeBanner: false,

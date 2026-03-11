@@ -19,8 +19,9 @@ class ChatMessagesNotifier
   Future<List<Message>> build(NodeId arg) async {
     ref.onDispose(() => _refreshTimer?.cancel());
 
+    // Fallback poll — primary updates come via WebSocket events
     _refreshTimer = Timer.periodic(
-      const Duration(seconds: 1),
+      const Duration(seconds: 5),
       (_) => refresh(),
     );
 

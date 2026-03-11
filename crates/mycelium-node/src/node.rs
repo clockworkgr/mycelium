@@ -34,6 +34,7 @@ use mycelium_storage::sessions::SessionRecord;
 
 use crate::battery::BatteryManager;
 use crate::config::NodeConfig;
+use crate::events::NodeEvent;
 use crate::rate_limiter::RateLimiter;
 
 /// Errors from high-level node operations.
@@ -101,6 +102,8 @@ pub struct Node {
     pub ble_transport: Arc<RwLock<Option<Arc<mycelium_core::transport::ble::BleTransport>>>>,
     /// Handle to Wi-Fi Direct transport for platform FFI callbacks.
     pub wifi_transport: Arc<RwLock<Option<Arc<mycelium_core::transport::wifi_direct::WifiDirectTransport>>>>,
+    /// Broadcast channel for node events (consumed by API server / WebSocket clients).
+    pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
 }
 
 impl Node {
@@ -128,6 +131,8 @@ impl Node {
             }
         }
 
+        let (event_tx, _) = tokio::sync::broadcast::channel(256);
+
         Self {
             identity,
             node_id,
@@ -148,6 +153,7 @@ impl Node {
             cancel: CancellationToken::new(),
             ble_transport: Arc::new(RwLock::new(None)),
             wifi_transport: Arc::new(RwLock::new(None)),
+            event_tx,
         }
     }
 
@@ -297,6 +303,7 @@ impl Node {
         let pending_messages = self.pending_messages.clone();
         let pending_routes = self.pending_routes.clone();
         let battery = self.battery.clone();
+        let event_tx = self.event_tx.clone();
         let cancel = self.cancel.clone();
         let node_id = self.node_id;
         let identity_bytes = self.identity.to_bytes();
@@ -331,6 +338,7 @@ impl Node {
                                     &pending_messages,
                                     &pending_routes,
                                     &battery,
+                                    &event_tx,
                                 ).await;
                             }
                             Err(e) => {
@@ -1000,6 +1008,7 @@ impl Node {
         pending_messages: &RwLock<HashMap<NodeId, Vec<PendingMessage>>>,
         pending_routes: &RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
         battery: &RwLock<BatteryManager>,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
     ) {
         match event {
             TransportEvent::NeighborDiscovered { peer, transport } => {
@@ -1074,6 +1083,11 @@ impl Node {
                         let _ = transport_manager.send(peer, &route.envelope_bytes).await;
                     }
                 }
+
+                let _ = event_tx.send(NodeEvent::PeerDiscovered {
+                    peer_id: *peer,
+                    transport: transport.to_string(),
+                });
             }
             TransportEvent::NeighborLost { peer, transport } => {
                 info!("Neighbor lost: {} via {}", peer, transport);
@@ -1101,6 +1115,11 @@ impl Node {
                         let _ = transport_manager.send(&p, &data).await;
                     }
                 }
+
+                let _ = event_tx.send(NodeEvent::PeerLost {
+                    peer_id: *peer,
+                    transport: transport.to_string(),
+                });
             }
             TransportEvent::DataReceived { peer, data, .. } => {
                 // Rate limit check with dynamic WoT trust distance
@@ -1268,6 +1287,7 @@ impl Node {
                             local_id,
                             lamport_clock,
                             battery,
+                            event_tx,
                         )
                         .await;
                     }
@@ -1282,6 +1302,7 @@ impl Node {
                             db,
                             local_id,
                             lamport_clock,
+                            event_tx,
                         )
                         .await;
                     }
@@ -1343,6 +1364,7 @@ impl Node {
                             body,
                             db,
                             local_id,
+                            event_tx,
                         );
                     }
                     WirePayloadType::GroupMessage => {
@@ -1631,6 +1653,7 @@ impl Node {
         local_id: NodeId,
         _lamport_clock: &RwLock<LamportClock>,
         battery: &RwLock<BatteryManager>,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
     ) {
         let is_for_us = envelope.destination == local_id;
 
@@ -1681,6 +1704,14 @@ impl Node {
                 "Received message {} from {}",
                 envelope.message_id, envelope.source
             );
+
+            let _ = event_tx.send(NodeEvent::MessageReceived {
+                source: envelope.source,
+                message_id: envelope.message_id,
+                data: record.plaintext.clone(),
+                content_type: enc.content_type,
+                timestamp: envelope.device_timestamp,
+            });
 
             // Send delivery receipt back to sender
             Self::send_delivery_receipt(
@@ -1746,6 +1777,7 @@ impl Node {
         db: &Database,
         local_id: NodeId,
         _lamport_clock: &RwLock<LamportClock>,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
     ) {
         if envelope.destination != local_id {
             debug!("SessionInit not for us, ignoring");
@@ -1836,6 +1868,14 @@ impl Node {
                 "Received first message {} via SessionInit from {}",
                 envelope.message_id, envelope.source
             );
+
+            let _ = event_tx.send(NodeEvent::MessageReceived {
+                source: envelope.source,
+                message_id: envelope.message_id,
+                data: record.plaintext.clone(),
+                content_type: enc.content_type,
+                timestamp: envelope.device_timestamp,
+            });
 
             // Send delivery receipt
             Self::send_delivery_receipt(
@@ -2442,6 +2482,7 @@ impl Node {
         body: &[u8],
         db: &Database,
         local_id: NodeId,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
     ) {
         if envelope.destination != local_id {
             info!("Receipt not for us (dest={}), ignoring", envelope.destination);
@@ -2462,10 +2503,16 @@ impl Node {
         };
 
         match db.update_message_status(&msg_id, new_status) {
-            Ok(()) => info!(
-                "Receipt: message {} marked as {} (from {})",
-                msg_id, new_status, envelope.source
-            ),
+            Ok(()) => {
+                info!(
+                    "Receipt: message {} marked as {} (from {})",
+                    msg_id, new_status, envelope.source
+                );
+                let _ = event_tx.send(NodeEvent::ReceiptUpdated {
+                    message_id: msg_id,
+                    status: new_status.to_string(),
+                });
+            }
             Err(e) => info!(
                 "Receipt: failed to update message {} to {}: {}",
                 msg_id, new_status, e

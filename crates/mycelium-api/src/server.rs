@@ -7,13 +7,15 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use mycelium_node::config::ApiConfig;
+use mycelium_node::events::NodeEvent;
 use mycelium_node::node::Node;
 
 use crate::routes::{contacts, conversations, groups, messages, network, node};
 use crate::state::AppState;
+use crate::types::WsServerMessage;
 use crate::ws;
 
 /// Build the axum Router with all API routes.
@@ -59,7 +61,30 @@ pub async fn start_server(
     node: Arc<Node>,
     config: &ApiConfig,
 ) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
-    let state = AppState::new(node);
+    let state = AppState::new(node.clone());
+
+    // Spawn bridge task: NodeEvent → WsServerMessage
+    let ws_tx = state.event_tx.clone();
+    let mut node_rx = node.event_tx.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match node_rx.recv().await {
+                Ok(event) => {
+                    if let Some(ws_msg) = convert_node_event(event) {
+                        let _ = ws_tx.send(ws_msg);
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("Event bridge lagged, dropped {} events", n);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    debug!("Node event channel closed, stopping bridge");
+                    break;
+                }
+            }
+        }
+    });
+
     let app = build_router(state);
 
     let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port)
@@ -76,4 +101,54 @@ pub async fn start_server(
     });
 
     Ok(handle)
+}
+
+/// Convert a NodeEvent into a WsServerMessage for WebSocket broadcast.
+fn convert_node_event(event: NodeEvent) -> Option<WsServerMessage> {
+    match event {
+        NodeEvent::MessageReceived {
+            source,
+            message_id,
+            data,
+            content_type,
+            timestamp,
+        } => {
+            let ct_str = match content_type {
+                0 => "text",
+                1 => "image",
+                2 => "file",
+                3 => "gps_pin",
+                4 => "voice_note",
+                _ => "unknown",
+            };
+            Some(WsServerMessage::IncomingMessage {
+                source: hex::encode(source.as_bytes()),
+                message_id: message_id.to_string(),
+                data: String::from_utf8_lossy(&data).to_string(),
+                protocol_id: "mycelium.chat.v1".to_string(),
+                content_type: ct_str.to_string(),
+                timestamp,
+            })
+        }
+        NodeEvent::ReceiptUpdated { message_id, status } => {
+            Some(WsServerMessage::DeliveryReceipt {
+                message_id: message_id.to_string(),
+                status,
+            })
+        }
+        NodeEvent::PeerDiscovered { peer_id, transport } => {
+            Some(WsServerMessage::PeerEvent {
+                event: "discovered".to_string(),
+                peer_id: hex::encode(peer_id.as_bytes()),
+                transport,
+            })
+        }
+        NodeEvent::PeerLost { peer_id, transport } => {
+            Some(WsServerMessage::PeerEvent {
+                event: "lost".to_string(),
+                peer_id: hex::encode(peer_id.as_bytes()),
+                transport,
+            })
+        }
+    }
 }

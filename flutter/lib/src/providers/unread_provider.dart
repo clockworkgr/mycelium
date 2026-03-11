@@ -16,8 +16,9 @@ class TotalUnreadNotifier extends AsyncNotifier<int> {
   Future<int> build() async {
     ref.onDispose(() => _refreshTimer?.cancel());
 
+    // Fallback poll — primary updates come via WebSocket events
     _refreshTimer = Timer.periodic(
-      const Duration(seconds: 2),
+      const Duration(seconds: 10),
       (_) => refresh(),
     );
 

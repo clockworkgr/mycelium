@@ -10,6 +10,7 @@ use mycelium_storage::db::Database;
 mod battery;
 mod beacon;
 mod config;
+mod events;
 mod node;
 mod rate_limiter;
 

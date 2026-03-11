@@ -17,8 +17,9 @@ class NetworkStatusNotifier extends AsyncNotifier<NetworkStatus> {
   Future<NetworkStatus> build() async {
     ref.onDispose(() => _refreshTimer?.cancel());
 
+    // Fallback poll — primary updates come via WebSocket events
     _refreshTimer = Timer.periodic(
-      const Duration(seconds: 5),
+      const Duration(seconds: 15),
       (_) => refresh(),
     );
 
