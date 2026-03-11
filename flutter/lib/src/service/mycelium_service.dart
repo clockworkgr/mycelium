@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:ffi';
-import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 
 import '../ffi/mycelium_bindings_generated.dart' as ffi;
 import '../ffi/native_library.dart';
@@ -13,19 +13,27 @@ import '../models/conversation_summary.dart';
 import '../models/contact.dart';
 import '../models/network_status.dart';
 import '../models/enums.dart';
+import 'api_client.dart';
 import 'ble_manager.dart';
-import 'mycelium_exception.dart';
 import 'ffi_helpers.dart';
+import 'mycelium_exception.dart';
 import 'ws_service.dart';
 
+/// Platform channel for daemon lifecycle management.
+const _daemonChannel = MethodChannel('com.mycelium.daemon');
+
+/// Mycelium service — manages node lifecycle and provides data via REST API.
+///
+/// After Phase 8, data operations go through the REST API (ApiClient),
+/// while node init/start/stop and BLE bridging still use FFI.
+/// This allows the app to reconnect to a running daemon after being killed.
 class MyceliumService {
   static MyceliumService? _instance;
   Pointer<ffi.MyceliumNode>? _handle;
-  Timer? _pollTimer;
-  final _messageController = StreamController<Message>.broadcast();
-  int _lastKnownUnread = 0;
+  final ApiClient _api = ApiClient();
   BleManager? _bleManager;
   WsService? _wsService;
+  NodeId? _cachedNodeId;
 
   MyceliumService._();
 
@@ -33,12 +41,25 @@ class MyceliumService {
     return _instance ??= MyceliumService._();
   }
 
-  Stream<Message> get incomingMessages => _messageController.stream;
+  bool get isInitialized => _handle != null || _cachedNodeId != null;
 
-  bool get isInitialized => _handle != null;
+  /// Access the REST API client.
+  ApiClient get api => _api;
 
-  /// Initialize the node with a data directory and display name.
+  /// Access the WebSocket service (available after start).
+  WsService? get wsService => _wsService;
+
+  /// Initialize the node. If the daemon is already running (API reachable),
+  /// reconnect without creating a new node.
   Future<void> initialize(String dataDir, String displayName) async {
+    // Check if the API server is already running (daemon survived app kill)
+    if (await _api.isAvailable()) {
+      debugPrint('Mycelium: API server already running, reconnecting');
+      await _reconnect();
+      return;
+    }
+
+    // Fresh start: create node via FFI
     if (_handle != null) return;
 
     final dataDirNative = toNativeString(dataDir);
@@ -55,43 +76,69 @@ class MyceliumService {
     }
   }
 
-  /// Access the WebSocket service (available after start).
-  WsService? get wsService => _wsService;
-
-  /// Start the node event loop.
+  /// Start the node event loop, daemon service, BLE, and WebSocket.
   Future<bool> start() async {
+    // If reconnecting to existing daemon, just start WS + BLE
+    if (_handle == null && _cachedNodeId != null) {
+      _startWebSocket();
+      await _startBle();
+      await _startDaemonService();
+      return true;
+    }
+
     _ensureHandle();
     final ok = bindings.mycelium_node_start(_handle!);
     if (ok) {
-      _startPolling();
+      // Cache the node ID from FFI
+      _cachedNodeId = _getNodeIdFromFfi();
       _startWebSocket();
       await _startBle();
+      await _startDaemonService();
     }
     return ok;
   }
 
-  /// Connect WebSocket for real-time events.
+  /// Reconnect to an already-running daemon (API server responding).
+  Future<void> _reconnect() async {
+    try {
+      final identity = await _api.getNodeIdentity();
+      final hex = identity['node_id'] as String;
+      _cachedNodeId = NodeId.fromHex(hex);
+      debugPrint('Mycelium: Reconnected, node_id=$hex');
+    } catch (e) {
+      debugPrint('Mycelium: Reconnect failed: $e');
+      rethrow;
+    }
+  }
+
+  /// Start the Android foreground daemon service.
+  Future<void> _startDaemonService() async {
+    try {
+      await _daemonChannel.invokeMethod('startDaemon');
+    } catch (e) {
+      debugPrint('Daemon service start failed: $e');
+    }
+  }
+
   void _startWebSocket() {
     _wsService = WsService();
     _wsService!.connect();
   }
 
-  /// Register BLE transport and start the BLE manager.
   Future<void> _startBle() async {
+    if (_handle == null) return; // No BLE without FFI handle
     try {
       bindings.mycelium_register_ble_transport(_handle!);
       final nodeId = getNodeId();
       _bleManager = BleManager(_handle!.cast());
       await _bleManager!.start(nodeId.bytes);
     } catch (e) {
-      // BLE is optional — don't prevent startup
       debugPrint('BLE init failed: $e');
     }
   }
 
   /// Stop the node.
   Future<void> stop() async {
-    _stopPolling();
     _wsService?.dispose();
     _wsService = null;
     await _bleManager?.stop();
@@ -99,10 +146,20 @@ class MyceliumService {
     if (_handle != null) {
       bindings.mycelium_node_stop(_handle!);
     }
+    try {
+      await _daemonChannel.invokeMethod('stopDaemon');
+    } catch (_) {}
   }
+
+  // --- Data operations (REST API) ---
 
   /// Get this node's ID.
   NodeId getNodeId() {
+    if (_cachedNodeId != null) return _cachedNodeId!;
+    return _getNodeIdFromFfi();
+  }
+
+  NodeId _getNodeIdFromFfi() {
     _ensureHandle();
     final buf = calloc<Uint8>(32);
     try {
@@ -113,244 +170,134 @@ class MyceliumService {
     }
   }
 
-  /// Send a text message to a peer.
+  /// Send a text message to a peer via REST API.
   Future<MessageId> sendMessage(NodeId destination, String text) async {
-    _ensureHandle();
-    final destPtr = toNativeBytes(destination.bytes);
-    final textBytes = Uint8List.fromList(text.codeUnits);
-    final dataPtr = toNativeBytes(textBytes);
-    final outId = calloc<Uint8>(16);
-    try {
-      final result = bindings.mycelium_send_message(
-        _handle!,
-        destPtr,
-        dataPtr,
-        textBytes.length,
-        ContentType.text.value,
-        outId,
-      );
-      checkResult(result);
-      return MessageId(Uint8List.fromList(outId.asTypedList(16)));
-    } finally {
-      calloc.free(destPtr);
-      calloc.free(dataPtr);
-      calloc.free(outId);
-    }
+    final result = await _api.sendMessage(
+      destination.toHex(),
+      text,
+      ContentType.text.value,
+    );
+    final hexId = result['message_id'] as String;
+    return MessageId(hexToBytes(hexId));
   }
 
-  /// Get messages for a conversation with a peer.
-  Future<List<Message>> getMessages(NodeId peerId, {int limit = 50, int offset = 0}) async {
-    _ensureHandle();
-    final peerPtr = toNativeBytes(peerId.bytes);
-    final capacity = limit;
-    final outBuf = calloc<ffi.MessageInfo>(capacity);
-    try {
-      final count = bindings.mycelium_get_messages(
-        _handle!,
-        peerPtr,
-        limit,
-        offset,
-        outBuf,
-        capacity,
+  /// Get messages for a conversation via REST API.
+  Future<List<Message>> getMessages(NodeId peerId,
+      {int limit = 50, int offset = 0}) async {
+    final list = await _api.getMessages(peerId.toHex(),
+        limit: limit, offset: offset);
+    return list.map((json) {
+      final m = json as Map<String, dynamic>;
+      return Message(
+        messageId: MessageId(hexToBytes(m['message_id'] as String)),
+        source: NodeId.fromHex(m['source'] as String),
+        destination: NodeId.fromHex(m['destination'] as String),
+        contentType: _parseContentType(m['content_type'] as String),
+        timestamp: DateTime.fromMillisecondsSinceEpoch(
+            (m['timestamp'] as num).toInt() * 1000),
+        status: _parseStatus(m['status'] as String),
+        isIncoming: m['is_incoming'] as bool,
+        plaintext: m['data'] as String? ?? '',
       );
-      checkResult(count);
-
-      final messages = <Message>[];
-      for (var i = 0; i < count; i++) {
-        final info = outBuf[i];
-        final plaintextBytes = info.plaintext_len > 0
-            ? info.plaintext.asTypedList(info.plaintext_len)
-            : Uint8List(0);
-
-        messages.add(Message(
-          messageId: MessageId(arrayToBytes(info.message_id, 16)),
-          source: NodeId(arrayToBytes(info.source, 32)),
-          destination: NodeId(arrayToBytes(info.destination, 32)),
-          contentType: ContentType.fromValue(info.content_type),
-          timestamp: DateTime.fromMillisecondsSinceEpoch(info.timestamp * 1000),
-          status: MessageStatus.fromValue(info.status),
-          isIncoming: info.is_incoming,
-          plaintext: String.fromCharCodes(plaintextBytes),
-        ));
-      }
-      return messages;
-    } finally {
-      calloc.free(peerPtr);
-      calloc.free(outBuf);
-    }
+    }).toList();
   }
 
-  /// Get list of conversations.
+  /// Get list of conversations via REST API.
   Future<List<ConversationSummary>> getConversations() async {
-    _ensureHandle();
-    const capacity = 100;
-    final outBuf = calloc<ffi.ConversationSummary>(capacity);
-    try {
-      final count = bindings.mycelium_get_conversations(_handle!, outBuf, capacity);
-      checkResult(count);
-
-      final conversations = <ConversationSummary>[];
-      for (var i = 0; i < count; i++) {
-        final info = outBuf[i];
-        final peerId = NodeId(arrayToBytes(info.peer_id, 32));
-        String? name;
-        try {
-          name = _getDisplayNameSync(peerId);
-        } catch (_) {}
-
-        conversations.add(ConversationSummary(
-          peerId: peerId,
-          lastMessageTime: DateTime.fromMillisecondsSinceEpoch(info.last_message_time * 1000),
-          messageCount: info.message_count,
-          hasUnread: info.has_unread,
-          displayName: name,
-        ));
-      }
-      return conversations;
-    } finally {
-      calloc.free(outBuf);
-    }
+    final list = await _api.getConversations();
+    return list.map((json) {
+      final c = json as Map<String, dynamic>;
+      return ConversationSummary(
+        peerId: NodeId.fromHex(c['peer_id'] as String),
+        lastMessageTime: DateTime.fromMillisecondsSinceEpoch(
+            (c['last_message_time'] as num).toInt() * 1000),
+        messageCount: (c['message_count'] as num).toInt(),
+        hasUnread: c['has_unread'] as bool,
+        displayName: c['display_name'] as String?,
+      );
+    }).toList();
   }
 
-  /// Delete a conversation.
+  /// Delete a conversation via REST API.
   Future<void> deleteConversation(NodeId peerId) async {
-    _ensureHandle();
-    final peerPtr = toNativeBytes(peerId.bytes);
-    try {
-      final result = bindings.mycelium_delete_conversation(_handle!, peerPtr);
-      checkResult(result);
-    } finally {
-      calloc.free(peerPtr);
-    }
+    await _api.deleteConversation(peerId.toHex());
   }
 
-  /// Mark messages from a peer as read.
+  /// Mark messages from a peer as read via REST API.
   Future<void> markRead(NodeId peerId) async {
-    _ensureHandle();
-    final peerPtr = toNativeBytes(peerId.bytes);
-    try {
-      bindings.mycelium_mark_read(_handle!, peerPtr);
-    } finally {
-      calloc.free(peerPtr);
-    }
+    await _api.markRead(peerId.toHex());
   }
 
-  /// Get total unread count.
+  /// Get total unread count via REST API.
   Future<int> totalUnreadCount() async {
-    _ensureHandle();
-    return bindings.mycelium_total_unread_count(_handle!);
+    final result = await _api.getUnreadCount();
+    return (result['total_unread'] as num).toInt();
   }
 
-  /// Get contacts list.
+  /// Get contacts list via REST API.
   Future<List<Contact>> getContacts() async {
-    _ensureHandle();
-    const capacity = 200;
-    const namesCapacity = 200 * 64;
-    final outContacts = calloc<ffi.ContactInfo>(capacity);
-    final outNames = calloc<Uint8>(namesCapacity);
-    try {
-      final count = bindings.mycelium_get_contacts(
-        _handle!, outContacts, capacity, outNames, namesCapacity,
+    final list = await _api.getContacts();
+    return list.map((json) {
+      final c = json as Map<String, dynamic>;
+      return Contact(
+        nodeId: NodeId.fromHex(c['node_id'] as String),
+        displayName: c['display_name'] as String? ?? '',
+        trustScore: (c['trust_score'] as num).toDouble(),
+        isVerified: c['is_verified'] as bool,
+        lastSeen: c['last_seen'] != null
+            ? DateTime.fromMillisecondsSinceEpoch(
+                (c['last_seen'] as num).toInt() * 1000)
+            : DateTime.fromMillisecondsSinceEpoch(0),
       );
-      checkResult(count);
-
-      final contacts = <Contact>[];
-      var nameOffset = 0;
-      for (var i = 0; i < count; i++) {
-        final info = outContacts[i];
-        final nameLen = info.display_name_len;
-        final nameBytes = outNames.asTypedList(namesCapacity).sublist(nameOffset, nameOffset + nameLen);
-        nameOffset += nameLen;
-
-        contacts.add(Contact(
-          nodeId: NodeId(arrayToBytes(info.node_id, 32)),
-          displayName: String.fromCharCodes(nameBytes),
-          trustScore: info.trust_score,
-          isVerified: info.is_verified,
-          lastSeen: info.last_seen > 0
-              ? DateTime.fromMillisecondsSinceEpoch(info.last_seen * 1000)
-              : DateTime.fromMillisecondsSinceEpoch(0),
-        ));
-      }
-      return contacts;
-    } finally {
-      calloc.free(outContacts);
-      calloc.free(outNames);
-    }
+    }).toList();
   }
 
-  /// Set display name for a contact.
+  /// Set display name for a contact via REST API.
   Future<void> setDisplayName(NodeId peerId, String name) async {
-    _ensureHandle();
-    final peerPtr = toNativeBytes(peerId.bytes);
-    final namePtr = toNativeString(name);
-    try {
-      final result = bindings.mycelium_set_display_name(_handle!, peerPtr, namePtr);
-      checkResult(result);
-    } finally {
-      calloc.free(peerPtr);
-      calloc.free(namePtr);
-    }
+    await _api.addContact(peerId.toHex(), name);
   }
 
-  /// Get trust score for a peer.
+  /// Get trust score for a peer via REST API.
   Future<double> trustScore(NodeId peerId) async {
-    _ensureHandle();
-    final peerPtr = toNativeBytes(peerId.bytes);
-    try {
-      return bindings.mycelium_trust_score(_handle!, peerPtr);
-    } finally {
-      calloc.free(peerPtr);
-    }
+    final result = await _api.getTrust(peerId.toHex());
+    return (result['trust_score'] as num).toDouble();
   }
 
-  /// Get safety number for a peer session.
+  /// Get safety number via REST API.
   Future<String?> safetyNumber(NodeId peerId) async {
-    _ensureHandle();
-    final peerPtr = toNativeBytes(peerId.bytes);
-    final outBuf = calloc<Uint8>(256);
     try {
-      final len = bindings.mycelium_safety_number(_handle!, peerPtr, outBuf, 256);
-      if (len < 0) return null;
-      return String.fromCharCodes(outBuf.asTypedList(len));
-    } finally {
-      calloc.free(peerPtr);
-      calloc.free(outBuf);
+      final result = await _api.getSafetyNumber(peerId.toHex());
+      return result['safety_number'] as String?;
+    } catch (_) {
+      return null;
     }
   }
 
-  /// Get current network status.
+  /// Get current network status via REST API.
   Future<NetworkStatus> getNetworkStatus() async {
-    _ensureHandle();
-    final outStatus = calloc<ffi.NetworkStatus>();
-    try {
-      final result = bindings.mycelium_network_status(_handle!, outStatus);
-      checkResult(result);
-      return NetworkStatus(
-        neighborCount: outStatus.ref.neighbor_count,
-        isConnected: outStatus.ref.is_connected,
-        batteryLevel: outStatus.ref.battery_level,
-        dtnQueueSize: outStatus.ref.dtn_queue_size,
-      );
-    } finally {
-      calloc.free(outStatus);
-    }
+    final result = await _api.getNetworkStatus();
+    return NetworkStatus(
+      neighborCount: (result['neighbor_count'] as num).toInt(),
+      isConnected: result['is_connected'] as bool,
+      batteryLevel: (result['battery_level'] as num).toInt(),
+      dtnQueueSize: (result['dtn_queue_size'] as num).toInt(),
+    );
   }
 
-  /// Dispose the service and free native resources.
+  /// Dispose the service.
   void dispose() {
-    _stopPolling();
     _wsService?.dispose();
     _wsService = null;
-    _messageController.close();
+    _api.dispose();
     if (_handle != null) {
       bindings.mycelium_node_free(_handle!);
       _handle = null;
     }
+    _cachedNodeId = null;
     _instance = null;
   }
 
-  // --- Private helpers ---
+  // --- Helpers ---
 
   void _ensureHandle() {
     if (_handle == null) {
@@ -358,50 +305,46 @@ class MyceliumService {
     }
   }
 
-  String? _getDisplayNameSync(NodeId peerId) {
-    final peerPtr = toNativeBytes(peerId.bytes);
-    final outBuf = calloc<Uint8>(256);
-    try {
-      final len = bindings.mycelium_get_display_name(_handle!, peerPtr, outBuf, 256);
-      if (len <= 0) return null;
-      return String.fromCharCodes(outBuf.asTypedList(len));
-    } finally {
-      calloc.free(peerPtr);
-      calloc.free(outBuf);
+  static ContentType _parseContentType(String s) {
+    switch (s) {
+      case 'text':
+        return ContentType.text;
+      case 'image':
+        return ContentType.image;
+      case 'file':
+        return ContentType.file;
+      case 'gps_pin':
+        return ContentType.gpsPin;
+      case 'voice_note':
+        return ContentType.voiceNote;
+      default:
+        return ContentType.text;
     }
   }
 
-  void _startPolling() {
-    _pollTimer?.cancel();
-    _pollTimer = Timer.periodic(const Duration(milliseconds: 500), (_) => _poll());
-  }
-
-  void _stopPolling() {
-    _pollTimer?.cancel();
-    _pollTimer = null;
-  }
-
-  void _poll() async {
-    if (_handle == null) return;
-    try {
-      final unread = bindings.mycelium_total_unread_count(_handle!);
-      if (unread > _lastKnownUnread) {
-        // New messages arrived — fetch latest from all conversations
-        final convos = await getConversations();
-        for (final convo in convos) {
-          if (convo.hasUnread) {
-            final msgs = await getMessages(convo.peerId, limit: 5);
-            for (final msg in msgs) {
-              if (msg.isIncoming && msg.status == MessageStatus.received) {
-                _messageController.add(msg);
-              }
-            }
-          }
-        }
-      }
-      _lastKnownUnread = unread;
-    } catch (_) {
-      // Polling should not crash the app
+  static MessageStatus _parseStatus(String s) {
+    switch (s) {
+      case 'pending':
+        return MessageStatus.pending;
+      case 'sent':
+        return MessageStatus.sent;
+      case 'delivered':
+        return MessageStatus.delivered;
+      case 'read':
+        return MessageStatus.read;
+      case 'received':
+        return MessageStatus.received;
+      default:
+        return MessageStatus.pending;
     }
   }
+}
+
+/// Convert hex string to bytes.
+Uint8List hexToBytes(String hex) {
+  final result = Uint8List(hex.length ~/ 2);
+  for (var i = 0; i < result.length; i++) {
+    result[i] = int.parse(hex.substring(i * 2, i * 2 + 2), radix: 16);
+  }
+  return result;
 }

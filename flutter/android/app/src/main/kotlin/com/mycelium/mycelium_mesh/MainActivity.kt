@@ -1,5 +1,7 @@
 package com.mycelium.mycelium_mesh
 
+import android.content.Intent
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -9,8 +11,9 @@ import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
-    private val METHOD_CHANNEL = "com.mycelium.ble"
-    private val EVENT_CHANNEL = "com.mycelium.ble/events"
+    private val BLE_METHOD_CHANNEL = "com.mycelium.ble"
+    private val BLE_EVENT_CHANNEL = "com.mycelium.ble/events"
+    private val DAEMON_CHANNEL = "com.mycelium.daemon"
 
     private var bleService: BleService? = null
     private var eventSink: EventChannel.EventSink? = null
@@ -19,6 +22,25 @@ class MainActivity : FlutterActivity() {
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
+        // --- Daemon lifecycle channel ---
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, DAEMON_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startDaemon" -> {
+                    startDaemonService()
+                    result.success(true)
+                }
+                "stopDaemon" -> {
+                    stopDaemonService()
+                    result.success(true)
+                }
+                "isDaemonRunning" -> {
+                    result.success(MyceliumDaemonService.isRunning)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        // --- BLE transport channels ---
         bleService = BleService(this)
         bleService?.listener = object : BleService.EventListener {
             override fun onPeerDiscovered(peerId: ByteArray) {
@@ -57,7 +79,7 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, METHOD_CHANNEL).setMethodCallHandler { call, result ->
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BLE_METHOD_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
                     val nodeId = (call.argument<List<Int>>("nodeId"))?.let {
@@ -92,7 +114,7 @@ class MainActivity : FlutterActivity() {
             }
         }
 
-        EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL).setStreamHandler(
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, BLE_EVENT_CHANNEL).setStreamHandler(
             object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
                     Log.i("MyceliumBLE", "EventChannel onListen, sink=${events != null}")
@@ -105,8 +127,25 @@ class MainActivity : FlutterActivity() {
         )
     }
 
+    private fun startDaemonService() {
+        val intent = Intent(this, MyceliumDaemonService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        Log.i("MyceliumDaemon", "Daemon service start requested")
+    }
+
+    private fun stopDaemonService() {
+        stopService(Intent(this, MyceliumDaemonService::class.java))
+        Log.i("MyceliumDaemon", "Daemon service stop requested")
+    }
+
     override fun onDestroy() {
         bleService?.stop()
+        // Note: daemon service intentionally NOT stopped here —
+        // it keeps the process alive for the Rust node.
         super.onDestroy()
     }
 }

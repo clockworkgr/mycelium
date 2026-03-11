@@ -10,10 +10,10 @@ import 'src/service/mycelium_service.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // Request BLE and camera permissions
+  // Request BLE, camera, and notification permissions
   await _requestPermissions();
 
-  // Initialize the native node
+  // Initialize the node (will reconnect if daemon is already running)
   try {
     final appDir = await getApplicationDocumentsDirectory();
     final dataDir = '${appDir.path}/mycelium';
@@ -33,6 +33,7 @@ Future<void> _requestPermissions() async {
     Permission.bluetoothConnect,
     Permission.locationWhenInUse,
     Permission.camera,
+    Permission.notification,
   ].request();
 }
 
