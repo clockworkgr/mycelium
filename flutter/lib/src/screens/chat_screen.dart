@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/node_id.dart';
 import '../providers/messages_provider.dart';
 import '../providers/service_provider.dart';
+import '../service/notification_service.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/send_bar.dart';
 import 'verify_screen.dart';
@@ -21,10 +22,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    // Suppress notifications for this conversation while it's open
+    NotificationService.instance.activeChat = widget.peerId.toHex();
     // Mark messages as read when opening chat
     Future.microtask(() {
       ref.read(myceliumServiceProvider).markRead(widget.peerId);
     });
+  }
+
+  @override
+  void dispose() {
+    NotificationService.instance.activeChat = null;
+    super.dispose();
   }
 
   @override

@@ -3,12 +3,13 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../service/notification_service.dart';
 import '../service/ws_service.dart';
+import 'contacts_provider.dart';
 import 'conversations_provider.dart';
 import 'service_provider.dart';
 import 'unread_provider.dart';
 import 'network_status_provider.dart';
-import 'contacts_provider.dart';
 
 /// Provider that listens to WebSocket events and invalidates relevant providers.
 ///
@@ -22,13 +23,32 @@ final wsEventBridgeProvider = Provider<void>((ref) {
 
   StreamSubscription<WsEvent>? sub;
 
-  sub = ws.events.listen((event) {
+  sub = ws.events.listen((event) async {
     switch (event) {
       case WsMessageEvent():
         // New message received — refresh conversations, messages, and unread count
         ref.invalidate(conversationListProvider);
         ref.invalidate(totalUnreadProvider);
         debugPrint('WS: message from ${event.source.substring(0, 8)}...');
+
+        // Show notification if not viewing this chat
+        if (NotificationService.instance.activeChat != event.source) {
+          // Look up sender display name from contacts
+          String senderName = '${event.source.substring(0, 8)}...';
+          try {
+            final contacts = await ref.read(myceliumServiceProvider).getContacts();
+            final match = contacts.where((c) => c.nodeId.toHex() == event.source);
+            if (match.isNotEmpty) {
+              senderName = match.first.displayName;
+            }
+          } catch (_) {}
+
+          NotificationService.instance.showMessageNotification(
+            senderName: senderName,
+            messageText: event.data,
+            peerHex: event.source,
+          );
+        }
       case WsReceiptEvent():
         // Receipt updated — refresh conversations to show status change
         ref.invalidate(conversationListProvider);

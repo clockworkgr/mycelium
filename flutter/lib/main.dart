@@ -6,12 +6,20 @@ import 'package:permission_handler/permission_handler.dart';
 import 'src/providers/ws_events_provider.dart';
 import 'src/router/app_router.dart';
 import 'src/service/mycelium_service.dart';
+import 'src/service/notification_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   // Request BLE, camera, and notification permissions
   await _requestPermissions();
+
+  // Initialize notifications (before runApp so tap handler is ready)
+  await NotificationService.instance.init(
+    onTap: (peerHex) {
+      appRouter.go('/conversations/chat/$peerHex');
+    },
+  );
 
   // Initialize the node (will reconnect if daemon is already running)
   try {
