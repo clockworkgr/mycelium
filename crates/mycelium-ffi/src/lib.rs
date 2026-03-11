@@ -1233,6 +1233,46 @@ pub unsafe extern "C" fn mycelium_ble_dequeue_send(
     }
 }
 
+/// Dequeue one pending Wi-Fi Direct send from the outbox.
+///
+/// Returns 1 if a packet was dequeued (fills out params), 0 if empty, -1 on error.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `out_peer_id` must point to 32 bytes.
+/// - `out_data` must point to `data_capacity` bytes.
+/// - `out_data_len` must point to a valid u32.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_wifi_dequeue_send(
+    handle: *mut MyceliumNode,
+    out_peer_id: *mut [u8; 32],
+    out_data: *mut u8,
+    data_capacity: u32,
+    out_data_len: *mut u32,
+) -> i32 {
+    if handle.is_null() || out_peer_id.is_null() || out_data.is_null() || out_data_len.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+
+    let result = runtime().block_on(async {
+        let guard = node.wifi_transport.read().await;
+        guard.as_ref().and_then(|wifi| wifi.dequeue_send())
+    });
+
+    match result {
+        Some((peer, data)) => {
+            let copy_len = data.len().min(data_capacity as usize);
+            (*out_peer_id) = *peer.as_bytes();
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, copy_len);
+            (*out_data_len) = copy_len as u32;
+            1
+        }
+        None => 0,
+    }
+}
+
 /// Register a callback for sending data via BLE.
 ///
 /// When the Rust layer needs to send data to a BLE peer, this callback is invoked.

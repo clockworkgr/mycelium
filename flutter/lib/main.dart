@@ -42,6 +42,7 @@ Future<void> _requestPermissions() async {
     Permission.locationWhenInUse,
     Permission.camera,
     Permission.notification,
+    Permission.nearbyWifiDevices,
   ].request();
 }
 

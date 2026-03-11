@@ -17,6 +17,7 @@ import 'api_client.dart';
 import 'ble_manager.dart';
 import 'ffi_helpers.dart';
 import 'mycelium_exception.dart';
+import 'wifi_direct_manager.dart';
 import 'ws_service.dart';
 
 /// Platform channel for daemon lifecycle management.
@@ -32,6 +33,7 @@ class MyceliumService {
   Pointer<ffi.MyceliumNode>? _handle;
   final ApiClient _api = ApiClient();
   BleManager? _bleManager;
+  WifiDirectManager? _wifiDirectManager;
   WsService? _wsService;
   NodeId? _cachedNodeId;
   bool _reconnected = false;
@@ -79,10 +81,11 @@ class MyceliumService {
 
   /// Start the node event loop, daemon service, BLE, and WebSocket.
   Future<bool> start() async {
-    // If reconnecting to existing daemon, just start WS + BLE
+    // If reconnecting to existing daemon, just start WS + BLE + WiFi Direct
     if (_reconnected) {
       _startWebSocket();
       await _startBle();
+      await _startWifiDirect();
       await _startDaemonService();
       return true;
     }
@@ -94,6 +97,7 @@ class MyceliumService {
       _cachedNodeId = _getNodeIdFromFfi();
       _startWebSocket();
       await _startBle();
+      await _startWifiDirect();
       await _startDaemonService();
     }
     return ok;
@@ -162,12 +166,26 @@ class MyceliumService {
     }
   }
 
+  Future<void> _startWifiDirect() async {
+    if (_handle == null) return; // No Wi-Fi Direct without FFI handle
+    try {
+      bindings.mycelium_register_wifi_direct_transport(_handle!);
+      final nodeId = getNodeId();
+      _wifiDirectManager = WifiDirectManager(_handle!.cast());
+      await _wifiDirectManager!.start(nodeId.bytes);
+    } catch (e) {
+      debugPrint('Wi-Fi Direct init failed: $e');
+    }
+  }
+
   /// Stop the node.
   Future<void> stop() async {
     _wsService?.dispose();
     _wsService = null;
     await _bleManager?.stop();
     _bleManager = null;
+    await _wifiDirectManager?.stop();
+    _wifiDirectManager = null;
     if (_handle != null) {
       bindings.mycelium_node_stop(_handle!);
     }

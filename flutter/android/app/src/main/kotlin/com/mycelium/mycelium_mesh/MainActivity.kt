@@ -13,10 +13,14 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     private val BLE_METHOD_CHANNEL = "com.mycelium.ble"
     private val BLE_EVENT_CHANNEL = "com.mycelium.ble/events"
+    private val WIFI_METHOD_CHANNEL = "com.mycelium.wifidirect"
+    private val WIFI_EVENT_CHANNEL = "com.mycelium.wifidirect/events"
     private val DAEMON_CHANNEL = "com.mycelium.daemon"
 
     private var bleService: BleService? = null
+    private var wifiDirectService: WifiDirectService? = null
     private var eventSink: EventChannel.EventSink? = null
+    private var wifiEventSink: EventChannel.EventSink? = null
     private val handler = Handler(Looper.getMainLooper())
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -125,6 +129,85 @@ class MainActivity : FlutterActivity() {
                 }
             }
         )
+
+        // --- Wi-Fi Direct transport channels ---
+        wifiDirectService = WifiDirectService(this)
+        wifiDirectService?.listener = object : WifiDirectService.EventListener {
+            override fun onPeerConnected(peerId: ByteArray) {
+                handler.post {
+                    wifiEventSink?.success(mapOf(
+                        "type" to "peerConnected",
+                        "peerId" to peerId.toList()
+                    ))
+                }
+            }
+
+            override fun onPeerDisconnected(peerId: ByteArray) {
+                handler.post {
+                    wifiEventSink?.success(mapOf(
+                        "type" to "peerDisconnected",
+                        "peerId" to peerId.toList()
+                    ))
+                }
+            }
+
+            override fun onDataReceived(peerId: ByteArray, data: ByteArray) {
+                handler.post {
+                    wifiEventSink?.success(mapOf(
+                        "type" to "dataReceived",
+                        "peerId" to peerId.toList(),
+                        "data" to data.toList()
+                    ))
+                }
+            }
+        }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_METHOD_CHANNEL).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    val nodeId = (call.argument<List<Int>>("nodeId"))?.let {
+                        ByteArray(it.size) { i -> it[i].toByte() }
+                    }
+                    if (nodeId != null && nodeId.size == 32) {
+                        wifiDirectService?.start(nodeId)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARG", "nodeId must be 32 bytes", null)
+                    }
+                }
+                "stop" -> {
+                    wifiDirectService?.stop()
+                    result.success(true)
+                }
+                "sendData" -> {
+                    val peerId = (call.argument<List<Int>>("peerId"))?.let {
+                        ByteArray(it.size) { i -> it[i].toByte() }
+                    }
+                    val data = (call.argument<List<Int>>("data"))?.let {
+                        ByteArray(it.size) { i -> it[i].toByte() }
+                    }
+                    if (peerId != null && data != null) {
+                        val ok = wifiDirectService?.sendData(peerId, data) ?: false
+                        result.success(ok)
+                    } else {
+                        result.error("INVALID_ARG", "peerId and data required", null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_EVENT_CHANNEL).setStreamHandler(
+            object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    Log.i(TAG, "WiFi Direct EventChannel onListen, sink=${events != null}")
+                    wifiEventSink = events
+                }
+                override fun onCancel(arguments: Any?) {
+                    wifiEventSink = null
+                }
+            }
+        )
     }
 
     private fun startDaemonService() {
@@ -144,8 +227,13 @@ class MainActivity : FlutterActivity() {
 
     override fun onDestroy() {
         bleService?.stop()
+        wifiDirectService?.stop()
         // Note: daemon service intentionally NOT stopped here —
         // it keeps the process alive for the Rust node.
         super.onDestroy()
+    }
+
+    companion object {
+        private const val TAG = "MyceliumMain"
     }
 }

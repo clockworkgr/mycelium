@@ -276,6 +276,16 @@ int32_t mycelium_ble_dequeue_send(
     uint32_t *out_data_len
 );
 
+/* --- Wi-Fi Direct Outbox (Rust → Platform polling) --- */
+
+/** Dequeue one pending Wi-Fi Direct send. Returns 1 if dequeued, 0 if empty, -1 on error. */
+int32_t mycelium_wifi_dequeue_send(
+    MyceliumNode *handle,
+    uint8_t out_peer_id[32],
+    uint8_t *out_data, uint32_t data_capacity,
+    uint32_t *out_data_len
+);
+
 /* --- Transport Send Callbacks (Rust → Platform) --- */
 
 int32_t mycelium_ble_set_send_callback(MyceliumNode *handle, TransportSendCallback callback);

@@ -1,11 +1,12 @@
-//! Wi-Fi Direct transport stub.
+//! Wi-Fi Direct transport.
 //!
-//! On Android, the real implementation will use the WifiP2pManager API
-//! via JNI/FFI callbacks. This stub provides the trait implementation structure.
+//! On Android, the real implementation uses the WifiP2pManager API
+//! via FFI callbacks. Dart polls the outbox for outgoing data at 50ms.
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
@@ -29,6 +30,9 @@ pub struct WifiDirectTransport {
     connected_peers: Arc<RwLock<Vec<NodeId>>>,
     started: Arc<RwLock<bool>>,
     send_callback: Arc<RwLock<Option<WifiSendCallback>>>,
+    /// Outbox queue for outgoing data. Dart polls this via FFI since it cannot
+    /// provide a synchronous C callback across threads.
+    outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
 }
 
 impl WifiDirectTransport {
@@ -40,7 +44,18 @@ impl WifiDirectTransport {
             connected_peers: Arc::new(RwLock::new(Vec::new())),
             started: Arc::new(RwLock::new(false)),
             send_callback: Arc::new(RwLock::new(None)),
+            outbox: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    /// Dequeue a pending send from the outbox.
+    /// Returns `Some((peer, data))` if there was a packet waiting, `None` otherwise.
+    pub fn dequeue_send(&self) -> Option<(NodeId, Vec<u8>)> {
+        let result = self.outbox.lock().ok()?.pop_front();
+        if let Some((ref peer, ref data)) = result {
+            debug!("WiFi Direct outbox dequeue: {} bytes for {}", data.len(), peer);
+        }
+        result
     }
 
     /// Register a platform send callback. When the Rust layer calls `send()`,
@@ -127,7 +142,9 @@ impl Transport for WifiDirectTransport {
             });
         }
 
-        // Use platform send callback if registered
+        debug!("WiFi Direct send: {} bytes to {}", data.len(), peer);
+
+        // Use platform send callback if registered, otherwise queue for Dart polling
         let cb = self.send_callback.read().await;
         if let Some(callback) = *cb {
             let peer_bytes = peer.as_bytes();
@@ -136,7 +153,11 @@ impl Transport for WifiDirectTransport {
                 return Err(TransportError::SendFailed(format!("WiFi Direct send callback returned {}", result)));
             }
         } else {
-            warn!("Wi-Fi Direct send to {} ({} bytes) — no send callback registered", peer, data.len());
+            // Push to outbox for Dart to poll via mycelium_wifi_dequeue_send
+            if let Ok(mut outbox) = self.outbox.lock() {
+                outbox.push_back((*peer, data.to_vec()));
+                debug!("WiFi Direct outbox: queued, depth now {}", outbox.len());
+            }
         }
         Ok(())
     }
@@ -168,5 +189,69 @@ impl Transport for WifiDirectTransport {
 
     fn mtu(&self) -> usize {
         65535
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_node_id(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 32])
+    }
+
+    #[tokio::test]
+    async fn test_outbox_send_and_dequeue() {
+        let transport = WifiDirectTransport::new(test_node_id(1));
+        transport.start().await.unwrap();
+        let peer = test_node_id(2);
+        transport.on_peer_connected(peer).await;
+
+        // Send should queue to outbox (no callback registered)
+        transport.send(&peer, b"hello wifi").await.unwrap();
+
+        let (dequeued_peer, dequeued_data) = transport.dequeue_send().unwrap();
+        assert_eq!(dequeued_peer, peer);
+        assert_eq!(dequeued_data, b"hello wifi");
+
+        // Outbox should be empty now
+        assert!(transport.dequeue_send().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_outbox_multiple_sends() {
+        let transport = WifiDirectTransport::new(test_node_id(1));
+        transport.start().await.unwrap();
+        let peer = test_node_id(2);
+        transport.on_peer_connected(peer).await;
+
+        transport.send(&peer, b"msg1").await.unwrap();
+        transport.send(&peer, b"msg2").await.unwrap();
+        transport.send(&peer, b"msg3").await.unwrap();
+
+        let (_, d1) = transport.dequeue_send().unwrap();
+        let (_, d2) = transport.dequeue_send().unwrap();
+        let (_, d3) = transport.dequeue_send().unwrap();
+        assert_eq!(d1, b"msg1");
+        assert_eq!(d2, b"msg2");
+        assert_eq!(d3, b"msg3");
+        assert!(transport.dequeue_send().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_send_not_started() {
+        let transport = WifiDirectTransport::new(test_node_id(1));
+        let peer = test_node_id(2);
+        let result = transport.send(&peer, b"data").await;
+        assert!(matches!(result, Err(TransportError::NotStarted)));
+    }
+
+    #[tokio::test]
+    async fn test_send_peer_not_connected() {
+        let transport = WifiDirectTransport::new(test_node_id(1));
+        transport.start().await.unwrap();
+        let peer = test_node_id(2);
+        let result = transport.send(&peer, b"data").await;
+        assert!(matches!(result, Err(TransportError::PeerNotConnected(_))));
     }
 }
