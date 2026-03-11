@@ -374,8 +374,7 @@ class MyceliumService {
           if (convo.hasUnread) {
             final msgs = await getMessages(convo.peerId, limit: 5);
             for (final msg in msgs) {
-              if (msg.isIncoming && msg.status == MessageStatus.sending) {
-                // This is likely a new message
+              if (msg.isIncoming && msg.status == MessageStatus.received) {
                 _messageController.add(msg);
               }
             }

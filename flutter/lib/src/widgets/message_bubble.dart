@@ -72,9 +72,11 @@ class MessageBubble extends StatelessWidget {
   Widget _statusIcon(ThemeData theme) {
     final color = theme.colorScheme.onPrimary.withValues(alpha: 0.7);
     switch (message.status) {
-      case MessageStatus.sending:
+      case MessageStatus.pending:
         return Icon(Icons.access_time, size: 14, color: color);
       case MessageStatus.sent:
+        return Icon(Icons.check, size: 14, color: color);
+      case MessageStatus.received:
         return Icon(Icons.check, size: 14, color: color);
       case MessageStatus.delivered:
         return Icon(Icons.done_all, size: 14, color: color);

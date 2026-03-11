@@ -2444,13 +2444,14 @@ impl Node {
         local_id: NodeId,
     ) {
         if envelope.destination != local_id {
+            info!("Receipt not for us (dest={}), ignoring", envelope.destination);
             return;
         }
 
         let (msg_id, receipt_type) = match wire::deserialize_receipt(body) {
             Ok(v) => v,
             Err(e) => {
-                debug!("Bad receipt: {}", e);
+                info!("Bad receipt from {}: {}", envelope.source, e);
                 return;
             }
         };
@@ -2460,11 +2461,16 @@ impl Node {
             ReceiptType::Read => "read",
         };
 
-        let _ = db.update_message_status(&msg_id, new_status);
-        debug!(
-            "Receipt: message {} marked as {} by {}",
-            msg_id, new_status, envelope.source
-        );
+        match db.update_message_status(&msg_id, new_status) {
+            Ok(()) => info!(
+                "Receipt: message {} marked as {} (from {})",
+                msg_id, new_status, envelope.source
+            ),
+            Err(e) => info!(
+                "Receipt: failed to update message {} to {}: {}",
+                msg_id, new_status, e
+            ),
+        }
     }
 
     /// Send a delivery receipt back to the sender.
@@ -2494,11 +2500,16 @@ impl Node {
             r.route_message(&to)
         };
 
-        if let RoutingDecision::SendRealtime { next_hop } = decision {
-            let data = envelope.serialize();
-            let _ = transport_manager.send(&next_hop, &data).await;
+        match decision {
+            RoutingDecision::SendRealtime { next_hop } => {
+                let data = envelope.serialize();
+                let _ = transport_manager.send(&next_hop, &data).await;
+                info!("Delivery receipt for {} sent to {} via {}", message_id, to, next_hop);
+            }
+            _ => {
+                info!("Delivery receipt for {} to {} dropped (no route)", message_id, to);
+            }
         }
-        // If no route, receipt is best-effort; silently drop
     }
 
     pub fn cancel_token(&self) -> CancellationToken {
