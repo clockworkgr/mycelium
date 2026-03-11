@@ -172,7 +172,7 @@ impl Database {
         Ok(result)
     }
 
-    /// Mark all incoming messages from a peer as read.
+    /// Mark all incoming messages from a peer as read. Returns message count.
     pub fn mark_messages_read(
         &self,
         local_id: &NodeId,
@@ -187,6 +187,46 @@ impl Database {
             ],
         )?;
         Ok(updated)
+    }
+
+    /// Get message IDs of unread incoming messages from a peer, then mark them read.
+    /// Returns the message IDs that were marked so read receipts can be sent.
+    pub fn mark_messages_read_returning_ids(
+        &self,
+        local_id: &NodeId,
+        peer_id: &NodeId,
+    ) -> Result<Vec<MessageId>, StorageError> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT message_id FROM messages
+             WHERE source = ?1 AND destination = ?2 AND is_incoming = 1 AND status = 'received'",
+        )?;
+        let ids: Vec<MessageId> = stmt
+            .query_map(
+                params![
+                    peer_id.as_bytes().as_slice(),
+                    local_id.as_bytes().as_slice(),
+                ],
+                |row| {
+                    let bytes: Vec<u8> = row.get(0)?;
+                    let mut arr = [0u8; 16];
+                    arr.copy_from_slice(&bytes[..16]);
+                    Ok(MessageId::from_bytes(arr))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if !ids.is_empty() {
+            conn.execute(
+                "UPDATE messages SET status = 'read'
+                 WHERE source = ?1 AND destination = ?2 AND is_incoming = 1 AND status = 'received'",
+                params![
+                    peer_id.as_bytes().as_slice(),
+                    local_id.as_bytes().as_slice(),
+                ],
+            )?;
+        }
+        Ok(ids)
     }
 
     /// Count unread incoming messages from a peer.

@@ -153,7 +153,7 @@ class MyceliumService {
           source: NodeId(arrayToBytes(info.source, 32)),
           destination: NodeId(arrayToBytes(info.destination, 32)),
           contentType: ContentType.fromValue(info.content_type),
-          timestamp: DateTime.fromMillisecondsSinceEpoch(info.timestamp),
+          timestamp: DateTime.fromMillisecondsSinceEpoch(info.timestamp * 1000),
           status: MessageStatus.fromValue(info.status),
           isIncoming: info.is_incoming,
           plaintext: String.fromCharCodes(plaintextBytes),
@@ -186,7 +186,7 @@ class MyceliumService {
 
         conversations.add(ConversationSummary(
           peerId: peerId,
-          lastMessageTime: DateTime.fromMillisecondsSinceEpoch(info.last_message_time),
+          lastMessageTime: DateTime.fromMillisecondsSinceEpoch(info.last_message_time * 1000),
           messageCount: info.message_count,
           hasUnread: info.has_unread,
           displayName: name,
@@ -253,7 +253,9 @@ class MyceliumService {
           displayName: String.fromCharCodes(nameBytes),
           trustScore: info.trust_score,
           isVerified: info.is_verified,
-          lastSeen: DateTime.fromMillisecondsSinceEpoch(info.last_seen),
+          lastSeen: info.last_seen > 0
+              ? DateTime.fromMillisecondsSinceEpoch(info.last_seen * 1000)
+              : DateTime.fromMillisecondsSinceEpoch(0),
         ));
       }
       return contacts;

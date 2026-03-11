@@ -1304,10 +1304,7 @@ pub unsafe extern "C" fn mycelium_mark_read(
     let node = &(*handle).node;
     let peer = NodeId::from_bytes(*peer_id);
 
-    match node.db.mark_messages_read(&node.node_id, &peer) {
-        Ok(count) => count as i32,
-        Err(_) => -2,
-    }
+    runtime().block_on(async { node.mark_read_and_notify(peer).await }) as i32
 }
 
 /// Get the number of unread messages from a specific peer.

@@ -111,23 +111,14 @@ pub async fn delete_conversation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// POST /v1/messages/:peer_id/read — Mark messages as read
+/// POST /v1/messages/:peer_id/read — Mark messages as read and send read receipts
 pub async fn mark_read(
     State(state): State<AppState>,
     Path(peer_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<ApiError>)> {
     let peer = parse_node_id(&peer_id)?;
-    let local_id = state.node.node_id;
 
-    let count = state.node.db.mark_messages_read(&local_id, &peer).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: e.to_string(),
-                code: 500,
-            }),
-        )
-    })?;
+    let count = state.node.mark_read_and_notify(peer).await;
 
     Ok(Json(serde_json::json!({ "marked_read": count })))
 }

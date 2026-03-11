@@ -2512,6 +2512,69 @@ impl Node {
         }
     }
 
+    /// Mark messages from a peer as read and send read receipts.
+    pub async fn mark_read_and_notify(&self, peer: NodeId) -> usize {
+        let msg_ids = match self.db.mark_messages_read_returning_ids(&self.node_id, &peer) {
+            Ok(ids) => ids,
+            Err(e) => {
+                info!("Failed to mark messages as read: {}", e);
+                return 0;
+            }
+        };
+
+        let count = msg_ids.len();
+        for msg_id in msg_ids {
+            Self::send_read_receipt(
+                msg_id,
+                peer,
+                self.node_id,
+                &self.transport_manager,
+                &self.routing,
+            )
+            .await;
+        }
+        count
+    }
+
+    /// Send a read receipt for a specific message.
+    async fn send_read_receipt(
+        message_id: MessageId,
+        to: NodeId,
+        local_id: NodeId,
+        transport_manager: &TransportManager,
+        routing: &RwLock<RoutingCoordinator>,
+    ) {
+        let payload = wire::serialize_receipt(&message_id, ReceiptType::Read);
+        let envelope = Envelope {
+            source: local_id,
+            destination: to,
+            message_id: MessageId::random(),
+            ttl: 10,
+            hop_count: 0,
+            flags: MessageFlags::SYSTEM,
+            lamport_clock: 0,
+            device_timestamp: 0,
+            protocol_version: ProtocolVersion::CURRENT,
+            payload,
+        };
+
+        let decision = {
+            let r = routing.read().await;
+            r.route_message(&to)
+        };
+
+        match decision {
+            RoutingDecision::SendRealtime { next_hop } => {
+                let data = envelope.serialize();
+                let _ = transport_manager.send(&next_hop, &data).await;
+                info!("Read receipt for {} sent to {} via {}", message_id, to, next_hop);
+            }
+            _ => {
+                info!("Read receipt for {} to {} dropped (no route)", message_id, to);
+            }
+        }
+    }
+
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
