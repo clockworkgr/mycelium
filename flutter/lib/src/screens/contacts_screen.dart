@@ -3,11 +3,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../models/contact.dart';
 import '../models/node_id.dart';
 import '../providers/contacts_provider.dart';
 import '../providers/service_provider.dart';
+import '../service/api_client.dart';
 import '../widgets/contact_tile.dart';
 import 'qr_scanner_screen.dart';
+import 'verify_screen.dart';
 
 class ContactsScreen extends ConsumerWidget {
   const ContactsScreen({super.key});
@@ -61,6 +64,7 @@ class ContactsScreen extends ConsumerWidget {
                       '/conversations/chat/${contact.nodeId.toHex()}',
                     );
                   },
+                  onLongPress: () => _showContactActions(context, ref, contact),
                 );
               },
             ),
@@ -83,6 +87,77 @@ class ContactsScreen extends ConsumerWidget {
     if (hex != null && hex.length == 64 && context.mounted) {
       _showAddContactDialog(context, ref, prefillNodeId: hex);
     }
+  }
+
+  void _showContactActions(BuildContext context, WidgetRef ref, Contact contact) {
+    showModalBottomSheet(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.verified_user),
+              title: const Text('Verify Session'),
+              subtitle: const Text('Compare safety numbers'),
+              onTap: () {
+                Navigator.pop(ctx);
+                Navigator.of(context).push(
+                  MaterialPageRoute(
+                    builder: (_) => VerifyScreen(peerId: contact.nodeId),
+                  ),
+                );
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.thumb_up_outlined),
+              title: const Text('Vouch for Contact'),
+              subtitle: const Text('Add trust endorsement'),
+              onTap: () async {
+                Navigator.pop(ctx);
+                try {
+                  final api = ApiClient();
+                  await api.addVouch(contact.nodeId.toHex());
+                  api.dispose();
+                  ref.invalidate(contactListProvider);
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Vouch added')),
+                    );
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Error: $e')),
+                    );
+                  }
+                }
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline, color: Colors.red),
+              title: const Text('Delete Contact',
+                  style: TextStyle(color: Colors.red)),
+              onTap: () async {
+                Navigator.pop(ctx);
+                try {
+                  final api = ApiClient();
+                  await api.deleteContact(contact.nodeId.toHex());
+                  api.dispose();
+                  ref.invalidate(contactListProvider);
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Error: $e')),
+                    );
+                  }
+                }
+              },
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   void _showAddContactDialog(BuildContext context, WidgetRef ref, {String? prefillNodeId}) {

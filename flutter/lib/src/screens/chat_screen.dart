@@ -6,6 +6,7 @@ import '../providers/messages_provider.dart';
 import '../providers/service_provider.dart';
 import '../widgets/message_bubble.dart';
 import '../widgets/send_bar.dart';
+import 'verify_screen.dart';
 
 class ChatScreen extends ConsumerStatefulWidget {
   final NodeId peerId;
@@ -36,6 +37,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
         titleTextStyle: Theme.of(context).textTheme.titleMedium?.copyWith(
               fontFamily: 'monospace',
             ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.verified_user_outlined),
+            tooltip: 'Verify Session',
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute(
+                  builder: (_) => VerifyScreen(peerId: widget.peerId),
+                ),
+              );
+            },
+          ),
+        ],
       ),
       body: Column(
         children: [

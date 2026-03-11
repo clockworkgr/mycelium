@@ -30,6 +30,46 @@ class ApiClient {
     return _decodeList(response);
   }
 
+  Future<void> deleteContact(String nodeIdHex) async {
+    final response = await _client.delete(
+      Uri.parse('$_baseUrl/v1/contacts/$nodeIdHex'),
+    );
+    if (response.statusCode != 204 && response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}: ${response.body}');
+    }
+  }
+
+  // --- Trust & Verification ---
+
+  Future<Map<String, dynamic>> getTrust(String nodeIdHex) async {
+    final response =
+        await _client.get(Uri.parse('$_baseUrl/v1/contacts/$nodeIdHex/trust'));
+    return _decode(response);
+  }
+
+  Future<void> addVouch(String nodeIdHex) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/contacts/$nodeIdHex/vouch'),
+    );
+    if (response.statusCode != 201 && response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}: ${response.body}');
+    }
+  }
+
+  Future<Map<String, dynamic>> verifySession(String nodeIdHex) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/contacts/$nodeIdHex/verify'),
+    );
+    return _decodeCreated(response);
+  }
+
+  Future<Map<String, dynamic>> getSafetyNumber(String nodeIdHex) async {
+    final response = await _client.get(
+      Uri.parse('$_baseUrl/v1/contacts/$nodeIdHex/safety-number'),
+    );
+    return _decode(response);
+  }
+
   // --- Groups ---
 
   Future<List<dynamic>> getGroups() async {

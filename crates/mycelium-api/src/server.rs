@@ -34,6 +34,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/contacts", get(contacts::list_contacts))
         .route("/v1/contacts", post(contacts::add_contact))
         .route("/v1/contacts/{node_id}", delete(contacts::delete_contact))
+        .route("/v1/contacts/{node_id}/trust", get(contacts::get_trust))
+        .route("/v1/contacts/{node_id}/vouch", post(contacts::add_vouch))
+        .route("/v1/contacts/{node_id}/verify", post(contacts::verify_session))
+        .route("/v1/contacts/{node_id}/safety-number", get(contacts::get_safety_number))
         // Groups
         .route("/v1/groups", get(groups::list_groups).post(groups::create_group))
         .route("/v1/groups/{group_id}/members", get(groups::list_members).post(groups::add_member))

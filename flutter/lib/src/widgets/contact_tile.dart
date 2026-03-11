@@ -5,8 +5,9 @@ import '../models/contact.dart';
 class ContactTile extends StatelessWidget {
   final Contact contact;
   final VoidCallback? onTap;
+  final VoidCallback? onLongPress;
 
-  const ContactTile({super.key, required this.contact, this.onTap});
+  const ContactTile({super.key, required this.contact, this.onTap, this.onLongPress});
 
   @override
   Widget build(BuildContext context) {
@@ -35,6 +36,7 @@ class ContactTile extends StatelessWidget {
       ),
       trailing: _buildTrustIndicator(theme),
       onTap: onTap,
+      onLongPress: onLongPress,
     );
   }
 
