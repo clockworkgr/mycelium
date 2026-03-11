@@ -43,6 +43,7 @@ Mycelium is a mobile mesh messaging application that operates without internet o
 ├───────────────────────────────────────────────────────────────┤
 │           Service Layer (Dart + Kotlin)                       │
 │  MyceliumService (FFI) ←→ BleManager ←→ BleService (Kotlin)  │
+│                        ←→ WifiDirectManager ←→ WifiDirectService │
 ├───────────────────────────────────────────────────────────────┤
 │              C FFI Boundary (libmycelium_ffi.so)              │
 ├───────────────────────────────────────────────────────────────┤
@@ -92,7 +93,7 @@ mycelium/
 │   │   ├── src/transport/mod.rs        # Transport trait definition
 │   │   ├── src/transport/manager.rs    # TransportManager
 │   │   ├── src/transport/ble.rs        # BLE transport with outbox queue
-│   │   ├── src/transport/wifi_direct.rs# Wi-Fi Direct transport stub
+│   │   ├── src/transport/wifi_direct.rs# Wi-Fi Direct transport with outbox queue
 │   │   ├── src/transport/mock.rs       # Mock transport for testing
 │   │   ├── src/routing/mod.rs          # Routing module exports
 │   │   ├── src/routing/aodv.rs         # AODV reactive routing
@@ -150,7 +151,8 @@ mycelium/
     │       │   └── network_status.dart  # NetworkStatus model
     │       ├── service/
     │       │   ├── mycelium_service.dart # Core FFI service (singleton)
-    │       │   └── ble_manager.dart      # BLE ↔ Rust bridge
+    │       │   ├── ble_manager.dart      # BLE ↔ Rust bridge
+    │       │   └── wifi_direct_manager.dart # Wi-Fi Direct ↔ Rust bridge
     │       ├── providers/
     │       │   └── providers.dart        # Riverpod providers
     │       └── screens/
@@ -164,7 +166,8 @@ mycelium/
             ├── AndroidManifest.xml       # BLE + camera permissions
             ├── kotlin/.../
             │   ├── MainActivity.kt       # Platform channels
-            │   └── BleService.kt         # Full BLE stack (~600 lines)
+            │   ├── BleService.kt         # Full BLE stack (~600 lines)
+            │   └── WifiDirectService.kt  # Wi-Fi Direct P2P + TCP sockets
             └── build.gradle.kts          # Rust build integration
 ```
 
@@ -254,6 +257,22 @@ Platform → Rust (Incoming):
       → EventChannel "dataReceived"
         → Dart BleManager → FFI mycelium_ble_on_data_received()
           → BleTransport.on_data_received() → broadcast event
+```
+
+### Wi-Fi Direct Transport Data Path
+
+```
+Rust → Platform (Outgoing):
+  WifiDirectTransport.send() → outbox VecDeque
+    → Dart polls mycelium_wifi_dequeue_send() every 50ms
+      → MethodChannel "sendData" → Kotlin WifiDirectService.sendData()
+        → TCP writeFrame(MeshData, payload) — no fragmentation needed
+
+Platform → Rust (Incoming):
+  Kotlin handleClient() read loop → readFrame()
+    → EventChannel "dataReceived"
+      → Dart WifiDirectManager → FFI mycelium_wifi_on_data_received()
+        → WifiDirectTransport.on_data_received() → broadcast event
 ```
 
 ---
@@ -496,6 +515,30 @@ pub struct BleTransport {
 - **dequeue_send():** Called by Dart at 50ms intervals via FFI to retrieve pending packets.
 - **on_peer_discovered/lost/data_received():** Called by platform code via FFI to inject BLE events.
 - **MTU:** 512 bytes
+
+### Wi-Fi Direct Transport (`transport/wifi_direct.rs`)
+
+```rust
+pub struct WifiDirectTransport {
+    local_id: NodeId,
+    tx: broadcast::Sender<TransportEvent>,
+    connected_peers: Arc<RwLock<Vec<NodeId>>>,
+    started: Arc<RwLock<bool>>,
+    send_callback: Arc<RwLock<Option<WifiSendCallback>>>,
+    outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,  // std::sync::Mutex
+}
+```
+
+- **send():** If send callback registered, invokes it directly. Otherwise pushes to outbox for Dart polling.
+- **dequeue_send():** Called by Dart at 50ms intervals via FFI to retrieve pending packets.
+- **on_peer_connected/disconnected/data_received():** Called by platform code via FFI to inject Wi-Fi Direct events.
+- **MTU:** 65535 bytes (TCP handles segmentation)
+- **LinkQuality:** ~50 Mbps throughput, 10ms latency, -40 RSSI
+
+**Platform integration (ADR-003):**
+- `WifiDirectService.kt`: Android WifiP2pManager + Bonjour service discovery + TCP sockets on port 9740
+- `WifiDirectManager.dart`: Dart bridge between Kotlin EventChannel/MethodChannel and Rust FFI
+- TCP wire protocol: 1-byte type (Hello=0x01, MeshData=0x02) + 4-byte BE length + payload
 
 ### AODV Routing (`routing/aodv.rs`)
 
@@ -794,7 +837,7 @@ Client Apps ──▶ REST (axum)     ──▶ Node methods / Database queries
 | `/v1/messages/` | CRUD + mark-read | Send messages, get conversation, delete |
 | `/v1/conversations/` | list, unread count | Conversation summaries with display names |
 | `/v1/contacts/` | CRUD | Add/list/delete contacts |
-| `/v1/network/` | status, routes, dtn | Diagnostics: AODV table, DTN queue, neighbor count |
+| `/v1/network/` | status, routes, dtn, transports | Diagnostics: AODV table, DTN queue, neighbor count, per-transport status |
 
 ### WebSocket API
 
@@ -856,7 +899,7 @@ thread_local! {
 - **Error reporting:** `mycelium_last_error()` retrieves last error, `mycelium_clear_error()` clears it
 - **Plaintext lifetime:** `MessageInfo.plaintext` pointers valid only until next `mycelium_get_messages()` call on the same thread
 
-### Function Groups (48 functions)
+### Function Groups (49 functions)
 
 | Group | Functions | Description |
 |-------|-----------|-------------|
@@ -871,7 +914,7 @@ thread_local! {
 | Transport | `register_ble_transport`, `register_wifi_direct_transport` | Register transports |
 | BLE Events | `ble_on_peer_discovered`, `ble_on_peer_lost`, `ble_on_data_received` | Platform → Rust |
 | Wi-Fi Events | `wifi_on_peer_connected`, `wifi_on_peer_disconnected`, `wifi_on_data_received` | Platform → Rust |
-| Outbox | `ble_dequeue_send` | Rust → Platform polling |
+| Outbox | `ble_dequeue_send`, `wifi_dequeue_send` | Rust → Platform polling |
 | Callbacks | `ble_set_send_callback`, `wifi_set_send_callback` | Rust → Platform direct |
 
 ### Memory Management
@@ -1239,7 +1282,7 @@ BLE scan finds device with Mycelium service UUID
 | Spec Section | Feature | Status | Notes |
 |-------------|---------|--------|-------|
 | §2 Architecture | Rust core + mobile UI | **Implemented** | Flutter instead of Jetpack Compose |
-| §3.1 Wi-Fi Direct | Transport | **Stub** | Trait impl exists, no platform code |
+| §3.1 Wi-Fi Direct | Transport | **Implemented** | Rust outbox + Android WifiP2pManager + Dart bridge (ADR-003) |
 | §3.1 BLE | Transport | **Implemented** | Full dual-role GATT, fragmentation, write queue |
 | §3.1 BT Classic | Transport | **Not started** | Deferred to v0.4 |
 | §3.1 LoRa | Transport | **Not started** | Deferred to v0.4 |
@@ -1279,7 +1322,7 @@ BLE scan finds device with Mycelium service UUID
 2. **Wire Format:** Custom binary codec instead of Cap'n Proto (spec §2.3). Schemas kept as documentation.
 3. **Group Crypto:** Simplified sender keys instead of full MLS tree ratchet (spec §6.2). Adequate for groups <20 members.
 4. **Onboarding:** QR code scanning instead of seed phrase groups (spec §15). Simpler UX.
-5. **Transport:** Only BLE implemented so far. Wi-Fi Direct has trait implementation but no platform code.
+5. **Transport:** BLE and Wi-Fi Direct both implemented. Wi-Fi Direct uses TCP sockets over WifiP2pManager groups (ADR-003).
 
 ---
 

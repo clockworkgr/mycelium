@@ -137,6 +137,28 @@ pub struct NetworkStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct TransportInfo {
+    pub name: String,
+    pub registered: bool,
+    pub peer_count: usize,
+    pub peers: Vec<TransportPeerInfo>,
+    pub mtu: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransportPeerInfo {
+    pub node_id: String,
+    pub rssi: Option<i16>,
+    pub throughput_bps: u32,
+    pub latency_ms: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TransportStatusResponse {
+    pub transports: Vec<TransportInfo>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RouteEntryResponse {
     pub destination: String,
     pub next_hop: String,

@@ -19,6 +19,7 @@ class _DebugScreenState extends State<DebugScreen> {
 
   Map<String, dynamic>? _nodeStatus;
   Map<String, dynamic>? _networkStatus;
+  Map<String, dynamic>? _transportStatus;
   List<dynamic>? _routes;
   List<dynamic>? _dtnBundles;
   String? _error;
@@ -45,6 +46,7 @@ class _DebugScreenState extends State<DebugScreen> {
       final results = await Future.wait([
         _api.getNodeStatus(),
         _api.getNetworkStatus(),
+        _api.getTransportStatus(),
         _api.getRoutes(),
         _api.getDtnBundles(),
       ]);
@@ -52,8 +54,9 @@ class _DebugScreenState extends State<DebugScreen> {
         setState(() {
           _nodeStatus = results[0] as Map<String, dynamic>;
           _networkStatus = results[1] as Map<String, dynamic>;
-          _routes = results[2] as List<dynamic>;
-          _dtnBundles = results[3] as List<dynamic>;
+          _transportStatus = results[2] as Map<String, dynamic>;
+          _routes = results[3] as List<dynamic>;
+          _dtnBundles = results[4] as List<dynamic>;
           _error = null;
         });
       }
@@ -107,6 +110,8 @@ class _DebugScreenState extends State<DebugScreen> {
                   _buildNodeInfoCard(),
                   const SizedBox(height: 12),
                   _buildNetworkStatusCard(),
+                  const SizedBox(height: 12),
+                  _buildTransportsCard(),
                   const SizedBox(height: 12),
                   _buildRoutingTableCard(),
                   const SizedBox(height: 12),
@@ -183,6 +188,106 @@ class _DebugScreenState extends State<DebugScreen> {
         ),
       ),
     );
+  }
+
+  Widget _buildTransportsCard() {
+    final ts = _transportStatus;
+    final transports = (ts?['transports'] as List<dynamic>?) ?? [];
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Transports', style: Theme.of(context).textTheme.titleMedium),
+            const Divider(),
+            if (ts != null)
+              ...transports.map((t) => _transportSection(t))
+            else
+              const Center(child: CircularProgressIndicator()),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _transportSection(dynamic t) {
+    final name = t['name'] ?? '';
+    final registered = t['registered'] == true;
+    final peerCount = t['peer_count'] ?? 0;
+    final mtu = t['mtu'] ?? 0;
+    final peers = (t['peers'] as List<dynamic>?) ?? [];
+    final label = name == 'ble' ? 'BLE' : 'Wi-Fi Direct';
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                width: 10,
+                height: 10,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: registered ? Colors.green : Colors.grey,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
+            ],
+          ),
+          const SizedBox(height: 4),
+          _row('Registered', '$registered'),
+          _row('Peers', '$peerCount'),
+          if (registered) _row('MTU', '$mtu bytes'),
+          if (peers.isNotEmpty)
+            ...peers.map((p) => _transportPeerRow(p)),
+        ],
+      ),
+    );
+  }
+
+  Widget _transportPeerRow(dynamic peer) {
+    final nodeId = _shortHex(peer['node_id'] ?? '');
+    final rssi = peer['rssi'];
+    final throughput = peer['throughput_bps'] ?? 0;
+    final latency = peer['latency_ms'] ?? 0;
+
+    return Padding(
+      padding: const EdgeInsets.only(left: 18, top: 2),
+      child: Row(
+        children: [
+          const Icon(Icons.devices, size: 14, color: Colors.grey),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  nodeId,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12),
+                ),
+                Text(
+                  '${rssi != null ? "RSSI: ${rssi}dBm  " : ""}'
+                  '${_formatThroughput(throughput)}  '
+                  '${latency}ms',
+                  style: const TextStyle(fontSize: 11, color: Colors.grey),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  String _formatThroughput(dynamic bps) {
+    final b = (bps is int) ? bps : 0;
+    if (b < 1000) return '$b bps';
+    if (b < 1000000) return '${(b / 1000).toStringAsFixed(0)} Kbps';
+    return '${(b / 1000000).toStringAsFixed(1)} Mbps';
   }
 
   Widget _buildRoutingTableCard() {

@@ -6,8 +6,13 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 
+use mycelium_core::transport::Transport;
+
 use crate::state::AppState;
-use crate::types::{ApiError, DtnBundleResponse, NetworkStatusResponse, RouteEntryResponse};
+use crate::types::{
+    ApiError, DtnBundleResponse, NetworkStatusResponse, RouteEntryResponse, TransportInfo,
+    TransportPeerInfo, TransportStatusResponse,
+};
 
 /// GET /v1/network/status — Network overview
 pub async fn get_status(
@@ -103,4 +108,81 @@ pub async fn get_dtn_bundles(
         .collect();
 
     Json(bundles)
+}
+
+/// GET /v1/network/transports — Per-transport status
+pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStatusResponse> {
+    let mut transports = Vec::new();
+
+    // BLE transport
+    {
+        let guard = state.node.ble_transport.read().await;
+        if let Some(ref ble) = *guard {
+            let peers = ble.connected_peers();
+            let peer_infos: Vec<TransportPeerInfo> = peers
+                .iter()
+                .map(|p| {
+                    let lq = ble.link_quality(p);
+                    TransportPeerInfo {
+                        node_id: hex::encode(p.as_bytes()),
+                        rssi: lq.and_then(|q| q.rssi),
+                        throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                        latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                    }
+                })
+                .collect();
+            transports.push(TransportInfo {
+                name: "ble".to_string(),
+                registered: true,
+                peer_count: peer_infos.len(),
+                mtu: ble.mtu(),
+                peers: peer_infos,
+            });
+        } else {
+            transports.push(TransportInfo {
+                name: "ble".to_string(),
+                registered: false,
+                peer_count: 0,
+                peers: Vec::new(),
+                mtu: 0,
+            });
+        }
+    }
+
+    // Wi-Fi Direct transport
+    {
+        let guard = state.node.wifi_transport.read().await;
+        if let Some(ref wifi) = *guard {
+            let peers = wifi.connected_peers();
+            let peer_infos: Vec<TransportPeerInfo> = peers
+                .iter()
+                .map(|p| {
+                    let lq = wifi.link_quality(p);
+                    TransportPeerInfo {
+                        node_id: hex::encode(p.as_bytes()),
+                        rssi: lq.and_then(|q| q.rssi),
+                        throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                        latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                    }
+                })
+                .collect();
+            transports.push(TransportInfo {
+                name: "wifi_direct".to_string(),
+                registered: true,
+                peer_count: peer_infos.len(),
+                mtu: wifi.mtu(),
+                peers: peer_infos,
+            });
+        } else {
+            transports.push(TransportInfo {
+                name: "wifi_direct".to_string(),
+                registered: false,
+                peer_count: 0,
+                peers: Vec::new(),
+                mtu: 0,
+            });
+        }
+    }
+
+    Json(TransportStatusResponse { transports })
 }

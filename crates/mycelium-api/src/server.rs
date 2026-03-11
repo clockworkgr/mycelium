@@ -49,6 +49,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/network/status", get(network::get_status))
         .route("/v1/network/routes", get(network::get_routes))
         .route("/v1/network/dtn", get(network::get_dtn_bundles))
+        .route("/v1/network/transports", get(network::get_transports))
         // WebSocket
         .route("/v1/ws", get(ws::ws_upgrade))
         // Middleware

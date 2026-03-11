@@ -178,6 +178,12 @@ class ApiClient {
     return _decodeList(response);
   }
 
+  Future<Map<String, dynamic>> getTransportStatus() async {
+    final response =
+        await _client.get(Uri.parse('$_baseUrl/v1/network/transports'));
+    return _decode(response);
+  }
+
   // --- Groups ---
 
   Future<List<dynamic>> getGroups() async {
