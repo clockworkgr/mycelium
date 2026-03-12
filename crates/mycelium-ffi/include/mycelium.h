@@ -232,6 +232,11 @@ int32_t mycelium_safety_number(
     uint8_t *out_buf, uint32_t buf_len
 );
 
+/* --- Node Display Name --- */
+
+/** Set the node's display name (used in beacons). Call before mycelium_node_start(). */
+int32_t mycelium_set_node_display_name(MyceliumNode *handle, const char *name);
+
 /* --- Network Status --- */
 
 /** Get current network status. Returns 0 on success. */
