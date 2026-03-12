@@ -164,6 +164,7 @@ pub struct TransportInfo {
     pub peer_count: usize,
     pub peers: Vec<TransportPeerInfo>,
     pub mtu: usize,
+    pub outbox_depth: usize,
 }
 
 #[derive(Debug, Serialize)]

@@ -272,6 +272,7 @@ class _DebugScreenState extends State<DebugScreen> {
           _row('Registered', '$registered'),
           _row('Peers', '$peerCount'),
           if (registered) _row('MTU', '$mtu bytes'),
+          if (registered) _row('Outbox', '${t['outbox_depth'] ?? 0}'),
           if (peers.isNotEmpty)
             ...peers.map((p) => _transportPeerRow(p)),
         ],

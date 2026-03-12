@@ -48,6 +48,11 @@ impl WifiDirectTransport {
         }
     }
 
+    /// Number of packets waiting in the outbox.
+    pub fn outbox_len(&self) -> usize {
+        self.outbox.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
     /// Dequeue a pending send from the outbox.
     /// Returns `Some((peer, data))` if there was a packet waiting, `None` otherwise.
     pub fn dequeue_send(&self) -> Option<(NodeId, Vec<u8>)> {

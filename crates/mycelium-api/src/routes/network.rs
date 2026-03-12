@@ -157,6 +157,7 @@ pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStat
                 registered: true,
                 peer_count: peer_infos.len(),
                 mtu: ble.mtu(),
+                outbox_depth: ble.outbox_len(),
                 peers: peer_infos,
             });
         } else {
@@ -166,6 +167,7 @@ pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStat
                 peer_count: 0,
                 peers: Vec::new(),
                 mtu: 0,
+                outbox_depth: 0,
             });
         }
     }
@@ -192,6 +194,7 @@ pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStat
                 registered: true,
                 peer_count: peer_infos.len(),
                 mtu: wifi.mtu(),
+                outbox_depth: wifi.outbox_len(),
                 peers: peer_infos,
             });
         } else {
@@ -201,6 +204,7 @@ pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStat
                 peer_count: 0,
                 peers: Vec::new(),
                 mtu: 0,
+                outbox_depth: 0,
             });
         }
     }
