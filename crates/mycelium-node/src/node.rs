@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -104,6 +104,8 @@ pub struct Node {
     pub wifi_transport: Arc<RwLock<Option<Arc<mycelium_core::transport::wifi_direct::WifiDirectTransport>>>>,
     /// Broadcast channel for node events (consumed by API server / WebSocket clients).
     pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
+    /// Dedup set for channel messages (prevents re-processing flooded messages).
+    seen_channel_messages: Arc<RwLock<HashSet<MessageId>>>,
 }
 
 impl Node {
@@ -154,6 +156,7 @@ impl Node {
             ble_transport: Arc::new(RwLock::new(None)),
             wifi_transport: Arc::new(RwLock::new(None)),
             event_tx,
+            seen_channel_messages: Arc::new(RwLock::new(HashSet::new())),
         }
     }
 
@@ -304,6 +307,7 @@ impl Node {
         let pending_routes = self.pending_routes.clone();
         let battery = self.battery.clone();
         let event_tx = self.event_tx.clone();
+        let seen_channel_messages = self.seen_channel_messages.clone();
         let cancel = self.cancel.clone();
         let node_id = self.node_id;
         let identity_bytes = self.identity.to_bytes();
@@ -339,6 +343,7 @@ impl Node {
                                     &pending_routes,
                                     &battery,
                                     &event_tx,
+                                    &seen_channel_messages,
                                 ).await;
                             }
                             Err(e) => {
@@ -1029,6 +1034,7 @@ impl Node {
         pending_routes: &RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
         battery: &RwLock<BatteryManager>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+        seen_channel_messages: &RwLock<HashSet<MessageId>>,
     ) {
         match event {
             TransportEvent::NeighborDiscovered { peer, transport } => {
@@ -1449,6 +1455,23 @@ impl Node {
                             local_id,
                         )
                         .await;
+                    }
+                    WirePayloadType::ChannelMessage => {
+                        Self::handle_channel_message(
+                            &envelope,
+                            body,
+                            db,
+                            transport_manager,
+                            local_id,
+                            seen_channel_messages,
+                            event_tx,
+                        )
+                        .await;
+                    }
+                    WirePayloadType::ChannelSubscribe
+                    | WirePayloadType::ChannelUnsubscribe
+                    | WirePayloadType::ChannelModeration => {
+                        debug!("Channel control message {:?} received, not yet handled", payload_type);
                     }
                 }
             }
@@ -2587,6 +2610,83 @@ impl Node {
         };
 
         let _ = db.save_contact(&contact);
+    }
+
+    // --- Channel message handler ---
+
+    /// Handle an incoming channel message: dedup, store if subscribed, flood to peers.
+    async fn handle_channel_message(
+        envelope: &Envelope,
+        body: &[u8],
+        db: &Database,
+        transport_manager: &TransportManager,
+        local_id: NodeId,
+        seen: &RwLock<HashSet<MessageId>>,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+    ) {
+        let (channel_id, content_type, data) = match wire::deserialize_channel_message(body) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("Bad channel message: {}", e);
+                return;
+            }
+        };
+
+        // Dedup: skip if we've already seen this message_id
+        {
+            let mut seen_set = seen.write().await;
+            if !seen_set.insert(envelope.message_id) {
+                debug!("Duplicate channel message {}, skipping", envelope.message_id);
+                return;
+            }
+            // Cap the dedup set to prevent unbounded growth
+            if seen_set.len() > 10_000 {
+                seen_set.clear();
+            }
+        }
+
+        // Store if we're subscribed to this channel
+        if db.is_subscribed(&channel_id).unwrap_or(false) {
+            let msg_id = *envelope.message_id.as_bytes();
+            let timestamp = if envelope.device_timestamp > 0 {
+                envelope.device_timestamp
+            } else {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            };
+            let _ = db.store_channel_message(
+                &msg_id,
+                &channel_id,
+                &envelope.source,
+                &data,
+                content_type,
+                timestamp,
+            );
+
+            // Notify WebSocket clients
+            let _ = event_tx.send(NodeEvent::MessageReceived {
+                source: envelope.source,
+                message_id: envelope.message_id,
+                data,
+                content_type,
+                timestamp,
+            });
+        }
+
+        // Flood to all connected peers (except the one who sent it)
+        if envelope.ttl > 0 {
+            let mut fwd = envelope.clone();
+            fwd.forward();
+            let fwd_data = fwd.serialize();
+            let peers = transport_manager.known_peers().await;
+            for p in peers {
+                if p != envelope.source && p != local_id {
+                    let _ = transport_manager.send(&p, &fwd_data).await;
+                }
+            }
+        }
     }
 
     // --- Receipt handler ---
