@@ -54,6 +54,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/network/transports", get(network::get_transports))
         .route("/v1/network/peers", get(network::get_peers))
         .route("/v1/network/pending", get(network::get_pending))
+        .route("/v1/network/events", get(network::get_events))
         // WebSocket
         .route("/v1/ws", get(ws::ws_upgrade))
         // Middleware
@@ -70,11 +71,24 @@ pub async fn start_server(
 
     // Spawn bridge task: NodeEvent → WsServerMessage
     let ws_tx = state.event_tx.clone();
+    let bridge_log = state.event_log.clone();
+    let bridge_start = state.started_at;
     let mut node_rx = node.event_tx.subscribe();
     tokio::spawn(async move {
         loop {
             match node_rx.recv().await {
                 Ok(event) => {
+                    let (evt_type, detail) = event_summary(&event);
+                    if let Ok(mut log) = bridge_log.lock() {
+                        if log.len() >= 50 {
+                            log.pop_front();
+                        }
+                        log.push_back(crate::types::EventEntry {
+                            uptime_secs: bridge_start.elapsed().as_secs(),
+                            event_type: evt_type,
+                            detail,
+                        });
+                    }
                     if let Some(ws_msg) = convert_node_event(event) {
                         let _ = ws_tx.send(ws_msg);
                     }
@@ -131,6 +145,34 @@ pub async fn start_server(
     });
 
     Ok(handle)
+}
+
+/// Produce a short (event_type, detail) pair for the event log ring buffer.
+fn event_summary(event: &NodeEvent) -> (String, String) {
+    match event {
+        NodeEvent::MessageReceived { source, .. } => (
+            "message_received".to_string(),
+            format!("from {}", &hex::encode(source.as_bytes())[..16]),
+        ),
+        NodeEvent::ReceiptUpdated {
+            message_id, status, ..
+        } => (
+            "receipt".to_string(),
+            format!("{} {}", status, &message_id.to_string()[..8]),
+        ),
+        NodeEvent::PeerDiscovered {
+            peer_id, transport, ..
+        } => (
+            "peer_discovered".to_string(),
+            format!("{} via {}", &hex::encode(peer_id.as_bytes())[..16], transport),
+        ),
+        NodeEvent::PeerLost {
+            peer_id, transport, ..
+        } => (
+            "peer_lost".to_string(),
+            format!("{} via {}", &hex::encode(peer_id.as_bytes())[..16], transport),
+        ),
+    }
 }
 
 /// Convert a NodeEvent into a WsServerMessage for WebSocket broadcast.

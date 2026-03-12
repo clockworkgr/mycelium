@@ -23,6 +23,7 @@ class _DebugScreenState extends State<DebugScreen> {
   Map<String, dynamic>? _trustStats;
   List<dynamic>? _routes;
   List<dynamic>? _dtnBundles;
+  List<dynamic>? _events;
   String? _error;
 
   @override
@@ -51,6 +52,7 @@ class _DebugScreenState extends State<DebugScreen> {
         _api.getTrustStats(),
         _api.getRoutes(),
         _api.getDtnBundles(),
+        _api.getEvents(),
       ]);
       if (mounted) {
         setState(() {
@@ -60,6 +62,7 @@ class _DebugScreenState extends State<DebugScreen> {
           _trustStats = results[3] as Map<String, dynamic>;
           _routes = results[4] as List<dynamic>;
           _dtnBundles = results[5] as List<dynamic>;
+          _events = results[6] as List<dynamic>;
           _error = null;
         });
       }
@@ -121,6 +124,8 @@ class _DebugScreenState extends State<DebugScreen> {
                   _buildRoutingTableCard(),
                   const SizedBox(height: 12),
                   _buildDtnBundlesCard(),
+                  const SizedBox(height: 12),
+                  _buildEventsCard(),
                 ],
               ),
             ),
@@ -445,6 +450,86 @@ class _DebugScreenState extends State<DebugScreen> {
                 ),
               ],
             ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildEventsCard() {
+    final events = _events;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Recent Events (${events?.length ?? 0})',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const Divider(),
+            if (events != null && events.isNotEmpty)
+              ...events.reversed.map((e) => _eventRow(e))
+            else
+              const Padding(
+                padding: EdgeInsets.symmetric(vertical: 8),
+                child: Text(
+                  'No events yet',
+                  style: TextStyle(color: Colors.grey),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _eventRow(dynamic event) {
+    final type = event['event_type'] ?? '';
+    final detail = event['detail'] ?? '';
+    final uptime = event['uptime_secs'] ?? 0;
+
+    IconData icon;
+    Color iconColor;
+    switch (type) {
+      case 'message_received':
+        icon = Icons.mail;
+        iconColor = Colors.blue;
+        break;
+      case 'receipt':
+        icon = Icons.check_circle;
+        iconColor = Colors.green;
+        break;
+      case 'peer_discovered':
+        icon = Icons.person_add;
+        iconColor = Colors.green;
+        break;
+      case 'peer_lost':
+        icon = Icons.person_off;
+        iconColor = Colors.red;
+        break;
+      default:
+        icon = Icons.info;
+        iconColor = Colors.grey;
+    }
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 3),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: iconColor),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '$type: $detail',
+              style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          Text(
+            _formatUptime(uptime),
+            style: const TextStyle(fontSize: 10, color: Colors.grey),
           ),
         ],
       ),

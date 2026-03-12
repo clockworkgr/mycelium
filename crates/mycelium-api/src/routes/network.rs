@@ -10,8 +10,9 @@ use mycelium_core::transport::Transport;
 
 use crate::state::AppState;
 use crate::types::{
-    ApiError, DtnBundleResponse, NetworkStatusResponse, PeerResponse, PendingResponse,
-    RouteEntryResponse, TransportInfo, TransportPeerInfo, TransportStatusResponse,
+    ApiError, DtnBundleResponse, EventEntry, NetworkStatusResponse, PeerResponse,
+    PendingResponse, RouteEntryResponse, TransportInfo, TransportPeerInfo,
+    TransportStatusResponse,
 };
 
 /// GET /v1/network/status — Network overview
@@ -129,6 +130,16 @@ pub async fn get_pending(State(state): State<AppState>) -> Json<PendingResponse>
             .map(|n| hex::encode(n.as_bytes()))
             .collect(),
     })
+}
+
+/// GET /v1/network/events — Recent event log
+pub async fn get_events(State(state): State<AppState>) -> Json<Vec<EventEntry>> {
+    let entries = if let Ok(log) = state.event_log.lock() {
+        log.iter().cloned().collect()
+    } else {
+        Vec::new()
+    };
+    Json(entries)
 }
 
 /// GET /v1/network/transports — Per-transport status

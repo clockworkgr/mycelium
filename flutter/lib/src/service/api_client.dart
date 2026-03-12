@@ -190,6 +190,12 @@ class ApiClient {
     return _decode(response);
   }
 
+  Future<List<dynamic>> getEvents() async {
+    final response =
+        await _client.get(Uri.parse('$_baseUrl/v1/network/events'));
+    return _decodeList(response);
+  }
+
   // --- Groups ---
 
   Future<List<dynamic>> getGroups() async {
