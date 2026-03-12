@@ -247,6 +247,23 @@ class ApiClient {
     return _decodeCreated(response);
   }
 
+  // --- Emergency ---
+
+  Future<Map<String, dynamic>> sendEmergencyBroadcast(int level, String message) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/emergency/broadcast'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'level': level, 'message': message}),
+    );
+    return _decodeCreated(response);
+  }
+
+  Future<List<dynamic>> getEmergencyHistory() async {
+    final response =
+        await _client.get(Uri.parse('$_baseUrl/v1/emergency/history'));
+    return _decodeList(response);
+  }
+
   // --- Groups ---
 
   Future<List<dynamic>> getGroups() async {

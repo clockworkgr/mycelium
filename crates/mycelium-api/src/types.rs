@@ -309,6 +309,27 @@ pub enum WsServerMessage {
     },
 }
 
+// --- Emergency ---
+
+#[derive(Debug, Deserialize)]
+pub struct EmergencyBroadcastRequest {
+    pub level: u8,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmergencyBroadcastResponse {
+    pub message_id: String,
+    pub level: u8,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmergencyHistoryEntry {
+    pub uptime_secs: u64,
+    pub event_type: String,
+    pub detail: String,
+}
+
 // --- Events ---
 
 #[derive(Debug, Clone, Serialize)]

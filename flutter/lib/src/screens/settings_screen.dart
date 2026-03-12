@@ -5,6 +5,7 @@ import 'package:qr_flutter/qr_flutter.dart';
 import '../providers/developer_mode_provider.dart';
 import '../providers/network_status_provider.dart';
 import '../providers/service_provider.dart';
+import '../service/api_client.dart';
 import '../widgets/network_status_card.dart';
 import '../widgets/node_id_display.dart';
 
@@ -43,6 +44,88 @@ class SettingsScreen extends ConsumerWidget {
               ),
             ],
           ),
+        ),
+      ),
+    );
+  }
+
+  void _showEmergencyDialog(BuildContext context) {
+    int selectedLevel = 1;
+    final messageController = TextEditingController();
+
+    showDialog(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDialogState) => AlertDialog(
+          title: const Text('Emergency Broadcast'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Level:'),
+              const SizedBox(height: 8),
+              SegmentedButton<int>(
+                segments: const [
+                  ButtonSegment(value: 1, label: Text('Priority')),
+                  ButtonSegment(value: 2, label: Text('Urgent')),
+                  ButtonSegment(value: 3, label: Text('Critical')),
+                ],
+                selected: {selectedLevel},
+                onSelectionChanged: (set) {
+                  setDialogState(() => selectedLevel = set.first);
+                },
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: messageController,
+                decoration: const InputDecoration(
+                  hintText: 'Describe the emergency...',
+                  border: OutlineInputBorder(),
+                ),
+                maxLines: 3,
+                autofocus: true,
+              ),
+              if (selectedLevel == 3)
+                const Padding(
+                  padding: EdgeInsets.only(top: 8),
+                  child: Text(
+                    'Critical: requires 3+ trusted cosigners to relay',
+                    style: TextStyle(color: Colors.red, fontSize: 12),
+                  ),
+                ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              style: FilledButton.styleFrom(backgroundColor: Colors.red),
+              onPressed: () async {
+                final msg = messageController.text.trim();
+                if (msg.isEmpty) return;
+                Navigator.pop(ctx);
+                try {
+                  final api = ApiClient();
+                  await api.sendEmergencyBroadcast(selectedLevel, msg);
+                  api.dispose();
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      const SnackBar(content: Text('Emergency broadcast sent')),
+                    );
+                  }
+                } catch (e) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Failed to send: $e')),
+                    );
+                  }
+                }
+              },
+              child: const Text('SEND'),
+            ),
+          ],
         ),
       ),
     );
@@ -124,6 +207,17 @@ class SettingsScreen extends ConsumerWidget {
                 padding: const EdgeInsets.all(16),
                 child: Text('Network error: $err'),
               ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Emergency broadcast
+          Card(
+            child: ListTile(
+              leading: const Icon(Icons.warning_amber, color: Colors.red),
+              title: const Text('Emergency Broadcast'),
+              subtitle: const Text('Send alert to mesh network'),
+              onTap: () => _showEmergencyDialog(context),
             ),
           ),
           const SizedBox(height: 16),
