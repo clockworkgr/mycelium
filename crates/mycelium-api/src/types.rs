@@ -126,6 +126,15 @@ pub struct CreateGroupResponse {
     pub group_id: String,
 }
 
+// --- Trust ---
+
+#[derive(Debug, Serialize)]
+pub struct TrustStatsResponse {
+    pub total_contacts: usize,
+    pub total_vouches: usize,
+    pub verified_sessions: usize,
+}
+
 // --- Network / Diagnostics ---
 
 #[derive(Debug, Serialize)]

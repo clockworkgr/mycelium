@@ -25,6 +25,7 @@ pub fn build_router(state: AppState) -> Router {
         // Node
         .route("/v1/node/status", get(node::get_status))
         .route("/v1/node/identity", get(node::get_identity))
+        .route("/v1/node/trust", get(node::get_trust_stats))
         // Messages
         .route("/v1/messages", post(messages::send_message))
         .route("/v1/messages/{peer_id}", get(messages::get_messages))

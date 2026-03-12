@@ -4,7 +4,7 @@ use axum::extract::State;
 use axum::Json;
 
 use crate::state::AppState;
-use crate::types::{NodeIdentityResponse, NodeStatusResponse};
+use crate::types::{NodeIdentityResponse, NodeStatusResponse, TrustStatsResponse};
 
 /// GET /v1/node/status
 pub async fn get_status(
@@ -26,6 +26,34 @@ pub async fn get_status(
         session_count,
         group_count,
         prekey_remaining,
+    })
+}
+
+/// GET /v1/node/trust — Trust graph stats
+pub async fn get_trust_stats(
+    State(state): State<AppState>,
+) -> Json<TrustStatsResponse> {
+    let total_contacts = state
+        .node
+        .db
+        .list_contacts()
+        .map(|c| c.len())
+        .unwrap_or(0);
+
+    let trust_graph = state.node.trust_graph.read().await;
+    let self_id = state.node.node_id;
+    let total_vouches = trust_graph.vouched_by_node(&self_id).len();
+
+    let session_mgr = state.node.session_manager.read().await;
+    let verified_sessions = session_mgr
+        .all_sessions()
+        .filter(|(_, s)| s.is_verified)
+        .count();
+
+    Json(TrustStatsResponse {
+        total_contacts,
+        total_vouches,
+        verified_sessions,
     })
 }
 

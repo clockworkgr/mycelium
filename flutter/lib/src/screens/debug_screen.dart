@@ -20,6 +20,7 @@ class _DebugScreenState extends State<DebugScreen> {
   Map<String, dynamic>? _nodeStatus;
   Map<String, dynamic>? _networkStatus;
   Map<String, dynamic>? _transportStatus;
+  Map<String, dynamic>? _trustStats;
   List<dynamic>? _routes;
   List<dynamic>? _dtnBundles;
   String? _error;
@@ -47,6 +48,7 @@ class _DebugScreenState extends State<DebugScreen> {
         _api.getNodeStatus(),
         _api.getNetworkStatus(),
         _api.getTransportStatus(),
+        _api.getTrustStats(),
         _api.getRoutes(),
         _api.getDtnBundles(),
       ]);
@@ -55,8 +57,9 @@ class _DebugScreenState extends State<DebugScreen> {
           _nodeStatus = results[0] as Map<String, dynamic>;
           _networkStatus = results[1] as Map<String, dynamic>;
           _transportStatus = results[2] as Map<String, dynamic>;
-          _routes = results[3] as List<dynamic>;
-          _dtnBundles = results[4] as List<dynamic>;
+          _trustStats = results[3] as Map<String, dynamic>;
+          _routes = results[4] as List<dynamic>;
+          _dtnBundles = results[5] as List<dynamic>;
           _error = null;
         });
       }
@@ -109,6 +112,8 @@ class _DebugScreenState extends State<DebugScreen> {
                 children: [
                   _buildNodeInfoCard(),
                   const SizedBox(height: 12),
+                  _buildTrustStatsCard(),
+                  const SizedBox(height: 12),
                   _buildNetworkStatusCard(),
                   const SizedBox(height: 12),
                   _buildTransportsCard(),
@@ -140,6 +145,28 @@ class _DebugScreenState extends State<DebugScreen> {
               _row('Sessions', '${status['session_count'] ?? 0}'),
               _row('Groups', '${status['group_count'] ?? 0}'),
               _row('OTP Prekeys', '${status['prekey_remaining'] ?? 0}'),
+            ] else
+              const Center(child: CircularProgressIndicator()),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTrustStatsCard() {
+    final trust = _trustStats;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Trust & Identity', style: Theme.of(context).textTheme.titleMedium),
+            const Divider(),
+            if (trust != null) ...[
+              _row('Contacts', '${trust['total_contacts'] ?? 0}'),
+              _row('Vouches Given', '${trust['total_vouches'] ?? 0}'),
+              _row('Verified Sessions', '${trust['verified_sessions'] ?? 0}'),
             ] else
               const Center(child: CircularProgressIndicator()),
           ],
