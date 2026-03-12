@@ -10,6 +10,8 @@ pub struct Beacon {
     pub battery_level: u8,
     pub neighbor_count: u16,
     pub lamport_clock: u64,
+    /// Truncated hash of group discovery key for auto-trust matching.
+    pub group_discovery_hash: Option<[u8; 8]>,
 }
 
 impl Beacon {
@@ -37,6 +39,17 @@ impl Beacon {
         buf.push(self.battery_level);
         buf.extend_from_slice(&self.neighbor_count.to_le_bytes());
         buf.extend_from_slice(&self.lamport_clock.to_le_bytes());
+
+        // Optional group discovery hash (1 byte flag + 8 bytes hash)
+        match &self.group_discovery_hash {
+            Some(hash) => {
+                buf.push(1);
+                buf.extend_from_slice(hash);
+            }
+            None => {
+                buf.push(0);
+            }
+        }
 
         buf
     }
@@ -86,6 +99,21 @@ impl Beacon {
         let lamport_clock = u64::from_le_bytes(
             data[offset..offset + 8].try_into().ok()?,
         );
+        offset += 8;
+
+        // Optional group discovery hash
+        let group_discovery_hash = if offset < data.len() && data[offset] == 1 {
+            offset += 1;
+            if offset + 8 <= data.len() {
+                let mut hash = [0u8; 8];
+                hash.copy_from_slice(&data[offset..offset + 8]);
+                Some(hash)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         Some(Beacon {
             node_id: NodeId(nid),
@@ -95,6 +123,7 @@ impl Beacon {
             battery_level,
             neighbor_count,
             lamport_clock,
+            group_discovery_hash,
         })
     }
 }
@@ -113,6 +142,7 @@ mod tests {
             battery_level: 75,
             neighbor_count: 5,
             lamport_clock: 42,
+            group_discovery_hash: None,
         };
 
         let bytes = beacon.serialize();
@@ -124,6 +154,7 @@ mod tests {
         assert_eq!(beacon.battery_level, decoded.battery_level);
         assert_eq!(beacon.neighbor_count, decoded.neighbor_count);
         assert_eq!(beacon.lamport_clock, decoded.lamport_clock);
+        assert_eq!(decoded.group_discovery_hash, None);
     }
 
     #[test]
@@ -149,6 +180,7 @@ mod tests {
             battery_level: 50,
             neighbor_count: 2,
             lamport_clock: 100,
+            group_discovery_hash: None,
         };
         let mut data = beacon.serialize();
         // Corrupt node_type byte (offset 4 + 32 = 36)
@@ -167,6 +199,7 @@ mod tests {
             battery_level: 90,
             neighbor_count: 10,
             lamport_clock: 42,
+            group_discovery_hash: None,
         };
         let data = beacon.serialize();
         let decoded = Beacon::deserialize(&data).unwrap();
@@ -184,10 +217,48 @@ mod tests {
             battery_level: 0,
             neighbor_count: 0,
             lamport_clock: 0,
+            group_discovery_hash: None,
         };
         let data = beacon.serialize();
         let decoded = Beacon::deserialize(&data).unwrap();
         assert_eq!(decoded.display_name, "");
         assert_eq!(decoded.battery_level, 0);
+    }
+
+    #[test]
+    fn test_beacon_with_group_discovery_hash() {
+        let hash = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let beacon = Beacon {
+            node_id: NodeId([0xBB; 32]),
+            node_type: NodeType::Phone,
+            display_name: "GroupNode".to_string(),
+            protocol_version: ProtocolVersion::CURRENT,
+            battery_level: 80,
+            neighbor_count: 3,
+            lamport_clock: 10,
+            group_discovery_hash: Some(hash),
+        };
+        let data = beacon.serialize();
+        let decoded = Beacon::deserialize(&data).unwrap();
+        assert_eq!(decoded.group_discovery_hash, Some(hash));
+        assert_eq!(decoded.display_name, "GroupNode");
+    }
+
+    #[test]
+    fn test_beacon_without_group_discovery_hash_backward_compat() {
+        // Old-style beacon without the group discovery flag
+        let beacon = Beacon {
+            node_id: NodeId([0xCC; 32]),
+            node_type: NodeType::Phone,
+            display_name: "Old".to_string(),
+            protocol_version: ProtocolVersion::CURRENT,
+            battery_level: 50,
+            neighbor_count: 1,
+            lamport_clock: 5,
+            group_discovery_hash: None,
+        };
+        let data = beacon.serialize();
+        let decoded = Beacon::deserialize(&data).unwrap();
+        assert_eq!(decoded.group_discovery_hash, None);
     }
 }

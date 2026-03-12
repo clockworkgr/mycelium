@@ -106,6 +106,8 @@ pub struct Node {
     pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
     /// Dedup set for channel messages (prevents re-processing flooded messages).
     seen_channel_messages: Arc<RwLock<HashSet<MessageId>>>,
+    /// Truncated hash of local group discovery key for beacon matching.
+    pub local_group_hash: Option<[u8; 8]>,
 }
 
 impl Node {
@@ -135,6 +137,20 @@ impl Node {
 
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
 
+        // Compute local group discovery hash from config
+        let local_group_hash = config.group_seed.as_ref().and_then(|hex_str| {
+            let key_bytes = hex::decode(hex_str).ok()?;
+            if key_bytes.len() == 32 {
+                use sha2::{Sha256, Digest};
+                let hash = Sha256::digest(&key_bytes);
+                let mut truncated = [0u8; 8];
+                truncated.copy_from_slice(&hash[..8]);
+                Some(truncated)
+            } else {
+                None
+            }
+        });
+
         Self {
             identity,
             node_id,
@@ -157,6 +173,7 @@ impl Node {
             wifi_transport: Arc::new(RwLock::new(None)),
             event_tx,
             seen_channel_messages: Arc::new(RwLock::new(HashSet::new())),
+            local_group_hash,
         }
     }
 
@@ -308,6 +325,7 @@ impl Node {
         let battery = self.battery.clone();
         let event_tx = self.event_tx.clone();
         let seen_channel_messages = self.seen_channel_messages.clone();
+        let local_group_hash = self.local_group_hash;
         let cancel = self.cancel.clone();
         let node_id = self.node_id;
         let identity_bytes = self.identity.to_bytes();
@@ -344,6 +362,7 @@ impl Node {
                                     &battery,
                                     &event_tx,
                                     &seen_channel_messages,
+                                    local_group_hash,
                                 ).await;
                             }
                             Err(e) => {
@@ -504,6 +523,7 @@ impl Node {
             crate::config::NodeTypeConfig::Phone => NodeType::Phone,
             crate::config::NodeTypeConfig::Supernode => NodeType::Supernode,
         };
+        let local_group_hash_b = self.local_group_hash;
         let beacon_interval = Duration::from_secs(self.config.beacon_interval_secs.max(1));
 
         tokio::spawn(async move {
@@ -531,6 +551,7 @@ impl Node {
                             battery_level,
                             neighbor_count,
                             lamport_clock: clock_val,
+                            group_discovery_hash: local_group_hash_b,
                         };
 
                         let beacon_data = beacon.serialize();
@@ -1035,6 +1056,7 @@ impl Node {
         battery: &RwLock<BatteryManager>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
         seen_channel_messages: &RwLock<HashSet<MessageId>>,
+        local_group_hash: Option<[u8; 8]>,
     ) {
         match event {
             TransportEvent::NeighborDiscovered { peer, transport } => {
@@ -1423,7 +1445,9 @@ impl Node {
                             body,
                             db,
                             lamport_clock,
+                            trust_graph,
                             local_id,
+                            local_group_hash,
                         )
                         .await;
                     }
@@ -2567,7 +2591,9 @@ impl Node {
         body: &[u8],
         db: &Database,
         lamport_clock: &RwLock<LamportClock>,
+        trust_graph: &RwLock<TrustGraph>,
         local_id: NodeId,
+        local_group_hash: Option<[u8; 8]>,
     ) {
         if envelope.source == local_id {
             return; // Ignore our own beacons
@@ -2604,7 +2630,7 @@ impl Node {
                 // Update last_seen and display name
                 existing.last_seen = Some(now_secs);
                 if !beacon.display_name.is_empty() {
-                    existing.display_name = beacon.display_name;
+                    existing.display_name = beacon.display_name.clone();
                 }
                 existing
             }
@@ -2612,7 +2638,7 @@ impl Node {
                 // Auto-create contact from beacon
                 ContactRecord {
                     node_id: beacon.node_id,
-                    display_name: beacon.display_name,
+                    display_name: beacon.display_name.clone(),
                     public_key: beacon.node_id.as_bytes().to_vec(), // Use node_id as public key placeholder
                     trust_score: 0.0,
                     is_verified: false,
@@ -2622,6 +2648,29 @@ impl Node {
         };
 
         let _ = db.save_contact(&contact);
+
+        // Auto-trust peers with matching group discovery hash
+        if let (Some(local_hash), Some(peer_hash)) =
+            (local_group_hash, beacon.group_discovery_hash)
+        {
+            if local_hash == peer_hash {
+                info!(
+                    "Group discovery match with {} — auto-vouching",
+                    beacon.node_id
+                );
+                let mut tg = trust_graph.write().await;
+                tg.add_vouch(local_id, beacon.node_id);
+                let vouch = mycelium_storage::vouches::VouchRecord {
+                    voucher_id: local_id,
+                    vouchee_id: beacon.node_id,
+                    voucher_public_key: local_id.as_bytes().to_vec(),
+                    display_name: beacon.display_name.clone(),
+                    signature: Vec::new(), // Auto-vouch, no cryptographic sig
+                    timestamp: now_secs,
+                };
+                let _ = db.save_vouch(&vouch);
+            }
+        }
     }
 
     // --- Channel message handler ---
