@@ -23,6 +23,9 @@ pub fn run_all(conn: &Connection) -> Result<(), StorageError> {
     if current_version < 1 {
         migrate_v1(conn)?;
     }
+    if current_version < 2 {
+        migrate_v2(conn)?;
+    }
 
     Ok(())
 }
@@ -118,6 +121,44 @@ fn migrate_v1(conn: &Connection) -> Result<(), StorageError> {
         );
 
         INSERT INTO schema_version (version) VALUES (1);
+        ",
+    )?;
+
+    Ok(())
+}
+
+fn migrate_v2(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "
+        -- Public channels
+        CREATE TABLE IF NOT EXISTS channels (
+            channel_id BLOB PRIMARY KEY,
+            name TEXT NOT NULL,
+            creator_id BLOB NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        );
+
+        -- Channel messages
+        CREATE TABLE IF NOT EXISTS channel_messages (
+            message_id BLOB PRIMARY KEY,
+            channel_id BLOB NOT NULL,
+            source BLOB NOT NULL,
+            data BLOB NOT NULL,
+            content_type INTEGER NOT NULL DEFAULT 0,
+            timestamp INTEGER NOT NULL,
+            FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_channel_messages_channel
+            ON channel_messages(channel_id, timestamp);
+
+        -- Channel subscriptions
+        CREATE TABLE IF NOT EXISTS channel_subscriptions (
+            channel_id BLOB NOT NULL,
+            subscribed_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            PRIMARY KEY (channel_id)
+        );
+
+        INSERT INTO schema_version (version) VALUES (2);
         ",
     )?;
 

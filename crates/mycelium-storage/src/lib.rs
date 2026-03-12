@@ -2,6 +2,7 @@ pub mod db;
 pub mod messages;
 pub mod sessions;
 pub mod contacts;
+pub mod channels;
 pub mod dtn;
 pub mod groups;
 pub mod prekeys;
