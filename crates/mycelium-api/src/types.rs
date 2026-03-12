@@ -16,6 +16,9 @@ pub struct NodeStatusResponse {
     pub session_count: usize,
     pub group_count: usize,
     pub prekey_remaining: usize,
+    pub battery_level: Option<u8>,
+    pub power_mode: String,
+    pub is_charging: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -87,6 +87,10 @@ impl BatteryManager {
     pub fn battery_level(&self) -> Option<u8> {
         self.battery_level
     }
+
+    pub fn is_charging(&self) -> bool {
+        self.is_charging
+    }
 }
 
 impl Default for BatteryManager {

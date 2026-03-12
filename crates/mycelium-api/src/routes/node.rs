@@ -18,6 +18,15 @@ pub async fn get_status(
     let group_count = state.node.groups.read().await.len();
     let prekey_remaining = state.node.prekey_state.read().await.one_time_prekeys.len();
 
+    let (battery_level, power_mode, is_charging) = {
+        let bm = state.node.battery.read().await;
+        (
+            bm.battery_level(),
+            format!("{:?}", bm.power_mode()),
+            bm.is_charging(),
+        )
+    };
+
     Json(NodeStatusResponse {
         node_id,
         display_name,
@@ -26,6 +35,9 @@ pub async fn get_status(
         session_count,
         group_count,
         prekey_remaining,
+        battery_level,
+        power_mode,
+        is_charging,
     })
 }
 

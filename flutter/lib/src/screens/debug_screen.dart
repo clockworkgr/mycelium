@@ -150,6 +150,10 @@ class _DebugScreenState extends State<DebugScreen> {
               _row('Sessions', '${status['session_count'] ?? 0}'),
               _row('Groups', '${status['group_count'] ?? 0}'),
               _row('OTP Prekeys', '${status['prekey_remaining'] ?? 0}'),
+              _row('Battery', status['battery_level'] != null
+                  ? '${status['battery_level']}%${status['is_charging'] == true ? ' (charging)' : ''}'
+                  : 'Unknown'),
+              _row('Power Mode', status['power_mode'] ?? 'Unknown'),
             ] else
               const Center(child: CircularProgressIndicator()),
           ],
