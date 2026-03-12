@@ -196,6 +196,57 @@ class ApiClient {
     return _decodeList(response);
   }
 
+  // --- Channels ---
+
+  Future<List<dynamic>> getChannels() async {
+    final response = await _client.get(Uri.parse('$_baseUrl/v1/channels'));
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> createChannel(String name) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/channels'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'name': name}),
+    );
+    return _decodeCreated(response);
+  }
+
+  Future<void> subscribeChannel(String channelIdHex) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/channels/$channelIdHex/subscribe'),
+    );
+    if (response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}: ${response.body}');
+    }
+  }
+
+  Future<void> unsubscribeChannel(String channelIdHex) async {
+    final response = await _client.delete(
+      Uri.parse('$_baseUrl/v1/channels/$channelIdHex/subscribe'),
+    );
+    if (response.statusCode != 204 && response.statusCode != 200) {
+      throw ApiException('HTTP ${response.statusCode}: ${response.body}');
+    }
+  }
+
+  Future<List<dynamic>> getChannelMessages(String channelIdHex,
+      {int limit = 50, int offset = 0}) async {
+    final response = await _client.get(Uri.parse(
+        '$_baseUrl/v1/channels/$channelIdHex/messages?limit=$limit&offset=$offset'));
+    return _decodeList(response);
+  }
+
+  Future<Map<String, dynamic>> postChannelMessage(
+      String channelIdHex, String text, {int contentType = 0}) async {
+    final response = await _client.post(
+      Uri.parse('$_baseUrl/v1/channels/$channelIdHex/messages'),
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode({'data': text, 'content_type': contentType}),
+    );
+    return _decodeCreated(response);
+  }
+
   // --- Groups ---
 
   Future<List<dynamic>> getGroups() async {
