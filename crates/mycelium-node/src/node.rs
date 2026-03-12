@@ -1473,6 +1473,18 @@ impl Node {
                     | WirePayloadType::ChannelModeration => {
                         debug!("Channel control message {:?} received, not yet handled", payload_type);
                     }
+                    WirePayloadType::EmergencyBroadcast => {
+                        Self::handle_emergency_broadcast(
+                            &envelope,
+                            body,
+                            trust_graph,
+                            transport_manager,
+                            local_id,
+                            seen_channel_messages,
+                            event_tx,
+                        )
+                        .await;
+                    }
                 }
             }
             TransportEvent::LinkQualityChanged { peer, quality, .. } => {
@@ -2676,6 +2688,102 @@ impl Node {
         }
 
         // Flood to all connected peers (except the one who sent it)
+        if envelope.ttl > 0 {
+            let mut fwd = envelope.clone();
+            fwd.forward();
+            let fwd_data = fwd.serialize();
+            let peers = transport_manager.known_peers().await;
+            for p in peers {
+                if p != envelope.source && p != local_id {
+                    let _ = transport_manager.send(&p, &fwd_data).await;
+                }
+            }
+        }
+    }
+
+    // --- Emergency broadcast handler ---
+
+    async fn handle_emergency_broadcast(
+        envelope: &Envelope,
+        body: &[u8],
+        trust_graph: &RwLock<TrustGraph>,
+        transport_manager: &TransportManager,
+        local_id: NodeId,
+        seen: &RwLock<HashSet<MessageId>>,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+    ) {
+        let (level, message_bytes, cosigners) = match wire::deserialize_emergency_broadcast(body) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("Bad emergency broadcast: {}", e);
+                return;
+            }
+        };
+
+        // Dedup
+        {
+            let mut seen_set = seen.write().await;
+            if !seen_set.insert(envelope.message_id) {
+                debug!("Duplicate emergency broadcast {}, skipping", envelope.message_id);
+                return;
+            }
+            if seen_set.len() > 10_000 {
+                seen_set.clear();
+            }
+        }
+
+        // Trust threshold checks
+        let tg = trust_graph.read().await;
+        let sender_trust = tg.trust_score(&local_id, &envelope.source).value;
+
+        let accepted = match level {
+            wire::EmergencyLevel::Priority => sender_trust > 0.3,
+            wire::EmergencyLevel::Urgent => sender_trust > 0.6,
+            wire::EmergencyLevel::Critical => {
+                // Need 3+ cosigners each with trust > 0.8
+                if cosigners.len() < 3 {
+                    debug!(
+                        "Critical emergency from {} rejected: only {} cosigners (need 3+)",
+                        envelope.source,
+                        cosigners.len()
+                    );
+                    false
+                } else {
+                    let trusted_cosigners = cosigners
+                        .iter()
+                        .filter(|cs| {
+                            let cs_id = NodeId::from_bytes(**cs);
+                            tg.trust_score(&local_id, &cs_id).value > 0.8
+                        })
+                        .count();
+                    trusted_cosigners >= 3
+                }
+            }
+        };
+        drop(tg);
+
+        if !accepted {
+            debug!(
+                "Emergency broadcast from {} rejected: level={:?}, sender_trust={:.2}",
+                envelope.source, level, sender_trust
+            );
+            return;
+        }
+
+        let message_text = String::from_utf8_lossy(&message_bytes).to_string();
+        info!(
+            "Emergency broadcast accepted: level={:?}, from={}, msg={}",
+            level, envelope.source, message_text
+        );
+
+        // Notify via event
+        let _ = event_tx.send(NodeEvent::EmergencyBroadcast {
+            source: envelope.source,
+            level: level as u8,
+            message: message_text,
+        });
+
+        // Flood to all peers (bypass AODV routing for all emergency levels)
         if envelope.ttl > 0 {
             let mut fwd = envelope.clone();
             fwd.forward();

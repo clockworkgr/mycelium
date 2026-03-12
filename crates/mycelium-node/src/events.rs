@@ -30,4 +30,10 @@ pub enum NodeEvent {
         peer_id: NodeId,
         transport: String,
     },
+    /// An emergency broadcast was received.
+    EmergencyBroadcast {
+        source: NodeId,
+        level: u8,
+        message: String,
+    },
 }

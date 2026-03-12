@@ -301,6 +301,12 @@ pub enum WsServerMessage {
         content_type: u8,
         timestamp: u64,
     },
+    #[serde(rename = "emergency")]
+    EmergencyBroadcast {
+        source: String,
+        level: u8,
+        message: String,
+    },
 }
 
 // --- Events ---

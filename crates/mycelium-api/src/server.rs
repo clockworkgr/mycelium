@@ -176,6 +176,10 @@ fn event_summary(event: &NodeEvent) -> (String, String) {
             "peer_lost".to_string(),
             format!("{} via {}", &hex::encode(peer_id.as_bytes())[..16], transport),
         ),
+        NodeEvent::EmergencyBroadcast { source, level, .. } => (
+            "emergency".to_string(),
+            format!("level {} from {}", level, &hex::encode(source.as_bytes())[..16]),
+        ),
     }
 }
 
@@ -226,5 +230,14 @@ fn convert_node_event(event: NodeEvent) -> Option<WsServerMessage> {
                 transport,
             })
         }
+        NodeEvent::EmergencyBroadcast {
+            source,
+            level,
+            message,
+        } => Some(WsServerMessage::EmergencyBroadcast {
+            source: hex::encode(source.as_bytes()),
+            level,
+            message,
+        }),
     }
 }
