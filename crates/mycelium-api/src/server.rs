@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::routing::{delete, get, post};
 use axum::Router;
@@ -83,6 +84,31 @@ pub async fn start_server(
                     break;
                 }
             }
+        }
+    });
+
+    // Spawn periodic NetworkEvent broadcast (every 5 seconds)
+    let net_tx = state.event_tx.clone();
+    let net_node = node.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let routing = net_node.routing.read().await;
+            let now = Instant::now();
+            let neighbor_count = routing
+                .aodv()
+                .routes()
+                .values()
+                .filter(|r| r.is_valid && r.hop_count == 1 && r.lifetime > now)
+                .count();
+            let dtn_queue_size = routing.dtn().bundle_count();
+            drop(routing);
+            let _ = net_tx.send(WsServerMessage::NetworkEvent {
+                neighbor_count,
+                is_connected: neighbor_count > 0,
+                dtn_queue_size,
+            });
         }
     });
 
