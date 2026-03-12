@@ -804,8 +804,28 @@ pub struct NodeConfig {
     pub node_type: NodeTypeConfig,  // Phone | Supernode
     pub dtn: DtnStorageConfig,      // 256MB/10MB/72h/8 copies
     pub beacon_interval_secs: u64,  // 10
+    pub api: ApiConfig,             // REST/WS server bind + port
+    pub group_seed: Option<String>, // Group discovery key (hex)
 }
 ```
+
+### CLI (`main.rs`)
+
+```
+mycelium-node [OPTIONS] [CONFIG_FILE]
+
+Options:
+  --supernode     Run as supernode (always-on, 2GB DTN, internet transport, API on 0.0.0.0)
+  --data-dir DIR  Override data directory
+  --port PORT     Override API server port
+  --help          Print help
+```
+
+When `--supernode` is passed:
+- Uses `NodeConfig::supernode()` as base (2GB DTN, 50MB per-identity quota)
+- Enables internet tunnel transport automatically
+- Binds API server to `0.0.0.0` for remote management
+- Uses `BatteryManager::always_on()` (always `PowerMode::Full`)
 
 **Tests:** 40+ tests across 4 test files covering lifecycle, message exchange, multi-hop routing, DTN fallback, persistence, receipts, beacons, and session management.
 
@@ -1311,7 +1331,7 @@ BLE scan finds device with Mycelium service UUID
 | §8.3 Receipts | Delivery/Read | **Implemented** | Auto-send on receive, update status |
 | §8.4 Public Channels | Broadcast boards | **Not started** | Deferred to v0.2 |
 | §9 Emergency Broadcast | Tiered emergencies | **Complete** | Wire types, trust-gated handler, REST API, Flutter UI |
-| §10 OpenWRT Supernode | Router package | **Not started** | Config exists for supernode mode |
+| §10 OpenWRT Supernode | Router package | **Partial** | CLI `--supernode` flag, auto-config, BatteryManager::always_on |
 | §11 Rate Limiting | Trust + rate hybrid | **Implemented** | Per-tier limits, auto-blacklist |
 | §12 Internet Tunnel | Opportunistic tunnel | **Not started** | Deferred to v0.2 |
 | §13 Protocol Versioning | Backwards compat | **Partial** | Version field in envelope, no negotiation yet |

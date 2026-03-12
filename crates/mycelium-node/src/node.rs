@@ -151,6 +151,12 @@ impl Node {
             }
         });
 
+        let battery = if matches!(config.node_type, crate::config::NodeTypeConfig::Supernode) {
+            BatteryManager::always_on()
+        } else {
+            BatteryManager::new()
+        };
+
         Self {
             identity,
             node_id,
@@ -160,7 +166,7 @@ impl Node {
             session_manager: Arc::new(RwLock::new(SessionManager::new())),
             prekey_state: Arc::new(RwLock::new(prekey_state)),
             rate_limiter: Arc::new(RwLock::new(RateLimiter::new())),
-            battery: Arc::new(RwLock::new(BatteryManager::new())),
+            battery: Arc::new(RwLock::new(battery)),
             db: Arc::new(db),
             trust_graph: Arc::new(RwLock::new(trust_graph)),
             groups: Arc::new(RwLock::new(HashMap::new())),
