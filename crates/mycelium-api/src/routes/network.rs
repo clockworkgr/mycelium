@@ -10,8 +10,8 @@ use mycelium_core::transport::Transport;
 
 use crate::state::AppState;
 use crate::types::{
-    ApiError, DtnBundleResponse, NetworkStatusResponse, RouteEntryResponse, TransportInfo,
-    TransportPeerInfo, TransportStatusResponse,
+    ApiError, DtnBundleResponse, NetworkStatusResponse, PeerResponse, RouteEntryResponse,
+    TransportInfo, TransportPeerInfo, TransportStatusResponse,
 };
 
 /// GET /v1/network/status — Network overview
@@ -185,4 +185,43 @@ pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStat
     }
 
     Json(TransportStatusResponse { transports })
+}
+
+/// GET /v1/network/peers — Unified peer list across all transports
+pub async fn get_peers(State(state): State<AppState>) -> Json<Vec<PeerResponse>> {
+    let mut peers = Vec::new();
+
+    {
+        let guard = state.node.ble_transport.read().await;
+        if let Some(ref ble) = *guard {
+            for p in ble.connected_peers() {
+                let lq = ble.link_quality(&p);
+                peers.push(PeerResponse {
+                    node_id: hex::encode(p.as_bytes()),
+                    transport: "ble".to_string(),
+                    rssi: lq.and_then(|q| q.rssi),
+                    throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                    latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    {
+        let guard = state.node.wifi_transport.read().await;
+        if let Some(ref wifi) = *guard {
+            for p in wifi.connected_peers() {
+                let lq = wifi.link_quality(&p);
+                peers.push(PeerResponse {
+                    node_id: hex::encode(p.as_bytes()),
+                    transport: "wifi_direct".to_string(),
+                    rssi: lq.and_then(|q| q.rssi),
+                    throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                    latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    Json(peers)
 }

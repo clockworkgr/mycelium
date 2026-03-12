@@ -149,6 +149,15 @@ pub struct NetworkStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PeerResponse {
+    pub node_id: String,
+    pub transport: String,
+    pub rssi: Option<i16>,
+    pub throughput_bps: u32,
+    pub latency_ms: u32,
+}
+
+#[derive(Debug, Serialize)]
 pub struct TransportInfo {
     pub name: String,
     pub registered: bool,
