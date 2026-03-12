@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Node configuration, loaded from TOML.
@@ -21,6 +23,26 @@ pub struct NodeConfig {
     /// Optional group discovery seed (hex-encoded 32-byte key derived from passphrase).
     #[serde(default)]
     pub group_seed: Option<String>,
+    /// Transport plugins configuration.
+    #[serde(default)]
+    pub plugins: Vec<PluginConfigEntry>,
+}
+
+/// Configuration entry for a transport plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfigEntry {
+    /// Plugin name (must match the registered plugin factory name).
+    pub name: String,
+    /// Whether this plugin is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Plugin-specific key-value settings.
+    #[serde(default)]
+    pub settings: HashMap<String, String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Local API server configuration (REST + WebSocket). See ADR-001.
@@ -111,6 +133,7 @@ impl Default for NodeConfig {
             beacon_interval_secs: 30,
             api: ApiConfig::default(),
             group_seed: None,
+            plugins: Vec::new(),
         }
     }
 }

@@ -4,6 +4,7 @@ pub mod internet;
 pub mod lora;
 pub mod mock;
 pub mod manager;
+pub mod plugin;
 pub mod wifi_direct;
 
 use std::fmt;

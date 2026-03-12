@@ -94,6 +94,10 @@ mycelium/
 │   │   ├── src/transport/manager.rs    # TransportManager
 │   │   ├── src/transport/ble.rs        # BLE transport with outbox queue
 │   │   ├── src/transport/wifi_direct.rs# Wi-Fi Direct transport with outbox queue
+│   │   ├── src/transport/lora.rs       # LoRa long-range transport
+│   │   ├── src/transport/bt_classic.rs # BT Classic SPP transport
+│   │   ├── src/transport/internet.rs   # TCP internet tunnel transport
+│   │   ├── src/transport/plugin.rs     # TransportPlugin trait + registry
 │   │   ├── src/transport/mock.rs       # Mock transport for testing
 │   │   ├── src/routing/mod.rs          # Routing module exports
 │   │   ├── src/routing/aodv.rs         # AODV reactive routing
