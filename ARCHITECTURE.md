@@ -859,6 +859,7 @@ Client Apps ──▶ REST (axum)     ──▶ Node methods / Database queries
 | `/v1/contacts/` | CRUD + trust + vouch + verify + safety-number | Add/list/delete contacts, trust scores, vouching |
 | `/v1/groups/` | CRUD + members + messages | Create groups, manage members, send group messages |
 | `/v1/channels/` | CRUD + subscribe + messages | Create/list channels, subscribe/unsubscribe, post/get messages |
+| `/v1/prekeys/{node_id}` | GET | Retrieve cached prekey bundle for a peer |
 | `/v1/emergency/` | broadcast, history | Send emergency alerts, view history |
 | `/v1/network/` | status, routes, dtn, transports, peers, pending, events | Diagnostics: AODV table, DTN queue, per-transport status, unified peers, pending queues, event log |
 
@@ -1331,7 +1332,7 @@ BLE scan finds device with Mycelium service UUID
 | §8.3 Receipts | Delivery/Read | **Implemented** | Auto-send on receive, update status |
 | §8.4 Public Channels | Broadcast boards | **Not started** | Deferred to v0.2 |
 | §9 Emergency Broadcast | Tiered emergencies | **Complete** | Wire types, trust-gated handler, REST API, Flutter UI |
-| §10 OpenWRT Supernode | Router package | **Partial** | CLI `--supernode` flag, auto-config, BatteryManager::always_on |
+| §10 OpenWRT Supernode | Router package | **Partial** | CLI `--supernode`, auto-config, route preference, prekey cache API |
 | §11 Rate Limiting | Trust + rate hybrid | **Implemented** | Per-tier limits, auto-blacklist |
 | §12 Internet Tunnel | Opportunistic tunnel | **Not started** | Deferred to v0.2 |
 | §13 Protocol Versioning | Backwards compat | **Partial** | Version field in envelope, no negotiation yet |

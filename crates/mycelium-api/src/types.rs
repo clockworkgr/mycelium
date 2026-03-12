@@ -167,6 +167,19 @@ pub struct PostChannelMessageRequest {
     pub content_type: u8,
 }
 
+// --- Prekeys ---
+
+#[derive(Debug, Serialize)]
+pub struct PrekeyBundleResponse {
+    pub node_id: String,
+    pub identity_key: String,
+    pub signed_prekey: String,
+    pub signed_prekey_signature: String,
+    pub signed_prekey_id: u32,
+    pub one_time_prekey: Option<String>,
+    pub one_time_prekey_id: Option<u32>,
+}
+
 // --- Trust ---
 
 #[derive(Debug, Serialize)]

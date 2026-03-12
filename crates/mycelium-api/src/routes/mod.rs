@@ -6,3 +6,4 @@ pub mod groups;
 pub mod messages;
 pub mod network;
 pub mod node;
+pub mod prekeys;

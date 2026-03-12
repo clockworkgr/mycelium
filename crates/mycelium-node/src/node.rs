@@ -94,7 +94,7 @@ pub struct Node {
     pub trust_graph: Arc<RwLock<TrustGraph>>,
     pub groups: Arc<RwLock<HashMap<[u8; 32], SenderKeyGroup>>>,
     lamport_clock: Arc<RwLock<LamportClock>>,
-    prekey_cache: Arc<RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>>,
+    pub prekey_cache: Arc<RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>>,
     pending_messages: Arc<RwLock<HashMap<NodeId, Vec<PendingMessage>>>>,
     pending_routes: Arc<RwLock<HashMap<NodeId, Vec<PendingRoute>>>>,
     cancel: CancellationToken,
@@ -1320,6 +1320,33 @@ impl Node {
                         let r = routing.read().await;
                         r.route_message(&envelope.destination)
                     };
+                    // Opportunistically cache prekey responses passing through
+                    if payload_type == WirePayloadType::PrekeyResponse {
+                        if let Ok(bp) = PrekeyBundlePayload::deserialize_body(body) {
+                            let bundle = PrekeyBundle {
+                                identity_key: bp.identity_key,
+                                signed_prekey: bp.signed_prekey,
+                                signed_prekey_signature: bp.signed_prekey_signature.clone(),
+                                signed_prekey_id: bp.signed_prekey_id,
+                                one_time_prekey: bp.one_time_prekey,
+                                one_time_prekey_id: bp.one_time_prekey_id,
+                            };
+                            {
+                                let mut cache = prekey_cache.write().await;
+                                cache.insert(envelope.source, (bundle, Instant::now()));
+                            }
+                            let serialized = bp.serialize();
+                            let _ = db.cache_prekey_bundle(
+                                envelope.source.as_bytes(),
+                                &serialized[1..],
+                            );
+                            debug!(
+                                "Cached prekey bundle from {} while forwarding",
+                                envelope.source
+                            );
+                        }
+                    }
+
                     if let RoutingDecision::SendRealtime { next_hop } = decision {
                         let mut fwd = envelope.clone();
                         fwd.forward();

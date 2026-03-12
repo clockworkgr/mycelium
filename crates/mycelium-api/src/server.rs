@@ -14,7 +14,7 @@ use mycelium_node::config::ApiConfig;
 use mycelium_node::events::NodeEvent;
 use mycelium_node::node::Node;
 
-use crate::routes::{channels, contacts, conversations, emergency, groups, messages, network, node};
+use crate::routes::{channels, contacts, conversations, emergency, groups, messages, network, node, prekeys};
 use crate::state::AppState;
 use crate::types::WsServerMessage;
 use crate::ws;
@@ -51,6 +51,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/channels", get(channels::list_channels).post(channels::create_channel))
         .route("/v1/channels/{channel_id}/subscribe", post(channels::subscribe).delete(channels::unsubscribe))
         .route("/v1/channels/{channel_id}/messages", get(channels::get_messages).post(channels::post_message))
+        // Prekeys
+        .route("/v1/prekeys/{node_id}", get(prekeys::get_cached_bundle))
         // Emergency
         .route("/v1/emergency/broadcast", post(emergency::broadcast))
         .route("/v1/emergency/history", get(emergency::history))
