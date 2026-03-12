@@ -13,6 +13,9 @@ pub struct NodeStatusResponse {
     pub display_name: String,
     pub uptime_secs: u64,
     pub version: String,
+    pub session_count: usize,
+    pub group_count: usize,
+    pub prekey_remaining: usize,
 }
 
 #[derive(Debug, Serialize)]

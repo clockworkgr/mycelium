@@ -137,6 +137,9 @@ class _DebugScreenState extends State<DebugScreen> {
               _row('Display Name', status['display_name'] ?? ''),
               _row('Uptime', _formatUptime(status['uptime_secs'] ?? 0)),
               _row('Version', status['version'] ?? ''),
+              _row('Sessions', '${status['session_count'] ?? 0}'),
+              _row('Groups', '${status['group_count'] ?? 0}'),
+              _row('OTP Prekeys', '${status['prekey_remaining'] ?? 0}'),
             ] else
               const Center(child: CircularProgressIndicator()),
           ],

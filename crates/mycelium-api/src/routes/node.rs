@@ -14,11 +14,18 @@ pub async fn get_status(
     let node_id = hex::encode(state.node.node_id.as_bytes());
     let display_name = state.node.config.display_name.clone();
 
+    let session_count = state.node.session_manager.read().await.all_sessions().count();
+    let group_count = state.node.groups.read().await.len();
+    let prekey_remaining = state.node.prekey_state.read().await.one_time_prekeys.len();
+
     Json(NodeStatusResponse {
         node_id,
         display_name,
         uptime_secs: uptime,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        session_count,
+        group_count,
+        prekey_remaining,
     })
 }
 
