@@ -22,6 +22,10 @@ pub enum WirePayloadType {
     Receipt = 0x60,
     GroupMessage = 0x70,
     SenderKeyDistribution = 0x71,
+    ChannelMessage = 0x80,
+    ChannelSubscribe = 0x81,
+    ChannelUnsubscribe = 0x82,
+    ChannelModeration = 0x83,
 }
 
 impl WirePayloadType {
@@ -39,6 +43,10 @@ impl WirePayloadType {
             0x60 => Some(Self::Receipt),
             0x70 => Some(Self::GroupMessage),
             0x71 => Some(Self::SenderKeyDistribution),
+            0x80 => Some(Self::ChannelMessage),
+            0x81 => Some(Self::ChannelSubscribe),
+            0x82 => Some(Self::ChannelUnsubscribe),
+            0x83 => Some(Self::ChannelModeration),
             _ => None,
         }
     }
@@ -619,6 +627,136 @@ pub fn deserialize_receipt(data: &[u8]) -> Result<(MessageId, ReceiptType), Code
     Ok((MessageId::from_bytes(msg_id), receipt_type))
 }
 
+// --- Channel message serialization ---
+
+/// Serialize a channel message payload.
+/// Layout: type(1=0x80) + channel_id(32) + content_type(1) + data
+pub fn serialize_channel_message(
+    channel_id: &[u8; 32],
+    content_type: u8,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 32 + 1 + data.len());
+    buf.push(WirePayloadType::ChannelMessage as u8);
+    buf.extend_from_slice(channel_id);
+    buf.push(content_type);
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Deserialize channel message body (after type byte).
+/// Returns: (channel_id, content_type, data)
+pub fn deserialize_channel_message(data: &[u8]) -> Result<([u8; 32], u8, Vec<u8>), CodecError> {
+    if data.len() < 33 {
+        return Err(CodecError::BufferTooShort {
+            expected: 33,
+            actual: data.len(),
+        });
+    }
+    let mut channel_id = [0u8; 32];
+    channel_id.copy_from_slice(&data[0..32]);
+    let content_type = data[32];
+    let payload = data[33..].to_vec();
+    Ok((channel_id, content_type, payload))
+}
+
+/// Serialize a channel subscribe payload.
+/// Layout: type(1=0x81) + channel_id(32)
+pub fn serialize_channel_subscribe(channel_id: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(33);
+    buf.push(WirePayloadType::ChannelSubscribe as u8);
+    buf.extend_from_slice(channel_id);
+    buf
+}
+
+/// Deserialize channel subscribe body (after type byte).
+/// Returns: channel_id
+pub fn deserialize_channel_subscribe(data: &[u8]) -> Result<[u8; 32], CodecError> {
+    if data.len() < 32 {
+        return Err(CodecError::BufferTooShort {
+            expected: 32,
+            actual: data.len(),
+        });
+    }
+    let mut channel_id = [0u8; 32];
+    channel_id.copy_from_slice(&data[0..32]);
+    Ok(channel_id)
+}
+
+/// Serialize a channel unsubscribe payload.
+/// Layout: type(1=0x82) + channel_id(32)
+pub fn serialize_channel_unsubscribe(channel_id: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(33);
+    buf.push(WirePayloadType::ChannelUnsubscribe as u8);
+    buf.extend_from_slice(channel_id);
+    buf
+}
+
+/// Deserialize channel unsubscribe body (after type byte).
+/// Returns: channel_id
+pub fn deserialize_channel_unsubscribe(data: &[u8]) -> Result<[u8; 32], CodecError> {
+    deserialize_channel_subscribe(data) // Same format
+}
+
+/// Moderation action for channels.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModerationAction {
+    RemoveMessage = 0,
+    BanUser = 1,
+}
+
+impl ModerationAction {
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0 => Some(Self::RemoveMessage),
+            1 => Some(Self::BanUser),
+            _ => None,
+        }
+    }
+}
+
+/// Serialize a channel moderation payload.
+/// Layout: type(1=0x83) + channel_id(32) + action(1) + target_id(32) + signature(64)
+pub fn serialize_channel_moderation(
+    channel_id: &[u8; 32],
+    action: ModerationAction,
+    target_id: &[u8; 32],
+    signature: &[u8; 64],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(130);
+    buf.push(WirePayloadType::ChannelModeration as u8);
+    buf.extend_from_slice(channel_id);
+    buf.push(action as u8);
+    buf.extend_from_slice(target_id);
+    buf.extend_from_slice(signature);
+    buf
+}
+
+/// Deserialize channel moderation body (after type byte).
+/// Returns: (channel_id, action, target_id, signature)
+pub fn deserialize_channel_moderation(
+    data: &[u8],
+) -> Result<([u8; 32], ModerationAction, [u8; 32], [u8; 64]), CodecError> {
+    if data.len() < 129 {
+        return Err(CodecError::BufferTooShort {
+            expected: 129,
+            actual: data.len(),
+        });
+    }
+    let mut channel_id = [0u8; 32];
+    channel_id.copy_from_slice(&data[0..32]);
+    let action = ModerationAction::from_byte(data[32]).ok_or(CodecError::BufferTooShort {
+        expected: 1,
+        actual: 0,
+    })?;
+    let mut target_id = [0u8; 32];
+    target_id.copy_from_slice(&data[33..65]);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&data[65..129]);
+    Ok((channel_id, action, target_id, signature))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -813,6 +951,59 @@ mod tests {
         assert_eq!(WirePayloadType::from_byte(0x60), Some(WirePayloadType::Receipt));
         assert_eq!(WirePayloadType::from_byte(0x70), Some(WirePayloadType::GroupMessage));
         assert_eq!(WirePayloadType::from_byte(0x71), Some(WirePayloadType::SenderKeyDistribution));
+        assert_eq!(WirePayloadType::from_byte(0x80), Some(WirePayloadType::ChannelMessage));
+        assert_eq!(WirePayloadType::from_byte(0x81), Some(WirePayloadType::ChannelSubscribe));
+        assert_eq!(WirePayloadType::from_byte(0x82), Some(WirePayloadType::ChannelUnsubscribe));
+        assert_eq!(WirePayloadType::from_byte(0x83), Some(WirePayloadType::ChannelModeration));
         assert_eq!(WirePayloadType::from_byte(0xFF), None);
+    }
+
+    #[test]
+    fn test_channel_message_roundtrip() {
+        let channel_id = [0xDD; 32];
+        let data = b"hello channel";
+        let bytes = serialize_channel_message(&channel_id, 0, data);
+        assert_eq!(bytes[0], WirePayloadType::ChannelMessage as u8);
+        let (cid, ct, payload) = deserialize_channel_message(&bytes[1..]).unwrap();
+        assert_eq!(cid, channel_id);
+        assert_eq!(ct, 0);
+        assert_eq!(payload, data);
+    }
+
+    #[test]
+    fn test_channel_subscribe_roundtrip() {
+        let channel_id = [0xEE; 32];
+        let bytes = serialize_channel_subscribe(&channel_id);
+        assert_eq!(bytes[0], WirePayloadType::ChannelSubscribe as u8);
+        let cid = deserialize_channel_subscribe(&bytes[1..]).unwrap();
+        assert_eq!(cid, channel_id);
+    }
+
+    #[test]
+    fn test_channel_unsubscribe_roundtrip() {
+        let channel_id = [0xFF; 32];
+        let bytes = serialize_channel_unsubscribe(&channel_id);
+        assert_eq!(bytes[0], WirePayloadType::ChannelUnsubscribe as u8);
+        let cid = deserialize_channel_unsubscribe(&bytes[1..]).unwrap();
+        assert_eq!(cid, channel_id);
+    }
+
+    #[test]
+    fn test_channel_moderation_roundtrip() {
+        let channel_id = [0xAA; 32];
+        let target_id = [0xBB; 32];
+        let signature = [0xCC; 64];
+        let bytes = serialize_channel_moderation(
+            &channel_id,
+            ModerationAction::BanUser,
+            &target_id,
+            &signature,
+        );
+        assert_eq!(bytes[0], WirePayloadType::ChannelModeration as u8);
+        let (cid, action, tid, sig) = deserialize_channel_moderation(&bytes[1..]).unwrap();
+        assert_eq!(cid, channel_id);
+        assert_eq!(action, ModerationAction::BanUser);
+        assert_eq!(tid, target_id);
+        assert_eq!(sig, signature);
     }
 }
