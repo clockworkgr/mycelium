@@ -17,6 +17,7 @@ import 'api_client.dart';
 import 'ble_manager.dart';
 import 'ffi_helpers.dart';
 import 'mycelium_exception.dart';
+import 'notification_service.dart';
 import 'wifi_direct_manager.dart';
 import 'ws_service.dart';
 
@@ -35,6 +36,7 @@ class MyceliumService {
   BleManager? _bleManager;
   WifiDirectManager? _wifiDirectManager;
   WsService? _wsService;
+  StreamSubscription? _wsEventSub;
   NodeId? _cachedNodeId;
   bool _reconnected = false;
 
@@ -152,6 +154,38 @@ class MyceliumService {
   void _startWebSocket() {
     _wsService = WsService();
     _wsService!.connect();
+    _wsEventSub = _wsService!.events.listen(_onWsEvent);
+  }
+
+  void _onWsEvent(WsEvent event) {
+    if (event is WsMessageEvent) {
+      final selfHex = _cachedNodeId?.toHex();
+      if (selfHex != null && event.source == selfHex) return;
+      final ns = NotificationService.instance;
+      if (ns.activeChat == event.source) return;
+      _showMessageNotification(event);
+    }
+  }
+
+  Future<void> _showMessageNotification(WsMessageEvent event) async {
+    String senderName = event.source.length > 12
+        ? '${event.source.substring(0, 12)}...'
+        : event.source;
+    try {
+      final contacts = await _api.getContacts();
+      for (final c in contacts) {
+        final m = c as Map<String, dynamic>;
+        if (m['node_id'] == event.source) {
+          senderName = m['display_name'] as String? ?? senderName;
+          break;
+        }
+      }
+    } catch (_) {}
+    await NotificationService.instance.showMessageNotification(
+      senderName: senderName,
+      messageText: event.data,
+      peerHex: event.source,
+    );
   }
 
   Future<void> _startBle() async {
@@ -180,6 +214,8 @@ class MyceliumService {
 
   /// Stop the node.
   Future<void> stop() async {
+    _wsEventSub?.cancel();
+    _wsEventSub = null;
     _wsService?.dispose();
     _wsService = null;
     await _bleManager?.stop();
@@ -332,6 +368,8 @@ class MyceliumService {
 
   /// Dispose the service.
   void dispose() {
+    _wsEventSub?.cancel();
+    _wsEventSub = null;
     _wsService?.dispose();
     _wsService = null;
     _api.dispose();
