@@ -1332,6 +1332,48 @@ impl Node {
                     return;
                 }
 
+                // Rate-limit user data messages based on sender trust distance
+                let is_user_data = matches!(
+                    payload_type,
+                    WirePayloadType::EncryptedMessage
+                        | WirePayloadType::GroupMessage
+                        | WirePayloadType::ChannelMessage
+                        | WirePayloadType::DtnRelay
+                );
+                if is_user_data {
+                    let trust_hops = {
+                        let tg = trust_graph.read().await;
+                        tg.trust_score(&local_id, &envelope.source).hops
+                    };
+                    let allowed = {
+                        let mut rl = rate_limiter.write().await;
+                        if payload_type == WirePayloadType::DtnRelay {
+                            rl.check_dtn_relay(
+                                &envelope.source,
+                                trust_hops,
+                                body.len(),
+                            )
+                        } else {
+                            rl.check_message(&envelope.source, trust_hops)
+                        }
+                    };
+                    if !allowed {
+                        debug!(
+                            "Rate-limited {:?} from {} (trust_hops={})",
+                            payload_type, envelope.source, trust_hops
+                        );
+                        let mut rl = rate_limiter.write().await;
+                        let blacklisted = rl.record_violation(&envelope.source);
+                        if blacklisted {
+                            warn!(
+                                "Auto-blacklisted {} after repeated rate violations",
+                                envelope.source
+                            );
+                        }
+                        return;
+                    }
+                }
+
                 match payload_type {
                     WirePayloadType::AodvRreq => {
                         Self::handle_aodv_rreq(
