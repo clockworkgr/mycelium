@@ -2598,6 +2598,10 @@ impl Node {
         local_id: NodeId,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
     ) {
+        debug!(
+            "handle_receipt: from={}, msg_id={}, body_len={}",
+            envelope.source, envelope.message_id, body.len()
+        );
         if envelope.destination != local_id {
             info!("Receipt not for us (dest={}), ignoring", envelope.destination);
             return;
@@ -2642,6 +2646,7 @@ impl Node {
         transport_manager: &TransportManager,
         routing: &RwLock<RoutingCoordinator>,
     ) {
+        debug!("send_delivery_receipt: msg_id={}, to={}", message_id, to);
         let payload = wire::serialize_receipt(&message_id, ReceiptType::Delivered);
         let envelope = Envelope {
             source: local_id,
@@ -2705,6 +2710,7 @@ impl Node {
         transport_manager: &TransportManager,
         routing: &RwLock<RoutingCoordinator>,
     ) {
+        debug!("send_read_receipt: msg_id={}, to={}", message_id, to);
         let payload = wire::serialize_receipt(&message_id, ReceiptType::Read);
         let envelope = Envelope {
             source: local_id,

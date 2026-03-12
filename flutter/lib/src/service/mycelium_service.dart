@@ -419,6 +419,10 @@ class MyceliumService {
         return MessageStatus.read;
       case 'received':
         return MessageStatus.received;
+      case 'dtn_pending':
+        return MessageStatus.dtnQueued;
+      case 'failed':
+        return MessageStatus.failed;
       default:
         return MessageStatus.pending;
     }
