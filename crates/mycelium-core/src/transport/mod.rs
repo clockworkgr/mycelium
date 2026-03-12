@@ -1,4 +1,5 @@
 pub mod ble;
+pub mod bt_classic;
 pub mod internet;
 pub mod lora;
 pub mod mock;
