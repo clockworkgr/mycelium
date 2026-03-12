@@ -833,11 +833,12 @@ Client Apps ──▶ REST (axum)     ──▶ Node methods / Database queries
 
 | Group | Endpoints | Description |
 |-------|-----------|-------------|
-| `/v1/node/` | `status`, `identity` | Node ID, uptime, public key |
+| `/v1/node/` | `status`, `identity`, `trust` | Node ID, uptime, public key, trust graph stats |
 | `/v1/messages/` | CRUD + mark-read | Send messages, get conversation, delete |
 | `/v1/conversations/` | list, unread count | Conversation summaries with display names |
-| `/v1/contacts/` | CRUD | Add/list/delete contacts |
-| `/v1/network/` | status, routes, dtn, transports | Diagnostics: AODV table, DTN queue, neighbor count, per-transport status |
+| `/v1/contacts/` | CRUD + trust + vouch + verify + safety-number | Add/list/delete contacts, trust scores, vouching |
+| `/v1/groups/` | CRUD + members + messages | Create groups, manage members, send group messages |
+| `/v1/network/` | status, routes, dtn, transports, peers, pending, events | Diagnostics: AODV table, DTN queue, per-transport status, unified peers, pending queues, event log |
 
 ### WebSocket API
 
@@ -850,12 +851,12 @@ Connect to `/v1/ws`. JSON-framed messages:
 **Server → Client:**
 - `message` — Incoming message (filtered by subscription)
 - `peer` — Neighbor discovered/lost events
-- `network` — Periodic network status
+- `network` — Periodic network status (broadcast every 5 seconds with neighbor count, connectivity, DTN queue size)
 - `receipt` — Delivery receipt status changes
 
 ### Key Types
 
-- `AppState` — Shared state: `Arc<Node>` + `broadcast::Sender<WsServerMessage>` + start time
+- `AppState` — Shared state: `Arc<Node>` + `broadcast::Sender<WsServerMessage>` + start time + event log ring buffer
 - `WsServerMessage` — Enum of all server-pushed event types (Clone for broadcast)
 - `ApiConfig` — Bind address, port, enabled flag (in `NodeConfig`)
 
