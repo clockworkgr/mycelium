@@ -2751,6 +2751,18 @@ impl Node {
         let pr = self.pending_routes.read().await;
         pr.values().map(|v| v.len()).sum()
     }
+
+    /// Destinations with pending messages (awaiting session).
+    pub async fn pending_message_destinations(&self) -> Vec<NodeId> {
+        let pm = self.pending_messages.read().await;
+        pm.keys().copied().collect()
+    }
+
+    /// Destinations with pending route discoveries.
+    pub async fn pending_route_destinations(&self) -> Vec<NodeId> {
+        let pr = self.pending_routes.read().await;
+        pr.keys().copied().collect()
+    }
 }
 
 // --- Helpers ---

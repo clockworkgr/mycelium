@@ -10,8 +10,8 @@ use mycelium_core::transport::Transport;
 
 use crate::state::AppState;
 use crate::types::{
-    ApiError, DtnBundleResponse, NetworkStatusResponse, PeerResponse, RouteEntryResponse,
-    TransportInfo, TransportPeerInfo, TransportStatusResponse,
+    ApiError, DtnBundleResponse, NetworkStatusResponse, PeerResponse, PendingResponse,
+    RouteEntryResponse, TransportInfo, TransportPeerInfo, TransportStatusResponse,
 };
 
 /// GET /v1/network/status — Network overview
@@ -108,6 +108,27 @@ pub async fn get_dtn_bundles(
         .collect();
 
     Json(bundles)
+}
+
+/// GET /v1/network/pending — Pending messages and route discoveries
+pub async fn get_pending(State(state): State<AppState>) -> Json<PendingResponse> {
+    let pm_count = state.node.pending_messages_count().await;
+    let pm_dests = state.node.pending_message_destinations().await;
+    let pr_count = state.node.pending_routes_count().await;
+    let pr_dests = state.node.pending_route_destinations().await;
+
+    Json(PendingResponse {
+        pending_messages: pm_count,
+        pending_message_destinations: pm_dests
+            .iter()
+            .map(|n| hex::encode(n.as_bytes()))
+            .collect(),
+        pending_routes: pr_count,
+        pending_route_destinations: pr_dests
+            .iter()
+            .map(|n| hex::encode(n.as_bytes()))
+            .collect(),
+    })
 }
 
 /// GET /v1/network/transports — Per-transport status

@@ -180,6 +180,14 @@ pub struct TransportStatusResponse {
 }
 
 #[derive(Debug, Serialize)]
+pub struct PendingResponse {
+    pub pending_messages: usize,
+    pub pending_message_destinations: Vec<String>,
+    pub pending_routes: usize,
+    pub pending_route_destinations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RouteEntryResponse {
     pub destination: String,
     pub next_hop: String,
