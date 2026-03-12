@@ -26,6 +26,7 @@ pub enum WirePayloadType {
     ChannelSubscribe = 0x81,
     ChannelUnsubscribe = 0x82,
     ChannelModeration = 0x83,
+    EmergencyBroadcast = 0x90,
 }
 
 impl WirePayloadType {
@@ -47,6 +48,7 @@ impl WirePayloadType {
             0x81 => Some(Self::ChannelSubscribe),
             0x82 => Some(Self::ChannelUnsubscribe),
             0x83 => Some(Self::ChannelModeration),
+            0x90 => Some(Self::EmergencyBroadcast),
             _ => None,
         }
     }
@@ -100,7 +102,8 @@ pub struct EncryptedPayload {
 
 impl EncryptedPayload {
     pub fn serialize(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + 1 + WireRatchetHeader::SIZE + 4 + self.ciphertext.len());
+        let mut buf =
+            Vec::with_capacity(1 + 1 + WireRatchetHeader::SIZE + 4 + self.ciphertext.len());
         buf.push(WirePayloadType::EncryptedMessage as u8);
         buf.push(self.content_type);
         self.header.serialize(&mut buf);
@@ -152,8 +155,13 @@ pub struct SessionInitPayload {
 
 impl SessionInitPayload {
     pub fn serialize(&self) -> Vec<u8> {
-        let otp_size = if self.one_time_prekey_id.is_some() { 5 } else { 1 };
-        let mut buf = Vec::with_capacity(1 + 32 + 32 + 4 + otp_size + 4 + self.encrypted_payload.len());
+        let otp_size = if self.one_time_prekey_id.is_some() {
+            5
+        } else {
+            1
+        };
+        let mut buf =
+            Vec::with_capacity(1 + 32 + 32 + 4 + otp_size + 4 + self.encrypted_payload.len());
         buf.push(WirePayloadType::SessionInit as u8);
         buf.extend_from_slice(&self.ephemeral_public);
         buf.extend_from_slice(&self.identity_key);
@@ -367,6 +375,7 @@ pub fn serialize_aodv_rreq(
 }
 
 /// Deserialize AODV RREQ from body bytes (after type byte).
+#[allow(clippy::type_complexity)]
 pub fn deserialize_aodv_rreq(
     data: &[u8],
 ) -> Result<(u32, NodeId, u32, NodeId, u32, u8, u8), CodecError> {
@@ -447,11 +456,7 @@ pub fn deserialize_aodv_rrep(
 
 /// AODV Route Error wire format.
 /// Layout: type(1=0x32) + unreachable(32) + source(32) + dest_seq(4)
-pub fn serialize_aodv_rerr(
-    unreachable: &NodeId,
-    source: &NodeId,
-    dest_seq: u32,
-) -> Vec<u8> {
+pub fn serialize_aodv_rerr(unreachable: &NodeId, source: &NodeId, dest_seq: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(69);
     buf.push(WirePayloadType::AodvRerr as u8);
     buf.extend_from_slice(unreachable.as_bytes());
@@ -631,11 +636,7 @@ pub fn deserialize_receipt(data: &[u8]) -> Result<(MessageId, ReceiptType), Code
 
 /// Serialize a channel message payload.
 /// Layout: type(1=0x80) + channel_id(32) + content_type(1) + data
-pub fn serialize_channel_message(
-    channel_id: &[u8; 32],
-    content_type: u8,
-    data: &[u8],
-) -> Vec<u8> {
+pub fn serialize_channel_message(channel_id: &[u8; 32], content_type: u8, data: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(1 + 32 + 1 + data.len());
     buf.push(WirePayloadType::ChannelMessage as u8);
     buf.extend_from_slice(channel_id);
@@ -735,6 +736,7 @@ pub fn serialize_channel_moderation(
 
 /// Deserialize channel moderation body (after type byte).
 /// Returns: (channel_id, action, target_id, signature)
+#[allow(clippy::type_complexity)]
 pub fn deserialize_channel_moderation(
     data: &[u8],
 ) -> Result<([u8; 32], ModerationAction, [u8; 32], [u8; 64]), CodecError> {
@@ -755,6 +757,92 @@ pub fn deserialize_channel_moderation(
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&data[65..129]);
     Ok((channel_id, action, target_id, signature))
+}
+
+// --- Emergency broadcast serialization ---
+
+/// Emergency level for tiered broadcast.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmergencyLevel {
+    /// Boosted priority in relay queues. Requires trust > 0.3.
+    Priority = 1,
+    /// Bypasses per-identity rate limits. Requires trust > 0.6.
+    Urgent = 2,
+    /// Floods entire mesh. Requires 3+ cosigners with trust > 0.8.
+    Critical = 3,
+}
+
+impl EmergencyLevel {
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::Priority),
+            2 => Some(Self::Urgent),
+            3 => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
+/// Serialize an emergency broadcast payload.
+/// Layout: type(1=0x90) + level(1) + msg_len(4) + message + cosigner_count(1) + cosigners(N*32)
+pub fn serialize_emergency_broadcast(
+    level: EmergencyLevel,
+    message: &[u8],
+    cosigners: &[[u8; 32]],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 1 + 4 + message.len() + 1 + cosigners.len() * 32);
+    buf.push(WirePayloadType::EmergencyBroadcast as u8);
+    buf.push(level as u8);
+    buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
+    buf.extend_from_slice(message);
+    buf.push(cosigners.len() as u8);
+    for cosigner in cosigners {
+        buf.extend_from_slice(cosigner);
+    }
+    buf
+}
+
+/// Deserialize emergency broadcast body (after type byte).
+/// Returns: (level, message, cosigners)
+#[allow(clippy::type_complexity)]
+pub fn deserialize_emergency_broadcast(
+    data: &[u8],
+) -> Result<(EmergencyLevel, Vec<u8>, Vec<[u8; 32]>), CodecError> {
+    if data.len() < 6 {
+        return Err(CodecError::BufferTooShort {
+            expected: 6,
+            actual: data.len(),
+        });
+    }
+    let level = EmergencyLevel::from_byte(data[0]).ok_or(CodecError::BufferTooShort {
+        expected: 1,
+        actual: 0,
+    })?;
+    let msg_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
+    if data.len() < 5 + msg_len + 1 {
+        return Err(CodecError::BufferTooShort {
+            expected: 5 + msg_len + 1,
+            actual: data.len(),
+        });
+    }
+    let message = data[5..5 + msg_len].to_vec();
+    let cosigner_count = data[5 + msg_len] as usize;
+    let cosigners_start = 5 + msg_len + 1;
+    if data.len() < cosigners_start + cosigner_count * 32 {
+        return Err(CodecError::BufferTooShort {
+            expected: cosigners_start + cosigner_count * 32,
+            actual: data.len(),
+        });
+    }
+    let mut cosigners = Vec::with_capacity(cosigner_count);
+    for i in 0..cosigner_count {
+        let offset = cosigners_start + i * 32;
+        let mut cosigner = [0u8; 32];
+        cosigner.copy_from_slice(&data[offset..offset + 32]);
+        cosigners.push(cosigner);
+    }
+    Ok((level, message, cosigners))
 }
 
 #[cfg(test)]
@@ -945,16 +1033,50 @@ mod tests {
 
     #[test]
     fn test_wire_payload_type_from_byte() {
-        assert_eq!(WirePayloadType::from_byte(0x10), Some(WirePayloadType::EncryptedMessage));
-        assert_eq!(WirePayloadType::from_byte(0x40), Some(WirePayloadType::DtnRelay));
-        assert_eq!(WirePayloadType::from_byte(0x50), Some(WirePayloadType::Beacon));
-        assert_eq!(WirePayloadType::from_byte(0x60), Some(WirePayloadType::Receipt));
-        assert_eq!(WirePayloadType::from_byte(0x70), Some(WirePayloadType::GroupMessage));
-        assert_eq!(WirePayloadType::from_byte(0x71), Some(WirePayloadType::SenderKeyDistribution));
-        assert_eq!(WirePayloadType::from_byte(0x80), Some(WirePayloadType::ChannelMessage));
-        assert_eq!(WirePayloadType::from_byte(0x81), Some(WirePayloadType::ChannelSubscribe));
-        assert_eq!(WirePayloadType::from_byte(0x82), Some(WirePayloadType::ChannelUnsubscribe));
-        assert_eq!(WirePayloadType::from_byte(0x83), Some(WirePayloadType::ChannelModeration));
+        assert_eq!(
+            WirePayloadType::from_byte(0x10),
+            Some(WirePayloadType::EncryptedMessage)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x40),
+            Some(WirePayloadType::DtnRelay)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x50),
+            Some(WirePayloadType::Beacon)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x60),
+            Some(WirePayloadType::Receipt)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x70),
+            Some(WirePayloadType::GroupMessage)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x71),
+            Some(WirePayloadType::SenderKeyDistribution)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x80),
+            Some(WirePayloadType::ChannelMessage)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x81),
+            Some(WirePayloadType::ChannelSubscribe)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x82),
+            Some(WirePayloadType::ChannelUnsubscribe)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x83),
+            Some(WirePayloadType::ChannelModeration)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x90),
+            Some(WirePayloadType::EmergencyBroadcast)
+        );
         assert_eq!(WirePayloadType::from_byte(0xFF), None);
     }
 
@@ -986,6 +1108,30 @@ mod tests {
         assert_eq!(bytes[0], WirePayloadType::ChannelUnsubscribe as u8);
         let cid = deserialize_channel_unsubscribe(&bytes[1..]).unwrap();
         assert_eq!(cid, channel_id);
+    }
+
+    #[test]
+    fn test_emergency_broadcast_roundtrip() {
+        let message = b"Emergency: building collapse at sector 7";
+        let cosigners = vec![[0x11; 32], [0x22; 32], [0x33; 32]];
+        let bytes = serialize_emergency_broadcast(EmergencyLevel::Critical, message, &cosigners);
+        assert_eq!(bytes[0], WirePayloadType::EmergencyBroadcast as u8);
+        let (level, msg, cs) = deserialize_emergency_broadcast(&bytes[1..]).unwrap();
+        assert_eq!(level, EmergencyLevel::Critical);
+        assert_eq!(msg, message);
+        assert_eq!(cs.len(), 3);
+        assert_eq!(cs[0], [0x11; 32]);
+        assert_eq!(cs[2], [0x33; 32]);
+    }
+
+    #[test]
+    fn test_emergency_broadcast_no_cosigners() {
+        let message = b"Priority relay boost";
+        let bytes = serialize_emergency_broadcast(EmergencyLevel::Priority, message, &[]);
+        let (level, msg, cs) = deserialize_emergency_broadcast(&bytes[1..]).unwrap();
+        assert_eq!(level, EmergencyLevel::Priority);
+        assert_eq!(msg, message);
+        assert!(cs.is_empty());
     }
 
     #[test]

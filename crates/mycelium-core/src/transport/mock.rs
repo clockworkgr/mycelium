@@ -100,7 +100,7 @@ impl MockNetwork {
         let links = self.links.read().await;
         let config = links
             .get(&(src, dst))
-            .ok_or_else(|| TransportError::PeerNotConnected(dst))?;
+            .ok_or(TransportError::PeerNotConnected(dst))?;
 
         if !config.enabled {
             return Err(TransportError::PeerNotConnected(dst));
@@ -258,19 +258,14 @@ mod tests {
         transport_a.start().await.unwrap();
         transport_b.start().await.unwrap();
 
-        network
-            .add_link(a, b, MockLinkConfig::default())
-            .await;
+        network.add_link(a, b, MockLinkConfig::default()).await;
 
         transport_a.send(&b, b"hello mesh").await.unwrap();
 
-        let event = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            rx_b.recv(),
-        )
-        .await
-        .expect("timeout")
-        .expect("recv error");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx_b.recv())
+            .await
+            .expect("timeout")
+            .expect("recv error");
 
         match event {
             TransportEvent::DataReceived { peer, data, .. } => {

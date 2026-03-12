@@ -2,8 +2,8 @@ pub mod ble;
 pub mod bt_classic;
 pub mod internet;
 pub mod lora;
-pub mod mock;
 pub mod manager;
+pub mod mock;
 pub mod plugin;
 pub mod wifi_direct;
 

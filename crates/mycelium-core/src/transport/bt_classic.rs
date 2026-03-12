@@ -23,7 +23,14 @@ pub struct BtClassicTransport {
     tx: broadcast::Sender<TransportEvent>,
     connected_peers: Arc<RwLock<Vec<NodeId>>>,
     started: Arc<RwLock<bool>>,
+    #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
+}
+
+impl Default for BtClassicTransport {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BtClassicTransport {

@@ -1,5 +1,4 @@
 /// Battery level and adaptive power strategy per spec Section 16.
-
 /// Power mode determined by battery level and mesh conditions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PowerMode {
@@ -25,6 +24,7 @@ pub struct BatteryManager {
     neighbor_count: u16,
 }
 
+#[allow(dead_code)]
 impl BatteryManager {
     pub fn new() -> Self {
         Self {

@@ -1,8 +1,12 @@
 # Mycelium: Continuing Implementation Specification
 
+**Last Updated:** 2026-03-11
+
 ## 1. Vision
 
 Mycelium evolves from a mesh messenger into a **general-purpose mesh transport platform**. The Mycelium daemon runs as a standalone process on the device, exposing a local API (REST + WebSocket) that any application can connect to. The chat app becomes the first client, proving the API by dogfooding it.
+
+**Current state:** Phases 1-13 are complete. The local API server (47 REST endpoints + WebSocket) is operational. The Flutter app uses the REST API as its primary data interface with WebSocket for real-time events. BLE and Wi-Fi Direct transports work on Android. 186 tests pass across 7 Rust crates.
 
 **Long-term architecture:**
 ```
@@ -19,53 +23,53 @@ Mycelium evolves from a mesh messenger into a **general-purpose mesh transport p
               │                   │
               │  ┌─────────────┐  │
               │  │ Local API   │  │  ← axum REST + WebSocket
-              │  │ (protobuf)  │  │    prost serialization
+              │  │ (JSON)      │  │    serde_json serialization
               │  └─────────────┘  │
               │  ┌─────────────┐  │
               │  │ Protocol    │  │  ← String-based protocol IDs
               │  │ Router      │  │    per-app E2E encryption
               │  └─────────────┘  │
               │  ┌─────────────┐  │
-              │  │ Transports  │  │  ← BLE, Wi-Fi Direct, Internet
+              │  │ Transports  │  │  ← BLE, Wi-Fi Direct, LoRa, BT Classic, Internet
               │  └─────────────┘  │
               └───────────────────┘
 ```
 
 ---
 
-## 2. Immediate Priorities (Build Order)
+## 2. Phases (Build Order)
 
-### Phase 1: WebSocket + REST API & Debug Panel (simultaneous)
+### Phase 1: WebSocket + REST API & Debug Panel — COMPLETE
 
-Build the local API server in Rust and the debug panel in Flutter at the same time, iterating together.
+Built the local API server in Rust (axum, 47 endpoints) and debug panel in Flutter. JSON serialization (not protobuf as originally planned). See ADR-001.
 
-### Phase 2: Receipt Fix & 2-Phone Reliability
+### Phase 2: Receipt Fix & 2-Phone Reliability — COMPLETE
 
-Debug the delivery receipt flow end-to-end. Make the 2-phone experience rock-solid.
+Delivery receipts working end-to-end. WebSocket push for real-time status updates.
 
-### Phase 3: Multi-Hop Forwarding
+### Phase 3: Multi-Hop Forwarding — COMPLETE
 
-Wire up AODV forwarding so messages can relay through intermediate nodes. Build and test even though only 2 phones are available — verify with mock transport tests.
+AODV forwarding verified with 3-node and 4-node mock transport tests. DTN fallback after AODV timeout.
 
-### Phase 4: Group Chat UI
+### Phase 4: Group Chat UI — COMPLETE
 
-Wire Sender Key groups through the API to a Flutter group chat screen.
+Sender Key groups wired through REST API. Groups screen in Flutter. Create, add/remove members, send messages.
 
-### Phase 5: Contact Verification
+### Phase 5: Contact Verification — COMPLETE
 
-Safety number comparison flow with QR-based and manual verification.
+Safety number comparison flow. Verify screen with 60-digit display. QR-based verification.
 
-### Phase 6: Chat App Migration to WebSocket
+### Phase 6: Chat App Migration to WebSocket — COMPLETE
 
-Migrate the Flutter chat app from direct FFI to the WebSocket API. The chat app becomes protocol `mycelium.chat.v1`.
+Flutter app uses REST API (via ApiClient) + WebSocket (WsService) for real-time events. FFI retained for transport bridging only.
 
-### Phase 7: Internet Overlay (DHT)
+### Phase 7: Internet Overlay (DHT) — PARTIAL
 
-Kademlia-style DHT for internet-connected nodes to discover and relay to each other.
+Kademlia DHT module implemented in `mycelium-core/src/dht/` (routing table, RPC, message serialization, 16 tests). TCP networking not yet wired.
 
-### Phase 8: Full Daemon Extraction
+### Phase 8: Full Daemon Extraction — COMPLETE
 
-Extract Mycelium node to a standalone Android daemon process, started at boot.
+Node runs as standalone process. Flutter reconnects to surviving daemon after app kill.
 
 ---
 
@@ -73,11 +77,11 @@ Extract Mycelium node to a standalone Android daemon process, started at boot.
 
 ### 3.1 Technology Stack
 
-- **HTTP/REST**: `axum` (Tower-based, async, Tokio-native)
+- **HTTP/REST**: `axum` 0.8 (Tower-based, async, Tokio-native)
 - **WebSocket**: `axum` built-in WebSocket support (uses `tokio-tungstenite` internally)
-- **Serialization**: `prost` for protobuf encoding/decoding
-- **Protobuf codegen**: `prost-build` at build time from `.proto` schema files
-- **No gRPC runtime**: Raw protobuf frames over WebSocket, protobuf request/response bodies over REST
+- **Serialization**: `serde_json` for all request/response bodies (originally planned protobuf, chose JSON for simplicity)
+- **CORS**: `tower-http` CorsLayer (permissive for localhost)
+- **Hex encoding**: `hex` crate for NodeId/MessageId serialization
 
 ### 3.2 Server Configuration
 
@@ -88,9 +92,9 @@ Extract Mycelium node to a standalone Android daemon process, started at boot.
   - Optional: Per-app tokens (apps register and receive unique tokens)
 - **Config file**: Extend `NodeConfig` with API server settings
 
-### 3.3 REST API (Full CRUD)
+### 3.3 REST API (Full CRUD) — IMPLEMENTED
 
-All request/response bodies are protobuf-encoded (Content-Type: `application/x-protobuf`), with optional JSON fallback (`application/json`) for debugging.
+All request/response bodies are JSON-encoded (`Content-Type: application/json`). 47 endpoints across 9 route modules.
 
 #### Node
 | Method | Path | Description |
@@ -142,7 +146,7 @@ All request/response bodies are protobuf-encoded (Content-Type: `application/x-p
 | GET | `/v1/network/dtn` | DTN bundle queue (message_id, destination, copies_remaining, expires) |
 | GET | `/v1/network/pending` | Pending messages and route discoveries |
 
-### 3.4 WebSocket API
+### 3.4 WebSocket API — IMPLEMENTED
 
 #### Connection
 
@@ -154,7 +158,7 @@ Apps declare which protocol IDs they want to receive data for. If no protocols s
 
 #### Frame Format
 
-All WebSocket frames are binary, containing a protobuf-encoded `WsMessage`:
+All WebSocket frames are JSON text. The actual implementation uses `serde_json` instead of the originally planned protobuf. The schema below shows the logical structure:
 
 ```protobuf
 message WsMessage {
@@ -404,33 +408,37 @@ Once the WebSocket API is in place, delivery receipts will be pushed via `Delive
 
 ---
 
-## 12. File Summary
+## 12. File Summary — CURRENT STATE
 
-### New Crate: `mycelium-api`
-- Local HTTP/WebSocket server
-- Protobuf schema definitions (`.proto` files)
-- axum routes and handlers
-- WebSocket connection management and event broadcasting
+### Crate: `mycelium-api` (implemented)
+- Local HTTP/WebSocket server using axum 0.8
+- JSON serialization via serde_json (no protobuf)
+- 9 route modules: node, messages, conversations, contacts, groups, channels, prekeys, emergency, network
+- WebSocket handler with 6 server event types
+- 30+ request/response types in `types.rs`
+- 11 integration tests
 
-### New Proto Files
-- `api.proto`: REST request/response messages
-- `ws.proto`: WebSocket frame messages
-- `common.proto`: Shared types (NodeId, MessageId, etc.)
+### Crate: `mycelium-core` additions (implemented)
+- 8 transport modules: ble, wifi_direct, lora, bt_classic, internet, plugin, mock, manager
+- DHT module: Kademlia routing table, RPC, message serialization (16 tests)
+- AODV supernode route preference
 
-### Modified Crates
-- `mycelium-node`: Embed API server startup in `Node::start()`
-- `mycelium-core`: Expose routing table inspection methods
-- `mycelium-ffi`: Kept for backward compatibility during migration
+### Crate: `mycelium-node` additions (implemented)
+- CLI entry point with `--supernode`, `--data-dir`, `--port` flags
+- Supernode auto-configuration (2GB DTN, 0.0.0.0 bind, always-on battery)
+- Prekey cache REST API and opportunistic caching during relay
+- Beacon with group_discovery_hash for auto-trust
 
-### New Flutter Files
-- `lib/src/screens/debug_screen.dart`: Debug diagnostics panel
-- `lib/src/service/api_client.dart`: REST + WebSocket client (replaces FFI calls)
-- `lib/src/screens/group_chat_screen.dart`: Group messaging UI
-- `lib/src/screens/group_info_screen.dart`: Group members and management
-- `lib/src/screens/verify_screen.dart`: Safety number verification flow
+### Crate: `mycelium-crypto` additions (implemented)
+- `discovery.rs`: Group discovery key derivation (HKDF, "MyceliumGroupDiscovery")
 
-### Modified Flutter Files
-- `lib/src/router/app_router.dart`: Add debug tab (conditional), group routes
-- `lib/src/screens/settings_screen.dart`: Developer mode toggle
-- `lib/src/screens/contacts_screen.dart`: Verification flow integration
-- `lib/src/providers/`: New providers for debug data, groups
+### Crate: `mycelium-storage` additions (implemented)
+- `channels.rs`: Channel storage, subscriptions, messages (5 tests)
+
+### Flutter App (47 Dart files, implemented)
+- 14 screens: conversations, chat, contacts, groups, channels, channel_chat, settings, debug, welcome, name_setup, join_method, seed_phrase, qr_scanner, verify
+- 8 services: mycelium_service, api_client, ws_service, notification_service, ble_manager, wifi_direct_manager, ffi_helpers, mycelium_exception
+- 8 Riverpod providers with async/stream support
+- 7 data models with enum types
+- 6 reusable widgets
+- GoRouter with 6-tab shell + onboarding redirect

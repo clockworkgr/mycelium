@@ -39,7 +39,7 @@ impl Default for DtnConfig {
     fn default() -> Self {
         Self {
             spray_copies: 8,
-            ttl: Duration::from_secs(72 * 3600), // 72 hours
+            ttl: Duration::from_secs(72 * 3600),  // 72 hours
             max_storage_bytes: 256 * 1024 * 1024, // 256 MB (phone default)
             per_identity_quota_bytes: 10 * 1024 * 1024, // 10 MB per identity
         }
@@ -50,7 +50,7 @@ impl DtnConfig {
     /// Supernode configuration with larger storage.
     pub fn supernode() -> Self {
         Self {
-            max_storage_bytes: 2 * 1024 * 1024 * 1024, // 2 GB
+            max_storage_bytes: 2 * 1024 * 1024 * 1024,  // 2 GB
             per_identity_quota_bytes: 50 * 1024 * 1024, // 50 MB per identity
             ..Default::default()
         }
@@ -135,10 +135,7 @@ impl DtnEngine {
     }
 
     /// Store an incoming bundle received from another relay.
-    pub fn store_relay(
-        &mut self,
-        bundle: DtnBundle,
-    ) -> Result<(), DtnError> {
+    pub fn store_relay(&mut self, bundle: DtnBundle) -> Result<(), DtnError> {
         if self.bundles.contains_key(&bundle.message_id) {
             return Ok(()); // Already have it
         }
@@ -233,7 +230,11 @@ impl DtnEngine {
                         .push(*peer);
                 }
                 DtnAction::DeliverLocal { bundle } => {
-                    trace!("Bundle {} delivered to destination {}", bundle.message_id, bundle.destination);
+                    trace!(
+                        "Bundle {} delivered to destination {}",
+                        bundle.message_id,
+                        bundle.destination
+                    );
                 }
                 DtnAction::None => {}
             }
@@ -413,21 +414,11 @@ mod tests {
 
         // First store should work
         engine
-            .store_outgoing(
-                MessageId::random(),
-                node(2),
-                node(1),
-                vec![0u8; 80],
-            )
+            .store_outgoing(MessageId::random(), node(2), node(1), vec![0u8; 80])
             .unwrap();
 
         // Second store should fail (would exceed 100-byte quota)
-        let result = engine.store_outgoing(
-            MessageId::random(),
-            node(2),
-            node(1),
-            vec![0u8; 30],
-        );
+        let result = engine.store_outgoing(MessageId::random(), node(2), node(1), vec![0u8; 30]);
         assert!(result.is_err());
     }
 

@@ -314,8 +314,8 @@ fn ed25519_to_x25519_secret(signing_key: &SigningKey) -> X25519Secret {
 /// Convert Ed25519 public key to X25519 public key (Edwards -> Montgomery).
 fn ed25519_public_to_x25519(ed25519_pubkey: &[u8; 32]) -> X25519Public {
     use curve25519_dalek::edwards::CompressedEdwardsY;
-    let compressed = CompressedEdwardsY::from_slice(ed25519_pubkey)
-        .expect("invalid Ed25519 public key length");
+    let compressed =
+        CompressedEdwardsY::from_slice(ed25519_pubkey).expect("invalid Ed25519 public key length");
     let point = compressed.decompress().expect("invalid Ed25519 point");
     let montgomery = point.to_montgomery();
     X25519Public::from(*montgomery.as_bytes())
@@ -403,9 +403,15 @@ mod tests {
 
         // Verify signature is valid
         let verifying_key = VerifyingKey::from_bytes(&bundle.identity_key).unwrap();
-        let sig_bytes: [u8; 64] = bundle.signed_prekey_signature.as_slice().try_into().unwrap();
+        let sig_bytes: [u8; 64] = bundle
+            .signed_prekey_signature
+            .as_slice()
+            .try_into()
+            .unwrap();
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        assert!(verifying_key.verify(&bundle.signed_prekey, &signature).is_ok());
+        assert!(verifying_key
+            .verify(&bundle.signed_prekey, &signature)
+            .is_ok());
     }
 
     #[test]

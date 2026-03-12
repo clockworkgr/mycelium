@@ -89,7 +89,10 @@ pub enum AodvAction {
     /// Forward RERR to neighbors.
     BroadcastRerr(RouteError),
     /// Route found: data can be sent via this next hop.
-    RouteFound { destination: NodeId, next_hop: NodeId },
+    RouteFound {
+        destination: NodeId,
+        next_hop: NodeId,
+    },
     /// No action needed (duplicate, etc).
     None,
 }
@@ -180,15 +183,15 @@ impl AodvRouter {
     }
 
     /// Process an incoming RREQ. Returns action to take.
-    pub fn handle_rreq(
-        &mut self,
-        mut rreq: RouteRequest,
-        received_from: NodeId,
-    ) -> AodvAction {
+    pub fn handle_rreq(&mut self, mut rreq: RouteRequest, received_from: NodeId) -> AodvAction {
         // Dedup: have we seen this RREQ recently?
         self.cleanup_seen_rreqs();
         if self.is_duplicate_rreq(&rreq) {
-            trace!("Duplicate RREQ {} from {}, ignoring", rreq.request_id, rreq.source);
+            trace!(
+                "Duplicate RREQ {} from {}, ignoring",
+                rreq.request_id,
+                rreq.source
+            );
             return AodvAction::None;
         }
 
@@ -218,7 +221,10 @@ impl AodvRouter {
                 hop_count: 0,
                 lifetime_secs: self.route_lifetime.as_secs() as u32,
             };
-            debug!("We are the destination, sending RREP for rreq_id={}", rreq.request_id);
+            debug!(
+                "We are the destination, sending RREP for rreq_id={}",
+                rreq.request_id
+            );
             return AodvAction::UnicastRrep {
                 next_hop: received_from,
                 rrep,
@@ -237,10 +243,7 @@ impl AodvRouter {
                     destination: rreq.destination,
                     dest_seq: route.sequence_number,
                     hop_count: route.hop_count,
-                    lifetime_secs: route
-                        .lifetime
-                        .duration_since(Instant::now())
-                        .as_secs() as u32,
+                    lifetime_secs: route.lifetime.duration_since(Instant::now()).as_secs() as u32,
                 };
                 debug!(
                     "Intermediate reply for {} via cached route (rreq_id={})",
@@ -264,11 +267,7 @@ impl AodvRouter {
     }
 
     /// Process an incoming RREP. Returns action to take.
-    pub fn handle_rrep(
-        &mut self,
-        mut rrep: RouteReply,
-        received_from: NodeId,
-    ) -> AodvAction {
+    pub fn handle_rrep(&mut self, mut rrep: RouteReply, received_from: NodeId) -> AodvAction {
         // Create/update forward route to destination
         self.update_route(
             rrep.destination,
@@ -295,10 +294,7 @@ impl AodvRouter {
         if let Some(route) = self.routes.get(&rrep.source) {
             let next_hop = route.next_hop;
             rrep.hop_count += 1;
-            AodvAction::UnicastRrep {
-                next_hop,
-                rrep,
-            }
+            AodvAction::UnicastRrep { next_hop, rrep }
         } else {
             debug!("No reverse route to {}, dropping RREP", rrep.source);
             AodvAction::None
@@ -375,8 +371,7 @@ impl AodvRouter {
                     } else if hop_count == existing.hop_count {
                         // Same hops + same seq: prefer supernode next-hop
                         let new_via_supernode = self.known_supernodes.contains(&next_hop);
-                        let old_via_supernode =
-                            self.known_supernodes.contains(&existing.next_hop);
+                        let old_via_supernode = self.known_supernodes.contains(&existing.next_hop);
                         new_via_supernode && !old_via_supernode
                     } else {
                         false
@@ -403,9 +398,9 @@ impl AodvRouter {
     }
 
     fn is_duplicate_rreq(&self, rreq: &RouteRequest) -> bool {
-        self.seen_rreqs.iter().any(|r| {
-            r.source == rreq.source && r.request_id == rreq.request_id
-        })
+        self.seen_rreqs
+            .iter()
+            .any(|r| r.source == rreq.source && r.request_id == rreq.request_id)
     }
 
     /// Return all routes in the routing table (for diagnostics).

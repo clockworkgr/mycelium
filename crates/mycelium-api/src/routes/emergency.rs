@@ -77,9 +77,7 @@ pub async fn broadcast(
 }
 
 /// GET /v1/emergency/history — Recent emergency events from the event log
-pub async fn history(
-    State(state): State<AppState>,
-) -> Json<Vec<EmergencyHistoryEntry>> {
+pub async fn history(State(state): State<AppState>) -> Json<Vec<EmergencyHistoryEntry>> {
     let log = state.event_log.lock().unwrap_or_else(|e| e.into_inner());
     let entries: Vec<EmergencyHistoryEntry> = log
         .iter()

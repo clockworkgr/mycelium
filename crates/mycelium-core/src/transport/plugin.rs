@@ -95,9 +95,10 @@ impl PluginRegistry {
         &self,
         config: &PluginConfig,
     ) -> Result<Box<dyn TransportPlugin>, TransportError> {
-        let factory = self.factories.get(&config.name).ok_or_else(|| {
-            TransportError::Other(format!("unknown plugin: {}", config.name))
-        })?;
+        let factory = self
+            .factories
+            .get(&config.name)
+            .ok_or_else(|| TransportError::Other(format!("unknown plugin: {}", config.name)))?;
         factory.create(config)
     }
 
@@ -122,7 +123,9 @@ mod tests {
         let mut config = PluginConfig::default();
         config.name = "test-radio".to_string();
         config.enabled = true;
-        config.settings.insert("frequency".to_string(), "915".to_string());
+        config
+            .settings
+            .insert("frequency".to_string(), "915".to_string());
         assert_eq!(config.settings.get("frequency"), Some(&"915".to_string()));
     }
 

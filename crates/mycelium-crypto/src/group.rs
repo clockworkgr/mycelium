@@ -207,7 +207,13 @@ impl SenderKeyGroup {
 
             let node_id = NodeId(node_id_bytes);
             members.push(node_id);
-            member_keys.insert(node_id, SenderKey { chain_key, iteration });
+            member_keys.insert(
+                node_id,
+                SenderKey {
+                    chain_key,
+                    iteration,
+                },
+            );
         }
 
         Some(Self {

@@ -25,6 +25,7 @@ pub type BleSendCallback = extern "C" fn(*const [u8; 32], *const u8, u32) -> i32
 /// - Power: Low (designed for battery-constrained devices)
 /// - Use: Discovery beacons, small control messages, session init
 pub struct BleTransport {
+    #[allow(dead_code)]
     local_id: NodeId,
     tx: broadcast::Sender<TransportEvent>,
     connected_peers: Arc<RwLock<Vec<NodeId>>>,
@@ -32,6 +33,7 @@ pub struct BleTransport {
     send_callback: Arc<RwLock<Option<BleSendCallback>>>,
     /// Outbox queue for outgoing data. Dart polls this via FFI since it cannot
     /// provide a synchronous C callback across threads.
+    #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
 }
 
@@ -154,9 +156,16 @@ impl Transport for BleTransport {
         let cb = self.send_callback.read().await;
         if let Some(callback) = *cb {
             let peer_bytes = peer.as_bytes();
-            let result = callback(peer_bytes as *const [u8; 32], data.as_ptr(), data.len() as u32);
+            let result = callback(
+                peer_bytes as *const [u8; 32],
+                data.as_ptr(),
+                data.len() as u32,
+            );
             if result != 0 {
-                return Err(TransportError::SendFailed(format!("BLE send callback returned {}", result)));
+                return Err(TransportError::SendFailed(format!(
+                    "BLE send callback returned {}",
+                    result
+                )));
             }
         } else {
             // Push to outbox for Dart to poll via mycelium_ble_dequeue_send

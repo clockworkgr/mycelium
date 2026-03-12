@@ -25,6 +25,7 @@ pub type WifiSendCallback = extern "C" fn(*const [u8; 32], *const u8, u32) -> i3
 /// - Power: Medium-High (Wi-Fi radio)
 /// - Use: Bulk data transfer, large messages, file sharing
 pub struct WifiDirectTransport {
+    #[allow(dead_code)]
     local_id: NodeId,
     tx: broadcast::Sender<TransportEvent>,
     connected_peers: Arc<RwLock<Vec<NodeId>>>,
@@ -32,6 +33,7 @@ pub struct WifiDirectTransport {
     send_callback: Arc<RwLock<Option<WifiSendCallback>>>,
     /// Outbox queue for outgoing data. Dart polls this via FFI since it cannot
     /// provide a synchronous C callback across threads.
+    #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
 }
 
@@ -58,7 +60,11 @@ impl WifiDirectTransport {
     pub fn dequeue_send(&self) -> Option<(NodeId, Vec<u8>)> {
         let result = self.outbox.lock().ok()?.pop_front();
         if let Some((ref peer, ref data)) = result {
-            debug!("WiFi Direct outbox dequeue: {} bytes for {}", data.len(), peer);
+            debug!(
+                "WiFi Direct outbox dequeue: {} bytes for {}",
+                data.len(),
+                peer
+            );
         }
         result
     }
@@ -153,9 +159,16 @@ impl Transport for WifiDirectTransport {
         let cb = self.send_callback.read().await;
         if let Some(callback) = *cb {
             let peer_bytes = peer.as_bytes();
-            let result = callback(peer_bytes as *const [u8; 32], data.as_ptr(), data.len() as u32);
+            let result = callback(
+                peer_bytes as *const [u8; 32],
+                data.as_ptr(),
+                data.len() as u32,
+            );
             if result != 0 {
-                return Err(TransportError::SendFailed(format!("WiFi Direct send callback returned {}", result)));
+                return Err(TransportError::SendFailed(format!(
+                    "WiFi Direct send callback returned {}",
+                    result
+                )));
             }
         } else {
             // Push to outbox for Dart to poll via mycelium_wifi_dequeue_send

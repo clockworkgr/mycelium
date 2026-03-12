@@ -10,9 +10,8 @@ use mycelium_core::transport::Transport;
 
 use crate::state::AppState;
 use crate::types::{
-    ApiError, DtnBundleResponse, EventEntry, NetworkStatusResponse, PeerResponse,
-    PendingResponse, RouteEntryResponse, TransportInfo, TransportPeerInfo,
-    TransportStatusResponse,
+    ApiError, DtnBundleResponse, EventEntry, NetworkStatusResponse, PeerResponse, PendingResponse,
+    RouteEntryResponse, TransportInfo, TransportPeerInfo, TransportStatusResponse,
 };
 
 /// GET /v1/network/status — Network overview
@@ -48,9 +47,7 @@ pub async fn get_status(
 }
 
 /// GET /v1/network/routes — AODV routing table
-pub async fn get_routes(
-    State(state): State<AppState>,
-) -> Json<Vec<RouteEntryResponse>> {
+pub async fn get_routes(State(state): State<AppState>) -> Json<Vec<RouteEntryResponse>> {
     let routing = state.node.routing.read().await;
     let now = Instant::now();
 
@@ -80,9 +77,7 @@ pub async fn get_routes(
 }
 
 /// GET /v1/network/dtn — DTN bundle queue
-pub async fn get_dtn_bundles(
-    State(state): State<AppState>,
-) -> Json<Vec<DtnBundleResponse>> {
+pub async fn get_dtn_bundles(State(state): State<AppState>) -> Json<Vec<DtnBundleResponse>> {
     let routing = state.node.routing.read().await;
     let now = Instant::now();
 
@@ -120,15 +115,9 @@ pub async fn get_pending(State(state): State<AppState>) -> Json<PendingResponse>
 
     Json(PendingResponse {
         pending_messages: pm_count,
-        pending_message_destinations: pm_dests
-            .iter()
-            .map(|n| hex::encode(n.as_bytes()))
-            .collect(),
+        pending_message_destinations: pm_dests.iter().map(|n| hex::encode(n.as_bytes())).collect(),
         pending_routes: pr_count,
-        pending_route_destinations: pr_dests
-            .iter()
-            .map(|n| hex::encode(n.as_bytes()))
-            .collect(),
+        pending_route_destinations: pr_dests.iter().map(|n| hex::encode(n.as_bytes())).collect(),
     })
 }
 

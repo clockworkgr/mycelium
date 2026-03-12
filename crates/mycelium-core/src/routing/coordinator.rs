@@ -34,11 +34,7 @@ pub struct RoutingCoordinator {
 }
 
 impl RoutingCoordinator {
-    pub fn new(
-        local_id: NodeId,
-        aodv: AodvRouter,
-        dtn: DtnEngine,
-    ) -> Self {
+    pub fn new(local_id: NodeId, aodv: AodvRouter, dtn: DtnEngine) -> Self {
         Self {
             local_id,
             aodv,
@@ -88,11 +84,7 @@ impl RoutingCoordinator {
     }
 
     /// Handle an incoming AODV message.
-    pub fn handle_aodv_message(
-        &mut self,
-        msg: AodvMessage,
-        received_from: NodeId,
-    ) -> AodvAction {
+    pub fn handle_aodv_message(&mut self, msg: AodvMessage, received_from: NodeId) -> AodvAction {
         match msg {
             AodvMessage::RouteRequest(rreq) => self.aodv.handle_rreq(rreq, received_from),
             AodvMessage::RouteReply(rrep) => self.aodv.handle_rrep(rrep, received_from),
@@ -102,7 +94,10 @@ impl RoutingCoordinator {
 
     /// Notify the coordinator that a neighbor was encountered.
     /// Adds a direct AODV route and checks DTN bundles for the neighbor.
-    pub fn on_neighbor_encountered(&mut self, neighbor: NodeId) -> Vec<crate::dtn::spray_and_wait::DtnAction> {
+    pub fn on_neighbor_encountered(
+        &mut self,
+        neighbor: NodeId,
+    ) -> Vec<crate::dtn::spray_and_wait::DtnAction> {
         // Add direct neighbor route in AODV
         self.aodv.add_neighbor_route(neighbor);
 

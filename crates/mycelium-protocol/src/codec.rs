@@ -102,8 +102,7 @@ impl Envelope {
             ProtocolVersion(u16::from_le_bytes([data[offset], data[offset + 1]]));
         offset += 2;
 
-        let payload_len =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
         if data.len() < offset + payload_len {

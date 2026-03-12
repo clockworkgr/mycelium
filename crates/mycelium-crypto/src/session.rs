@@ -35,18 +35,14 @@ impl SessionManager {
         peer_id: NodeId,
         their_bundle: &PrekeyBundle,
     ) -> Result<InitiateResult, SessionError> {
-        let x3dh_result = x3dh::x3dh_initiate(our_identity, their_bundle)
-            .map_err(SessionError::X3dh)?;
+        let x3dh_result =
+            x3dh::x3dh_initiate(our_identity, their_bundle).map_err(SessionError::X3dh)?;
 
-        let ratchet = RatchetState::init_alice(
-            x3dh_result.shared_secret,
-            their_bundle.signed_prekey,
-        );
+        let ratchet =
+            RatchetState::init_alice(x3dh_result.shared_secret, their_bundle.signed_prekey);
 
-        let safety_number = compute_safety_number(
-            &our_identity.public_key_bytes(),
-            &their_bundle.identity_key,
-        );
+        let safety_number =
+            compute_safety_number(&our_identity.public_key_bytes(), &their_bundle.identity_key);
 
         let session = Session {
             peer_id,
@@ -85,16 +81,12 @@ impl SessionManager {
 
         // Clone the signed prekey secret for Double Ratchet initialization
         // (Bob uses his signed prekey as initial DH key)
-        let bob_spk = x25519_dalek::StaticSecret::from(
-            our_state.signed_prekey_secret.to_bytes(),
-        );
+        let bob_spk = x25519_dalek::StaticSecret::from(our_state.signed_prekey_secret.to_bytes());
 
         let ratchet = RatchetState::init_bob(x3dh_result.shared_secret, bob_spk);
 
-        let safety_number = compute_safety_number(
-            &our_state.identity.public_key_bytes(),
-            their_identity_key,
-        );
+        let safety_number =
+            compute_safety_number(&our_state.identity.public_key_bytes(), their_identity_key);
 
         let session = Session {
             peer_id,
@@ -115,10 +107,7 @@ impl SessionManager {
         plaintext: &[u8],
         ad: &[u8],
     ) -> Result<(RatchetHeader, Vec<u8>), SessionError> {
-        let session = self
-            .sessions
-            .get_mut(peer)
-            .ok_or(SessionError::NoSession)?;
+        let session = self.sessions.get_mut(peer).ok_or(SessionError::NoSession)?;
 
         session
             .ratchet
@@ -134,10 +123,7 @@ impl SessionManager {
         ciphertext: &[u8],
         ad: &[u8],
     ) -> Result<Vec<u8>, SessionError> {
-        let session = self
-            .sessions
-            .get_mut(peer)
-            .ok_or(SessionError::NoSession)?;
+        let session = self.sessions.get_mut(peer).ok_or(SessionError::NoSession)?;
 
         session
             .ratchet

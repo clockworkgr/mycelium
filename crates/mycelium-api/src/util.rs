@@ -23,7 +23,10 @@ pub fn parse_node_id(hex_str: &str) -> Result<NodeId, (StatusCode, Json<ApiError
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ApiError {
-                error: format!("Node ID must be 32 bytes (64 hex chars), got {}", bytes.len()),
+                error: format!(
+                    "Node ID must be 32 bytes (64 hex chars), got {}",
+                    bytes.len()
+                ),
                 code: 400,
             }),
         ));

@@ -103,6 +103,7 @@ pub struct LoraTransport {
     connected_peers: Arc<RwLock<Vec<NodeId>>>,
     started: Arc<RwLock<bool>>,
     /// Outbox queue for outgoing data. Platform polls via FFI.
+    #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
     /// Duty cycle tracking: total airtime used in current window (ms).
     duty_airtime_ms: Arc<Mutex<u64>>,
@@ -344,7 +345,10 @@ mod tests {
         // MTU for SF10 is 51 bytes
         let result = transport.send(&NodeId([0xAA; 32]), &[0u8; 100]).await;
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), TransportError::ExceedsMtu { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            TransportError::ExceedsMtu { .. }
+        ));
     }
 
     #[test]

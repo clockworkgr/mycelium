@@ -13,10 +13,7 @@ use crate::types::{WsClientMessage, WsServerMessage};
 use crate::util::parse_node_id;
 
 /// GET /v1/ws — WebSocket upgrade handler
-pub async fn ws_upgrade(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_ws(socket, state))
 }
 

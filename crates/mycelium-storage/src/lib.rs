@@ -1,10 +1,10 @@
-pub mod db;
-pub mod messages;
-pub mod sessions;
-pub mod contacts;
 pub mod channels;
+pub mod contacts;
+pub mod db;
 pub mod dtn;
 pub mod groups;
-pub mod prekeys;
-pub mod vouches;
+pub mod messages;
 pub mod migrations;
+pub mod prekeys;
+pub mod sessions;
+pub mod vouches;

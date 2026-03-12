@@ -18,7 +18,7 @@ impl Identity {
     pub fn generate() -> Self {
         let mut csprng = rand::rngs::OsRng;
         let signing_key = SigningKey::generate(&mut csprng);
-        let x25519_secret = X25519StaticSecret::random_from_rng(&mut csprng);
+        let x25519_secret = X25519StaticSecret::random_from_rng(csprng);
         Self {
             signing_key,
             x25519_secret,
@@ -66,7 +66,10 @@ impl Identity {
 
     /// Verify a signature against this identity's public key.
     pub fn verify(&self, message: &[u8], signature: &Signature) -> bool {
-        self.signing_key.verifying_key().verify(message, signature).is_ok()
+        self.signing_key
+            .verifying_key()
+            .verify(message, signature)
+            .is_ok()
     }
 
     /// Serialize identity to bytes (64 bytes signing key + 32 bytes x25519 secret).
@@ -200,8 +203,12 @@ mod tests {
         let alice = Identity::generate();
         let bob = Identity::generate();
 
-        let alice_shared = alice.x25519_secret().diffie_hellman(&bob.x25519_public_key());
-        let bob_shared = bob.x25519_secret().diffie_hellman(&alice.x25519_public_key());
+        let alice_shared = alice
+            .x25519_secret()
+            .diffie_hellman(&bob.x25519_public_key());
+        let bob_shared = bob
+            .x25519_secret()
+            .diffie_hellman(&alice.x25519_public_key());
         assert_eq!(alice_shared.as_bytes(), bob_shared.as_bytes());
     }
 }

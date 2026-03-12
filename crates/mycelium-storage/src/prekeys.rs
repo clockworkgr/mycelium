@@ -98,6 +98,7 @@ impl Database {
     }
 
     /// List all cached prekey bundles (node_id, bundle_data).
+    #[allow(clippy::type_complexity)]
     pub fn list_cached_prekey_bundles(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>, StorageError> {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT node_id, bundle_data FROM prekey_cache")?;

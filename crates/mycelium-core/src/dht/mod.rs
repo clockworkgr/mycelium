@@ -115,7 +115,10 @@ impl DhtEngine {
     /// Handle an incoming DHT message and produce a response.
     pub async fn handle_message(&self, msg: DhtMessage) -> Option<DhtResponse> {
         match msg {
-            DhtMessage::Ping { sender_id, sender_addr } => {
+            DhtMessage::Ping {
+                sender_id,
+                sender_addr,
+            } => {
                 self.add_peer(PeerInfo {
                     node_id: sender_id,
                     addr: sender_addr,
@@ -126,7 +129,11 @@ impl DhtEngine {
                     responder_id: self.local_id,
                 })
             }
-            DhtMessage::FindNode { sender_id, sender_addr, target } => {
+            DhtMessage::FindNode {
+                sender_id,
+                sender_addr,
+                target,
+            } => {
                 self.add_peer(PeerInfo {
                     node_id: sender_id,
                     addr: sender_addr,
@@ -134,16 +141,19 @@ impl DhtEngine {
                 })
                 .await;
                 let closest = self.find_closest(&target).await;
-                let nodes: Vec<(NodeId, SocketAddr)> = closest
-                    .into_iter()
-                    .map(|p| (p.node_id, p.addr))
-                    .collect();
+                let nodes: Vec<(NodeId, SocketAddr)> =
+                    closest.into_iter().map(|p| (p.node_id, p.addr)).collect();
                 Some(DhtResponse::FoundNodes {
                     responder_id: self.local_id,
                     nodes,
                 })
             }
-            DhtMessage::Store { sender_id, sender_addr, key, value } => {
+            DhtMessage::Store {
+                sender_id,
+                sender_addr,
+                key,
+                value,
+            } => {
                 self.add_peer(PeerInfo {
                     node_id: sender_id,
                     addr: sender_addr,
@@ -155,7 +165,11 @@ impl DhtEngine {
                     responder_id: self.local_id,
                 })
             }
-            DhtMessage::FindValue { sender_id, sender_addr, key } => {
+            DhtMessage::FindValue {
+                sender_id,
+                sender_addr,
+                key,
+            } => {
                 self.add_peer(PeerInfo {
                     node_id: sender_id,
                     addr: sender_addr,
@@ -171,10 +185,8 @@ impl DhtEngine {
                 } else {
                     drop(store);
                     let closest = self.find_closest(&key).await;
-                    let nodes: Vec<(NodeId, SocketAddr)> = closest
-                        .into_iter()
-                        .map(|p| (p.node_id, p.addr))
-                        .collect();
+                    let nodes: Vec<(NodeId, SocketAddr)> =
+                        closest.into_iter().map(|p| (p.node_id, p.addr)).collect();
                     Some(DhtResponse::FoundNodes {
                         responder_id: self.local_id,
                         nodes,

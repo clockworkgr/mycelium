@@ -11,10 +11,10 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use std::sync::Once;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::info;
-use std::sync::Once;
 
 use mycelium_crypto::identity::Identity;
 use mycelium_node::config::NodeConfig;
@@ -25,8 +25,8 @@ use mycelium_storage::db::Database;
 // Thread-local storage for message plaintext data.
 // Keeps plaintext alive until the next mycelium_get_messages call.
 thread_local! {
-    static MESSAGE_PLAINTEXTS: RefCell<Vec<Vec<u8>>> = RefCell::new(Vec::new());
-    static LAST_ERROR: RefCell<Option<String>> = RefCell::new(None);
+    static MESSAGE_PLAINTEXTS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 fn set_last_error(msg: impl Into<String>) {
@@ -199,7 +199,7 @@ pub unsafe extern "C" fn mycelium_node_new(
     // Open persistent database (derive encryption key from identity)
     let db_path = format!("{}/mycelium.db", data_dir);
     let db_key = {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"mycelium-db-key:");
         hasher.update(identity.to_bytes());
@@ -237,7 +237,10 @@ pub unsafe extern "C" fn mycelium_node_start(handle: *mut MyceliumNode) -> bool 
             let config = api_config.clone();
             match runtime().block_on(mycelium_api::start_server(node_clone, &config)) {
                 Ok(api_task) => {
-                    info!("API server started on {}:{}", config.bind_address, config.port);
+                    info!(
+                        "API server started on {}:{}",
+                        config.bind_address, config.port
+                    );
                     if let Ok(mut guard) = mycelium.api_handle.lock() {
                         *guard = Some(api_task);
                     }
@@ -409,7 +412,10 @@ pub unsafe extern "C" fn mycelium_get_messages(
     let node = &(*handle).node;
     let peer = NodeId::from_bytes(*peer_id);
 
-    let messages = match node.db.get_conversation(&node.node_id, &peer, limit, offset) {
+    let messages = match node
+        .db
+        .get_conversation(&node.node_id, &peer, limit, offset)
+    {
         Ok(msgs) => msgs,
         Err(_) => return -2,
     };
@@ -506,7 +512,9 @@ pub unsafe extern "C" fn mycelium_get_contacts(
         info.last_seen = contact.last_seen.unwrap_or(0);
 
         let name_bytes = contact.display_name.as_bytes();
-        let name_len = name_bytes.len().min((names_capacity - name_offset) as usize);
+        let name_len = name_bytes
+            .len()
+            .min((names_capacity - name_offset) as usize);
         info.display_name_len = name_len as u32;
 
         if !out_names.is_null() && name_len > 0 {
@@ -690,7 +698,11 @@ pub unsafe extern "C" fn mycelium_verify_session(
         sm.verify_session(&peer)
     });
 
-    if verified { 0 } else { -1 }
+    if verified {
+        0
+    } else {
+        -1
+    }
 }
 
 /// Get the safety number for a peer session as a null-terminated string.
@@ -947,7 +959,12 @@ pub unsafe extern "C" fn mycelium_set_message_callback(
                                         let src = msg.source.as_bytes();
                                         let mid = msg.message_id.as_bytes();
                                         let ct = content_type_to_u8(&msg.content_type);
-                                        cb(src as *const [u8; 32], mid as *const [u8; 16], ct, msg.device_timestamp);
+                                        cb(
+                                            src as *const [u8; 32],
+                                            mid as *const [u8; 16],
+                                            ct,
+                                            msg.device_timestamp,
+                                        );
                                     }
                                 }
                             }
@@ -978,7 +995,9 @@ pub unsafe extern "C" fn mycelium_register_ble_transport(handle: *mut MyceliumNo
     }
 
     let node = &(*handle).node;
-    let ble = Arc::new(mycelium_core::transport::ble::BleTransport::new(node.node_id));
+    let ble = Arc::new(mycelium_core::transport::ble::BleTransport::new(
+        node.node_id,
+    ));
     runtime().block_on(async {
         node.transport_manager.replace_transport(ble.clone()).await;
         *node.ble_transport.write().await = Some(ble);
@@ -993,17 +1012,14 @@ pub unsafe extern "C" fn mycelium_register_ble_transport(handle: *mut MyceliumNo
 /// # Safety
 /// - `handle` must be a valid pointer.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_register_wifi_direct_transport(
-    handle: *mut MyceliumNode,
-) -> i32 {
+pub unsafe extern "C" fn mycelium_register_wifi_direct_transport(handle: *mut MyceliumNode) -> i32 {
     if handle.is_null() {
         return -1;
     }
 
     let node = &(*handle).node;
-    let wifi = Arc::new(mycelium_core::transport::wifi_direct::WifiDirectTransport::new(
-        node.node_id,
-    ));
+    let wifi =
+        Arc::new(mycelium_core::transport::wifi_direct::WifiDirectTransport::new(node.node_id));
     runtime().block_on(async {
         node.transport_manager.add_transport(wifi.clone()).await;
         *node.wifi_transport.write().await = Some(wifi);

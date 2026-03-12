@@ -1,7 +1,7 @@
 # Mycelium Architecture Document
 
 **Version:** 0.1.0
-**Last Updated:** 2026-03-10
+**Last Updated:** 2026-03-11
 **Spec Reference:** `MYCELIUM_SPEC.md` v0.1-draft
 
 ---
@@ -34,7 +34,7 @@
 
 Mycelium is a mobile mesh messaging application that operates without internet or cellular infrastructure. It creates ad-hoc mesh networks using Bluetooth Low Energy on standard smartphones, with end-to-end encryption, delay-tolerant networking, and a Web of Trust identity system.
 
-**Architecture:** Rust core library (6 crates) compiled to a shared library (`libmycelium_ffi.so`) via C FFI, consumed by a Flutter/Dart frontend with Kotlin platform code for Android BLE.
+**Architecture:** Rust core library (7 crates) compiled to a shared library (`libmycelium_ffi.so`) via C FFI, consumed by a Flutter/Dart frontend (47 Dart files, 14 screens) with Kotlin platform code for Android BLE and Wi-Fi Direct. A local REST + WebSocket API server (47 endpoints) enables the Flutter app and future clients to communicate with the node daemon.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -86,7 +86,8 @@ mycelium/
 │   │   ├── src/double_ratchet.rs       # Double Ratchet protocol
 │   │   ├── src/session.rs              # Session management
 │   │   ├── src/wot.rs                  # Web of Trust
-│   │   └── src/group.rs                # Sender Key Groups
+│   │   ├── src/group.rs                # Sender Key Groups
+│   │   └── src/discovery.rs            # Group discovery key derivation
 │   ├── mycelium-core/                  # Transport and routing
 │   │   ├── src/lib.rs                  # Module exports
 │   │   ├── src/messaging.rs            # MessageStatus, StoredMessage types
@@ -102,7 +103,10 @@ mycelium/
 │   │   ├── src/routing/mod.rs          # Routing module exports
 │   │   ├── src/routing/aodv.rs         # AODV reactive routing
 │   │   ├── src/routing/coordinator.rs  # Routing coordinator
-│   │   └── src/dtn/spray_and_wait.rs   # DTN spray-and-wait engine
+│   │   ├── src/dtn/spray_and_wait.rs   # DTN spray-and-wait engine
+│   │   ├── src/dht/mod.rs             # Kademlia DHT node
+│   │   ├── src/dht/routing_table.rs   # k-bucket routing table
+│   │   └── src/dht/rpc.rs             # DHT message serialization
 │   ├── mycelium-storage/               # SQLCipher database layer
 │   │   ├── src/lib.rs                  # Database, schema, migrations
 │   │   ├── src/messages.rs             # Message CRUD
@@ -111,16 +115,17 @@ mycelium/
 │   │   ├── src/vouches.rs              # Web of Trust vouches
 │   │   ├── src/prekeys.rs              # Prekey storage + cache
 │   │   ├── src/dtn.rs                  # DTN bundle storage
-│   │   └── src/groups.rs               # Group state blobs
+│   │   ├── src/groups.rs               # Group state blobs
+│   │   └── src/channels.rs            # Channel storage + subscriptions
 │   ├── mycelium-node/                  # Node daemon
 │   │   ├── src/lib.rs                  # Module exports
 │   │   ├── src/main.rs                 # CLI entry point
-│   │   ├── src/node.rs                 # Node struct + event loop (~2600 lines)
-│   │   ├── src/config.rs               # NodeConfig
+│   │   ├── src/node.rs                 # Node struct + event loop (~3100 lines)
+│   │   ├── src/config.rs               # NodeConfig + PluginConfigEntry
 │   │   ├── src/beacon.rs               # Beacon serialization
 │   │   ├── src/rate_limiter.rs         # Trust-based rate limiting
 │   │   ├── src/battery.rs              # Battery management
-│   │   └── tests/                      # Integration tests (4 files)
+│   │   └── tests/                      # Integration tests (4 files, 29 tests)
 │   ├── mycelium-api/                   # Local REST + WebSocket API server
 │   │   ├── src/lib.rs                  # Public API
 │   │   ├── src/server.rs               # axum router + server startup
@@ -128,48 +133,84 @@ mycelium/
 │   │   ├── src/types.rs                # Request/response JSON types
 │   │   ├── src/ws.rs                   # WebSocket handler
 │   │   ├── src/util.rs                 # Parsing helpers
-│   │   ├── src/routes/                 # REST endpoint handlers
+│   │   ├── src/routes/                 # REST endpoint handlers (9 modules)
 │   │   │   ├── node.rs                 # /v1/node/*
 │   │   │   ├── messages.rs             # /v1/messages/*
 │   │   │   ├── conversations.rs        # /v1/conversations/*
 │   │   │   ├── contacts.rs             # /v1/contacts/*
+│   │   │   ├── groups.rs               # /v1/groups/*
+│   │   │   ├── channels.rs             # /v1/channels/*
+│   │   │   ├── prekeys.rs              # /v1/prekeys/*
+│   │   │   ├── emergency.rs            # /v1/emergency/*
 │   │   │   └── network.rs              # /v1/network/* (diagnostics)
 │   │   └── tests/api_test.rs           # Integration tests (11 tests)
 │   └── mycelium-ffi/                   # C FFI bindings
 │       ├── src/lib.rs                  # 48 extern "C" functions (~1500 lines)
 │       └── include/mycelium.h          # C header
-└── flutter/                            # Flutter mobile app
+└── flutter/                            # Flutter mobile app (47 Dart files)
     ├── pubspec.yaml                    # Dependencies
     ├── ffigen.yaml                     # FFI codegen config
     ├── lib/
-    │   ├── main.dart                   # App entry, permission requests
+    │   ├── main.dart                   # App entry, permission requests, onboarding check
     │   └── src/
-    │       ├── app.dart                # MaterialApp + GoRouter
+    │       ├── router/
+    │       │   └── app_router.dart      # GoRouter with 6-tab shell + onboarding
     │       ├── ffi/
     │       │   ├── mycelium_bindings_generated.dart  # Auto-generated
-    │       │   └── ffi_helpers.dart     # Type conversion utilities
+    │       │   └── native_library.dart  # Library loading
     │       ├── models/
+    │       │   ├── node_id.dart         # NodeId, MessageId classes
     │       │   ├── message.dart         # Message model
     │       │   ├── contact.dart         # Contact model
-    │       │   ├── conversation.dart    # Conversation model
-    │       │   └── network_status.dart  # NetworkStatus model
+    │       │   ├── conversation_summary.dart # Conversation model
+    │       │   ├── group.dart           # GroupSummary, GroupDetail
+    │       │   ├── network_status.dart  # NetworkStatus model
+    │       │   └── enums.dart           # ContentType, MessageStatus enums
     │       ├── service/
-    │       │   ├── mycelium_service.dart # Core FFI service (singleton)
+    │       │   ├── mycelium_service.dart # Core service (singleton), daemon lifecycle
+    │       │   ├── api_client.dart      # REST API client (primary data interface)
+    │       │   ├── ws_service.dart      # WebSocket real-time events
+    │       │   ├── notification_service.dart # Android notifications with chat suppression
     │       │   ├── ble_manager.dart      # BLE ↔ Rust bridge
-    │       │   └── wifi_direct_manager.dart # Wi-Fi Direct ↔ Rust bridge
-    │       ├── providers/
-    │       │   └── providers.dart        # Riverpod providers
-    │       └── screens/
+    │       │   ├── wifi_direct_manager.dart # Wi-Fi Direct ↔ Rust bridge
+    │       │   ├── ffi_helpers.dart      # Type conversion utilities
+    │       │   └── mycelium_exception.dart # Error handling
+    │       ├── providers/               # Riverpod state management (8 providers)
+    │       │   ├── service_provider.dart
+    │       │   ├── contacts_provider.dart
+    │       │   ├── conversations_provider.dart
+    │       │   ├── messages_provider.dart
+    │       │   ├── unread_provider.dart
+    │       │   ├── network_status_provider.dart
+    │       │   ├── ws_events_provider.dart
+    │       │   └── developer_mode_provider.dart
+    │       ├── widgets/                 # Reusable UI components
+    │       │   ├── message_bubble.dart
+    │       │   ├── conversation_tile.dart
+    │       │   ├── contact_tile.dart
+    │       │   ├── send_bar.dart
+    │       │   ├── network_status_card.dart
+    │       │   └── node_id_display.dart
+    │       └── screens/                 # 14 screens
     │           ├── conversations_screen.dart
     │           ├── chat_screen.dart
     │           ├── contacts_screen.dart
+    │           ├── groups_screen.dart
+    │           ├── channels_screen.dart
+    │           ├── channel_chat_screen.dart
     │           ├── settings_screen.dart
-    │           └── qr_scanner_screen.dart
+    │           ├── debug_screen.dart     # Network diagnostics panel
+    │           ├── welcome_screen.dart   # Onboarding start
+    │           ├── name_setup_screen.dart
+    │           ├── join_method_screen.dart
+    │           ├── seed_phrase_screen.dart
+    │           ├── qr_scanner_screen.dart
+    │           └── verify_screen.dart    # Session verification
     └── android/
         └── app/src/main/
-            ├── AndroidManifest.xml       # BLE + camera permissions
+            ├── AndroidManifest.xml       # BLE + Wi-Fi + camera permissions
             ├── kotlin/.../
-            │   ├── MainActivity.kt       # Platform channels
+            │   ├── MainActivity.kt       # Platform channels + battery bridge
             │   ├── BleService.kt         # Full BLE stack (~600 lines)
             │   └── WifiDirectService.kt  # Wi-Fi Direct P2P + TCP sockets
             └── build.gradle.kts          # Rust build integration
@@ -337,10 +378,15 @@ Each payload starts with a 1-byte type discriminator:
 | `0x60` | Receipt | 17 | Delivery/read confirmation |
 | `0x70` | GroupMessage | 37 | Sender key encrypted group msg |
 | `0x71` | SenderKeyDist | 68 | Group key distribution |
+| `0x80` | ChannelMessage | 33 | Public channel broadcast |
+| `0x81` | ChannelSubscribe | 32 | Channel subscription |
+| `0x82` | ChannelUnsubscribe | 32 | Channel unsubscription |
+| `0x83` | ChannelModeration | 65 | Channel moderation action |
+| `0x90` | EmergencyBroadcast | 2 | Tiered emergency alert (level + message + optional cosigners) |
 
 All multi-byte integers use little-endian encoding. Cap'n Proto schemas in `schemas/` are kept as documentation only; the crate uses a custom binary codec.
 
-**Tests:** 26 tests covering all type round-trips, serialization edge cases, and codec errors.
+**Tests:** 29 tests covering all type round-trips, channel/emergency payloads, serialization edge cases, and codec errors.
 
 ---
 
@@ -464,8 +510,19 @@ Simplified MLS for groups. Each member generates a sender key (32-byte chain key
 | `b"MyceliumGroupMK"` | 15 | Group message key derivation |
 | `b"MyceliumGroupCK"` | 15 | Group chain key advancement |
 | `b"MyceliumGroupAEAD"` | 17 | Group AEAD key derivation |
+| `b"MyceliumGroupDiscovery"` | 21 | Group discovery key from passphrase |
 
-**Tests:** ~35 tests covering identity, X3DH (with/without OTP), ratchet (basic, out-of-order, wrong AD), sessions, WoT (12 graph tests), and groups.
+### Group Discovery (`discovery.rs`)
+
+Derives a shared discovery key from a passphrase for automatic peer trust:
+
+```rust
+pub fn derive_group_discovery_key(passphrase: &str) -> [u8; 32]
+```
+
+Uses HKDF-SHA256 with info string `"MyceliumGroupDiscovery"`. The first 8 bytes of the derived key are included in beacon frames as `group_discovery_hash` for matching.
+
+**Tests:** 43 tests covering identity (8), X3DH (9, with/without OTP, prekey state serialization), ratchet (5, basic/out-of-order/wrong-AD), sessions (2), WoT (12 graph tests), groups (4), and discovery (3).
 
 ---
 
@@ -489,9 +546,9 @@ pub trait Transport: Send + Sync {
 }
 ```
 
-**TransportType:** Ble, WifiDirect, Mock
+**TransportType:** `Ble`, `WifiDirect`, `Lora`, `InternetTunnel`, `BtClassic`, `WifiAware`, `Mock`
 
-**TransportEvent:** `NeighborDiscovered`, `NeighborLost`, `DataReceived` (each carries peer, transport type, and optional data)
+**TransportEvent:** `NeighborDiscovered`, `NeighborLost`, `DataReceived`, `LinkQualityChanged` (each carries peer, transport type, and relevant data)
 
 ### TransportManager (`transport/manager.rs`)
 
@@ -544,6 +601,60 @@ pub struct WifiDirectTransport {
 - `WifiDirectManager.dart`: Dart bridge between Kotlin EventChannel/MethodChannel and Rust FFI
 - TCP wire protocol: 1-byte type (Hello=0x01, MeshData=0x02) + 4-byte BE length + payload
 
+### LoRa Transport (`transport/lora.rs`)
+
+Long-range, low-bandwidth transport for rural/emergency scenarios:
+
+- **LoraConfig:** frequency (default 915 MHz US, 868 MHz EU), spreading factor (SF7-SF12), bandwidth (125-500 kHz), TX power, duty cycle limit
+- **Duty cycle enforcement:** Tracks airtime and enforces configurable duty cycle (1% EU default)
+- **Airtime calculation:** Based on SF, BW, and payload size per LoRa modulation formula
+- **MTU:** Varies by SF — 222 bytes (SF7-9), 115 bytes (SF10), 51 bytes (SF11-12)
+- **Presets:** `LoraConfig::eu_default()` (868 MHz, SF9, 1% duty), `LoraConfig::us_default()` (915 MHz, SF9, 10% duty)
+- **Status:** Rust transport complete. Platform bridges (BLE GATT to LoRa module, USB serial) not yet implemented.
+
+### BT Classic SPP Transport (`transport/bt_classic.rs`)
+
+Bluetooth Classic Serial Port Profile for higher-throughput local links:
+
+- **MTU:** 16384 bytes (large RFCOMM frames, no fragmentation needed)
+- **Throughput:** ~2 Mbps SPP
+- **Outbox pattern:** Same as BLE — `VecDeque` polled by platform at 50ms via FFI
+- **Status:** Rust transport complete. Kotlin BtClassicService and Dart bridge not yet implemented.
+
+### Internet Tunnel Transport (`transport/internet.rs`)
+
+TCP-based overlay for internet-connected nodes:
+
+- **Config:** `InternetTransportConfig` with `listen_port` (default 9736) and `bootstrap_nodes` list
+- **Status:** Rust transport struct complete. Full TCP networking not yet wired.
+
+### Transport Plugin System (`transport/plugin.rs`)
+
+Extensible plugin API for third-party radio hardware:
+
+```rust
+pub trait TransportPlugin: Transport {
+    fn plugin_name(&self) -> &str;
+    fn plugin_version(&self) -> &str;
+    fn plugin_description(&self) -> &str;
+    fn configure(&mut self, config: &PluginConfig) -> Result<(), TransportError>;
+    fn requires_platform_bridge(&self) -> bool { false }
+}
+```
+
+- **PluginRegistry:** Factory pattern — register `PluginFactory` by name, create instances from config
+- **PluginConfig:** `name`, `enabled`, `settings: HashMap<String, String>`
+- **NodeConfig integration:** `plugins: Vec<PluginConfigEntry>` in TOML config file
+
+### Kademlia DHT (`dht/`)
+
+Distributed hash table for internet-connected peer discovery:
+
+- **k-bucket routing table:** 256 buckets, k=20, XOR distance metric
+- **DHT operations:** Ping/Pong, FindNode, FindValue, Store
+- **Message serialization:** Custom binary codec for DHT messages
+- **Integration:** Used by internet transport for node discovery and relay
+
 ### AODV Routing (`routing/aodv.rs`)
 
 Reactive routing protocol (spec Section 4.1, Layer 1):
@@ -555,6 +666,7 @@ pub struct AodvRouter {
     sequence_number: u32,                         // Per-node sequence counter
     request_id: u32,                              // RREQ counter
     seen_rreqs: HashMap<(NodeId, u32), Instant>,  // Deduplication
+    known_supernodes: HashSet<NodeId>,            // Registered supernodes for route preference
 }
 ```
 
@@ -563,6 +675,7 @@ pub struct AodvRouter {
 - **RREP handling:** Install route entry, propagate back toward source
 - **Route expiry:** Entries expire after configurable lifetime (default 60s)
 - **Link break:** Generate RERR, invalidate affected routes
+- **Supernode preference:** When two routes have equal sequence number and hop count, prefer the route via a supernode next-hop. Supernodes are registered via `register_supernode()` when beacons with `NodeType::Supernode` are received.
 
 **AodvAction** enum: `Forward(RREQ)`, `BroadcastRreq`, `UnicastRrep`, `RouteFound { destination, next_hop }`, `BroadcastRerr`, `None`
 
@@ -623,7 +736,7 @@ pub struct StoredMessage {
 }
 ```
 
-**Tests:** AODV routing (discovery, RREP, link break), DTN (store, spray, deliver, quota, eviction), transport (mock, manager).
+**Tests:** 51 tests covering AODV routing (9 tests: discovery, RREP, link break, dedup, supernode preference), DTN (5 tests: store, spray, deliver, quota, eviction), DHT (16 tests: k-bucket, routing table, XOR distance, message serialization), LoRa (7 tests), BT Classic (2 tests), internet (3 tests), Wi-Fi Direct routing (5 tests), mock (2 tests), plugin registry (3 tests).
 
 ---
 
@@ -631,7 +744,7 @@ pub struct StoredMessage {
 
 **Purpose:** SQLCipher-encrypted persistence layer. Thread-safe via `Mutex<Connection>`.
 
-### Database Schema (9 tables)
+### Database Schema (12 tables)
 
 | Table | Primary Key | Purpose |
 |-------|-------------|---------|
@@ -643,6 +756,9 @@ pub struct StoredMessage {
 | `prekey_cache` | `node_id BLOB` | Cached remote prekey bundles |
 | `our_prekeys` | `prekey_id INTEGER` | Own X25519 prekeys (signed + one-time) |
 | `dtn_store` | `message_id BLOB` | DTN bundle storage |
+| `channels` | `channel_id BLOB` | Channel metadata (name, creator, timestamps) |
+| `channel_messages` | `message_id BLOB` | Channel message storage |
+| `channel_subscriptions` | `channel_id BLOB` | Channel subscription state |
 | `config` | `key TEXT` | Key-value store (prekey state, group blobs) |
 
 ### Initialization
@@ -668,6 +784,7 @@ Encryption key derived in `main.rs`: `SHA-256(b"mycelium-db-key:" || identity.to
 - **Prekeys:** store, get_unused_one_time, mark_used, count_unused, cache/get/remove bundles, save/load_prekey_state_blob
 - **DTN:** store, get_for_destination, remove, expire, list_all, update_copies, storage_used
 - **Groups:** save/load/list/remove_group_blob (serialized in config table as `group:<hex_id>`)
+- **Channels:** create, subscribe, unsubscribe, store_channel_message, get_channel_messages, delete_channel (cascades messages + subscriptions)
 
 **Design decisions:**
 - All writes use INSERT OR REPLACE (idempotent upserts)
@@ -675,13 +792,13 @@ Encryption key derived in `main.rs`: `SHA-256(b"mycelium-db-key:" || identity.to
 - Group/prekey state stored as opaque blobs (avoids complex schema)
 - `Mutex<Connection>` makes Database `Send + Sync` for tokio
 
-**Tests:** 5 integration tests using in-memory databases.
+**Tests:** 9 tests across messages, vouches, and channels using in-memory databases.
 
 ---
 
 ## 9. mycelium-node
 
-**Purpose:** The node daemon. Contains the main event loop, message pipeline, and all protocol handlers. The largest crate (~4000 lines of code + ~1000 lines of tests).
+**Purpose:** The node daemon. Contains the main event loop, message pipeline, and all protocol handlers. The largest crate (~4500 lines of code + ~1200 lines of tests).
 
 ### Node Struct (`node.rs`)
 
@@ -693,6 +810,7 @@ pub struct Node {
     pub transport_manager: Arc<TransportManager>,
     pub ble_transport: Arc<RwLock<Option<Arc<BleTransport>>>>,
     pub wifi_transport: Arc<RwLock<Option<Arc<WifiDirectTransport>>>>,
+    pub prekey_cache: Arc<RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>>,
     routing: Arc<RwLock<RoutingCoordinator>>,
     session_manager: Arc<RwLock<SessionManager>>,
     prekey_state: Arc<RwLock<PrekeyState>>,
@@ -713,7 +831,7 @@ pub struct Node {
 Spawns concurrent tasks:
 
 1. **Transport event listener** — Processes `NeighborDiscovered`, `NeighborLost`, `DataReceived`
-2. **Beacon broadcaster** — Sends heartbeats every `config.beacon_interval_secs` (default 10s)
+2. **Beacon broadcaster** — Sends heartbeats every `config.beacon_interval_secs` (default 30s for phones, 10s for supernodes)
 3. **Maintenance timer** — Every 30s: expire AODV routes, expire DTN bundles, cleanup rate limiter, rotate prekeys
 
 ### Message Sending Pipeline (`send_message()`)
@@ -748,6 +866,8 @@ send_message(destination, plaintext, content_type)
 | DtnRelay | `handle_dtn_relay()` | Deliver locally or store for relay |
 | GroupMessage | `handle_group_message()` | Decrypt with sender key → store |
 | SenderKeyDist | `handle_sender_key_dist()` | Install sender key for group member |
+| ChannelMessage | `handle_channel_message()` | Verify subscription → store → flood to peers |
+| EmergencyBroadcast | `handle_emergency()` | Trust-gated processing → flood (level 3) |
 
 ### NeighborDiscovered Handler
 
@@ -762,16 +882,20 @@ When a new neighbor is discovered:
 Serialization format:
 [4]  Magic: "MYCO"
 [32] node_id
-[1]  node_type byte
+[1]  node_type byte (0=Phone, 1=Supernode, 2=ExternalRadio)
 [1]  name_length (max 255)
 [*]  display_name
 [2]  protocol_version (u16 LE)
 [1]  battery_level
 [2]  neighbor_count (u16 LE)
 [8]  lamport_clock (u64 LE)
+[1]  group_discovery_hash_flag (0 or 1)
+[8?] group_discovery_hash (optional, if flag=1)
 ```
 
-Beacons are broadcast to all neighbors with TTL=1 (no forwarding) every 10 seconds.
+Beacons are broadcast to all neighbors with TTL=1 (no forwarding) every 30 seconds (phones) or 10 seconds (supernodes).
+
+When a beacon carries a `group_discovery_hash` matching the local node's group seed, the sender is auto-trusted with an initial vouch.
 
 ### Rate Limiter (`rate_limiter.rs`)
 
@@ -803,15 +927,19 @@ Auto-blacklist after 10 violations per window (1 hour blacklist duration).
 
 ```rust
 pub struct NodeConfig {
-    pub data_dir: String,           // "./mycelium-data"
-    pub display_name: String,       // "Mycelium Node"
-    pub node_type: NodeTypeConfig,  // Phone | Supernode
-    pub dtn: DtnStorageConfig,      // 256MB/10MB/72h/8 copies
-    pub beacon_interval_secs: u64,  // 10
-    pub api: ApiConfig,             // REST/WS server bind + port
-    pub group_seed: Option<String>, // Group discovery key (hex)
+    pub data_dir: String,            // "./mycelium-data"
+    pub display_name: String,        // "Mycelium Node"
+    pub node_type: NodeTypeConfig,   // Phone | Supernode
+    pub transports: TransportConfig, // Per-transport enable flags
+    pub dtn: DtnStorageConfig,       // 256MB/10MB/72h/8 copies
+    pub beacon_interval_secs: u64,   // 30 (phones), 10 (supernodes)
+    pub api: ApiConfig,              // REST/WS server bind + port
+    pub group_seed: Option<String>,  // Group discovery key (hex)
+    pub plugins: Vec<PluginConfigEntry>, // Transport plugin configs
 }
 ```
+
+`TransportConfig` has boolean flags for each transport: `wifi_direct`, `ble`, `lora`, `internet_tunnel`, `mock`, plus `internet: InternetTransportConfig` for TCP settings.
 
 ### CLI (`main.rs`)
 
@@ -831,7 +959,7 @@ When `--supernode` is passed:
 - Binds API server to `0.0.0.0` for remote management
 - Uses `BatteryManager::always_on()` (always `PowerMode::Full`)
 
-**Tests:** 40+ tests across 4 test files covering lifecycle, message exchange, multi-hop routing, DTN fallback, persistence, receipts, beacons, and session management.
+**Tests:** 43 tests across 4 test files + 3 inline test modules covering lifecycle, message exchange, multi-hop routing, DTN fallback, persistence, receipts, beacons, battery, rate limiter, and session management.
 
 ---
 
@@ -849,7 +977,7 @@ Client Apps ──▶ REST (axum)     ──▶ Node methods / Database queries
 ### Technology Stack
 
 - **HTTP/WS server:** `axum` 0.8 with built-in WebSocket support
-- **Serialization:** `serde_json` (Phase 1). Protobuf via `prost` planned for Phase 2.
+- **Serialization:** `serde_json` for all request/response bodies
 - **CORS:** `tower-http` CorsLayer (permissive for localhost)
 - **Default bind:** `127.0.0.1:9735` (configured via `NodeConfig.api`)
 
@@ -903,7 +1031,7 @@ Connect to `/v1/ws`. JSON-framed messages:
 
 ## 11. mycelium-ffi
 
-**Purpose:** C FFI bridge between Rust and mobile platforms. Exposes 48 `extern "C"` functions.
+**Purpose:** C FFI bridge between Rust and mobile platforms. Exposes 49+ `extern "C"` functions.
 
 ### Architecture
 
@@ -965,67 +1093,88 @@ Defines:
 
 ## 12. Flutter App
 
-**Purpose:** Android mobile UI. Uses Flutter with Riverpod for state management, GoRouter for navigation, and dart:ffi for native library access.
+**Purpose:** Android mobile UI with 47 Dart files and 14 screens. Uses Flutter with Riverpod for state management, GoRouter for navigation, REST API client for data operations, and WebSocket for real-time events.
 
 ### App Structure
 
 ```
-main.dart → App (MaterialApp + GoRouter)
-  ├─ /conversations → ConversationsScreen (conversation list)
-  ├─ /contacts      → ContactsScreen (contact list + QR scan)
-  ├─ /settings      → SettingsScreen (node ID + QR code display)
-  ├─ /chat/:peerId  → ChatScreen (message view + send)
-  └─ /qr-scanner    → QrScannerScreen (camera QR reader)
+main.dart → App (GoRouter with 6-tab indexed shell + onboarding redirect)
+  ├─ /onboarding     → WelcomeScreen → NameSetupScreen → JoinMethodScreen → SeedPhraseScreen
+  ├─ /conversations  → ConversationsScreen (conversation list with unread badges)
+  │   └─ /chat/:id   → ChatScreen (message view + send + verify button)
+  ├─ /contacts       → ContactsScreen (contact list + QR scan + add)
+  ├─ /groups         → GroupsScreen (group list + create)
+  ├─ /channels       → ChannelsScreen (channel list + subscribe + create)
+  │   └─ (chat)      → ChannelChatScreen (channel message feed)
+  ├─ /settings       → SettingsScreen (node ID + QR + emergency + dev mode toggle)
+  └─ /debug          → DebugScreen (conditional: shown when dev mode enabled)
 ```
 
 ### Service Layer
 
 **MyceliumService** (singleton via Riverpod):
 - `initialize()` — Creates `MyceliumNode` via FFI, generates identity, opens DB
-- `start()` — Starts node, registers BLE transport, creates BleManager, begins polling
-- `_poll()` — 500ms timer checking for new messages and unread counts
-- Wraps all FFI calls with error handling and type conversion
+- `start()` — Starts node, registers BLE/Wi-Fi Direct transports, creates managers, starts API client and WebSocket
+- Daemon lifecycle: reconnects to surviving daemon after app kill
+- Wraps FFI + REST API calls with error handling
 
-**BleManager** (platform channel bridge):
-- `start(nodeId)` — Sends `start` via MethodChannel, listens to EventChannel
-- `_pollOutbox()` — 50ms timer calling `mycelium_ble_dequeue_send()`, forwards to Kotlin `sendData()`
-- Event handlers forward `peerDiscovered`/`peerLost`/`dataReceived` to Rust FFI
+**ApiClient** (REST client, primary data interface):
+- Base URL: `http://127.0.0.1:9735`
+- Methods for all 47 REST endpoints: node status, messages, conversations, contacts, groups, channels, emergency, network diagnostics
+- JSON request/response encoding via `dart:convert`
+
+**WsService** (WebSocket real-time events):
+- Connects to `ws://127.0.0.1:9735/v1/ws`
+- Events: `WsMessageEvent`, `WsReceiptEvent`, `WsPeerEvent`, `WsNetworkEvent`
+- Auto-reconnect with 2-second exponential backoff
+
+**NotificationService** (Android local notifications):
+- High-importance channel with sound/vibration
+- Active chat suppression (no notifications when chat is open)
+- Tap handler navigates to chat screen
+
+**BleManager** / **WifiDirectManager** (platform channel bridges):
+- `_pollOutbox()` — 50ms timer polling Rust outbox via FFI, forwards to Kotlin
+- Event handlers forward discovery/data events to Rust FFI
 
 ### Riverpod Providers
 
 | Provider | Type | Refresh |
 |----------|------|---------|
 | `myceliumServiceProvider` | Singleton | Manual |
-| `conversationListProvider` | Auto-dispose | 2 seconds |
-| `chatMessagesProvider(peerId)` | Family, auto-dispose | 1 second |
-| `contactListProvider` | Auto-dispose | Manual invalidation |
-| `networkStatusProvider` | Auto-dispose | 5 seconds |
-| `totalUnreadProvider` | Auto-dispose | 2 seconds |
+| `conversationListProvider` | Async | Auto-refresh |
+| `chatMessagesProvider(peerId)` | Family, async | Auto-refresh |
+| `contactListProvider` | Async | Manual invalidation |
+| `networkStatusProvider` | Async | 5 seconds |
+| `unreadCountProvider` | Async | Auto-refresh |
+| `wsEventBridgeProvider` | Stream | Real-time |
+| `developerModeProvider` | StateNotifier | Persistent |
 
 ### Models
 
+- **NodeId:** 32-byte Ed25519 public key, hex serialization, short display (8+8 chars)
 - **Message:** message_id, source, destination, content_type, timestamp, status, is_incoming, plaintext
 - **Contact:** node_id, display_name, trust_score, is_verified, last_seen
-- **Conversation:** peer_id, last_message_time, message_count, has_unread
-- **NetworkStatus:** neighbor_count, is_connected, battery_level, dtn_queue_size
-
-### FFI Helpers (`ffi_helpers.dart`)
-
-- `bytesToHex()` / `hexToBytes()` — Hex string conversion
-- `arrayToBytes(Array<Uint8>, int)` — Convert C fixed-size arrays to Dart Uint8List
-- `stringFromNative(Pointer<Uint8>, int)` — Null-terminated C string to Dart String
+- **ConversationSummary:** peer_id, display_name, last_message_time, message_count, has_unread
+- **GroupSummary:** group_id, member_count
+- **NetworkStatus:** neighbor_count, is_connected, dtn_queue_size, dtn_storage_used/max, pending_messages/routes
+- **Enums:** ContentType (7 variants), MessageStatus (7 variants)
 
 ### Dependencies (`pubspec.yaml`)
 
 ```yaml
-ffi: ^2.1.3                    # FFI bindings
-path_provider: ^2.1.5          # App documents directory
-flutter_riverpod: ^2.6.1       # State management
-go_router: ^14.8.1             # Navigation
-intl: ^0.19.0                  # Date/time formatting
-permission_handler: ^11.3.1    # BLE/camera permissions
-qr_flutter: ^4.1.0             # QR code generation
-mobile_scanner: ^6.0.2         # QR code scanning
+ffi: ^2.1.3                         # FFI bindings
+path_provider: ^2.1.5               # App documents directory
+flutter_riverpod: ^2.6.1            # State management
+go_router: ^14.8.1                  # Navigation
+http: ^1.2.2                        # REST API client
+web_socket_channel: ^3.0.1          # WebSocket client
+intl: ^0.19.0                       # Date/time formatting
+permission_handler: ^11.3.1         # BLE/camera permissions
+qr_flutter: ^4.1.0                  # QR code generation
+mobile_scanner: ^6.0.2              # QR code scanning
+flutter_local_notifications: ^18.0.1 # Android notifications
+shared_preferences: ^2.3.3          # Persistent settings
 ```
 
 ---
@@ -1119,7 +1268,7 @@ private val writeQueue = ConcurrentLinkedQueue<WriteOperation>()
 ### Workspace Build
 
 ```bash
-# Host tests (all 133 pass)
+# Host tests (all 186 pass)
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
 export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 cargo test
@@ -1288,14 +1437,14 @@ BLE scan finds device with Mycelium service UUID
 
 | Crate | Test Files | Tests | Coverage Areas |
 |-------|------------|-------|----------------|
-| mycelium-protocol | 3 modules | 26 | Type display, lamport ops, envelope roundtrips, all payload roundtrips |
-| mycelium-crypto | 6 modules | ~35 | Identity gen/serde, X3DH ±OTP, ratchet basic/OOO/wrong-AD, sessions, WoT graph (12), groups |
-| mycelium-core | 3 modules | ~20 | AODV routing, DTN spray/deliver/quota/eviction, transport mock/manager |
-| mycelium-storage | 2 modules | 5 | Message CRUD, mark-read/unread, conversation queries, vouch CRUD |
-| mycelium-node | 4 test files | ~40 | Lifecycle, 2-node exchange, multi-hop, DTN fallback, receipts, beacons, persistence (12), session/prekey roundtrips |
-| mycelium-api | 1 test file | 11 | REST endpoints, JSON responses, error handling, contact CRUD |
+| mycelium-protocol | 3 modules | 29 | Type display, lamport ops, envelope roundtrips, all 12 payload roundtrips, channel/emergency types |
+| mycelium-crypto | 7 modules | 43 | Identity (8), X3DH (9), ratchet (5), sessions (2), WoT (12), groups (4), discovery (3) |
+| mycelium-core | 11 modules | 51 | AODV (9), DTN (5), DHT (16), LoRa (7), BT Classic (2), internet (3), Wi-Fi Direct (5), mock (2), plugin (3) |
+| mycelium-storage | 3 modules | 9 | Messages (2), vouches (2), channels (5) |
+| mycelium-node | 4 test files + 3 modules | 43 | Lifecycle (8), pipeline (10), persistence (11), beacon (9), battery (2), rate limiter (4) |
+| mycelium-api | 1 test file | 11 | REST endpoints, JSON responses, error handling, contact CRUD, 404s |
 | mycelium-ffi | — | 0 | No unit tests (integration via Flutter) |
-| **Total** | | **~144** | |
+| **Total** | | **186** | |
 
 ### Integration Test Highlights
 
@@ -1314,17 +1463,17 @@ BLE scan finds device with Mycelium service UUID
 | §2 Architecture | Rust core + mobile UI | **Implemented** | Flutter instead of Jetpack Compose |
 | §3.1 Wi-Fi Direct | Transport | **Implemented** | Rust outbox + Android WifiP2pManager + Dart bridge (ADR-003) |
 | §3.1 BLE | Transport | **Implemented** | Full dual-role GATT, fragmentation, write queue |
-| §3.1 BT Classic | Transport | **Not started** | Deferred to v0.4 |
-| §3.1 LoRa | Transport | **Not started** | Deferred to v0.4 |
-| §3.1 Internet Tunnel | Transport | **Not started** | Deferred to v0.2 |
+| §3.1 BT Classic | Transport | **Partial** | Rust `BtClassicTransport` complete (16KB MTU, outbox pattern). Kotlin/Dart bridge not started. |
+| §3.1 LoRa | Transport | **Partial** | Rust `LoraTransport` complete (config, duty cycle, 7 tests). Platform bridges not started. |
+| §3.1 Internet Tunnel | Transport | **Partial** | Rust `InternetTransport` struct + config. TCP networking not wired. |
 | §3.2 Transport Handoff | Seamless migration | **Partial** | TransportManager sends via first available, no session migration |
 | §3.3 iOS Strategy | BLE relay | **Not started** | Deferred to v0.2 |
-| §4.1 AODV Routing | Reactive routing | **Implemented** | RREQ/RREP/RERR, route table, expiry |
+| §4.1 AODV Routing | Reactive routing | **Implemented** | RREQ/RREP/RERR, route table, expiry, supernode preference |
 | §4.1 DTN Spray-and-Wait | Store-and-forward | **Implemented** | Binary spray, per-identity quotas, eviction |
 | §4.2 Geographic Hash | Overlay routing | **Not started** | Deferred to v0.4 |
 | §5.1 Ed25519 Identity | Keypair identity | **Implemented** | Device-bound, no external identifiers |
 | §5.2 Web of Trust | Transitive trust | **Implemented** | BFS scoring with decay, vouch signing |
-| §5.3 Sybil Defense | Rate limiting | **Implemented** | Trust-based rate limits + blacklisting |
+| §5.3 Sybil Defense | Rate limiting | **Implemented** | Trust-based rate limits + blacklisting, wired to trust graph |
 | §5.4 Threshold Revocation | Key revocation | **Not started** | Deferred to v0.4 |
 | §6.1 X3DH | Key exchange | **Implemented** | SPK + OTP, signature verification |
 | §6.1 Double Ratchet | Forward-secret msgs | **Implemented** | DH ratchet, chain keys, out-of-order support |
@@ -1333,27 +1482,28 @@ BLE scan finds device with Mycelium service UUID
 | §7 Multi-Device | Linked devices | **Not started** | Deferred to v0.3 |
 | §8.1 Content Types | Message types | **Implemented** | Text, Image, File, GpsPin, VoiceNote, Receipt, System |
 | §8.2 Lamport Clocks | Message ordering | **Implemented** | Tick on send, merge on receive |
-| §8.3 Receipts | Delivery/Read | **Implemented** | Auto-send on receive, update status |
-| §8.4 Public Channels | Broadcast boards | **Not started** | Deferred to v0.2 |
-| §9 Emergency Broadcast | Tiered emergencies | **Complete** | Wire types, trust-gated handler, REST API, Flutter UI |
-| §10 OpenWRT Supernode | Router package | **Partial** | CLI `--supernode`, auto-config, route preference, prekey cache API |
-| §11 Rate Limiting | Trust + rate hybrid | **Implemented** | Per-tier limits, auto-blacklist |
-| §12 Internet Tunnel | Opportunistic tunnel | **Not started** | Deferred to v0.2 |
+| §8.3 Receipts | Delivery/Read | **Implemented** | Auto-send on receive, WS push, Flutter status indicators |
+| §8.4 Public Channels | Broadcast boards | **Implemented** | Wire types, storage, flooding, REST API (6 endpoints), Flutter UI (2 screens), WS events |
+| §9 Emergency Broadcast | Tiered emergencies | **Implemented** | Wire types, trust-gated handler (3 levels), REST API, Flutter UI, history |
+| §10 OpenWRT Supernode | Router package | **Partial** | CLI `--supernode`, auto-config (2GB DTN, 0.0.0.0 bind), route preference, prekey cache API. Cross-compile + LuCI not started. |
+| §11 Rate Limiting | Trust + rate hybrid | **Implemented** | Per-tier limits, auto-blacklist, wired to trust graph |
+| §12 Internet Tunnel | Opportunistic tunnel | **Partial** | Rust transport struct + DHT (Kademlia) module. TCP relay not wired. |
 | §13 Protocol Versioning | Backwards compat | **Partial** | Version field in envelope, no negotiation yet |
-| §14 Plugin System | Transport plugins | **Not started** | Deferred to v0.3 |
-| §15 Onboarding | Seed phrase groups | **Not started** | QR code sharing implemented instead |
-| §16 Battery Management | Adaptive power | **Implemented** | 5 power modes, platform battery injection |
-| §17 UI | Core screens | **Implemented** | Chat, Contacts, Settings, QR Scanner |
-| §18 Docker Testbed | CI/CD testing | **Not started** | Unit/integration tests only |
+| §14 Plugin System | Transport plugins | **Implemented** | `TransportPlugin` trait, `PluginRegistry`, `PluginConfig` in `NodeConfig`. Meshtastic/Reticulum adapters not started. |
+| §15 Onboarding | Seed phrase groups | **Implemented** | Group discovery key (HKDF), beacon matching, 4 onboarding screens, QR scanning |
+| §16 Battery Management | Adaptive power | **Implemented** | 5 power modes, platform battery injection via FFI, beacon battery field |
+| §17 UI | Core screens | **Implemented** | 14 screens: Chat, Contacts, Groups, Channels, Settings, Debug, Onboarding (4), QR, Verify |
+| §18 Docker Testbed | CI/CD testing | **Not started** | Unit/integration tests only (186 tests) |
 
 ### Deviations from Spec
 
 1. **UI Framework:** Flutter/Dart instead of Jetpack Compose (spec §2.3)
 2. **Wire Format:** Custom binary codec instead of Cap'n Proto (spec §2.3). Schemas kept as documentation.
-3. **Group Crypto:** Simplified sender keys instead of full MLS tree ratchet (spec §6.2). Adequate for groups <20 members.
-4. **Onboarding:** QR code scanning instead of seed phrase groups (spec §15). Simpler UX.
-5. **Transport:** BLE and Wi-Fi Direct both implemented. Wi-Fi Direct uses TCP sockets over WifiP2pManager groups (ADR-003).
+3. **API Serialization:** JSON (`serde_json`) instead of Protobuf. Simpler debugging, adequate performance for local API.
+4. **Group Crypto:** Simplified sender keys instead of full MLS tree ratchet (spec §6.2). Adequate for groups <20 members.
+5. **Onboarding:** Both seed phrase groups AND QR code scanning implemented (spec §15 only specified seed phrases).
+6. **Transport:** BLE and Wi-Fi Direct both implemented with platform bridges. LoRa, BT Classic, and Internet have Rust transports but no platform integration yet. Wi-Fi Direct uses TCP sockets over WifiP2pManager groups (ADR-003).
 
 ---
 
-*This document reflects the codebase as of 2026-03-10. Update when significant architectural changes are made.*
+*This document reflects the codebase as of 2026-03-11. Update when significant architectural changes are made.*

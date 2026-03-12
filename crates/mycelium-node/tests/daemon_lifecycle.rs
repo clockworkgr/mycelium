@@ -176,7 +176,11 @@ async fn test_conversation_deletion() {
         .db
         .get_conversation(&alice_id, &bob_id, 100, 0)
         .unwrap();
-    assert_eq!(convo_after.len(), 0, "Conversation should be empty after delete");
+    assert_eq!(
+        convo_after.len(),
+        0,
+        "Conversation should be empty after delete"
+    );
 
     // Conversation list should also be empty
     let conversations = alice.db.list_conversations(&alice_id).unwrap();

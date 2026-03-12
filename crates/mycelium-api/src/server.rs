@@ -14,7 +14,9 @@ use mycelium_node::config::ApiConfig;
 use mycelium_node::events::NodeEvent;
 use mycelium_node::node::Node;
 
-use crate::routes::{channels, contacts, conversations, emergency, groups, messages, network, node, prekeys};
+use crate::routes::{
+    channels, contacts, conversations, emergency, groups, messages, network, node, prekeys,
+};
 use crate::state::AppState;
 use crate::types::WsServerMessage;
 use crate::ws;
@@ -29,7 +31,10 @@ pub fn build_router(state: AppState) -> Router {
         // Messages
         .route("/v1/messages", post(messages::send_message))
         .route("/v1/messages/{peer_id}", get(messages::get_messages))
-        .route("/v1/messages/{peer_id}", delete(messages::delete_conversation))
+        .route(
+            "/v1/messages/{peer_id}",
+            delete(messages::delete_conversation),
+        )
         .route("/v1/messages/{peer_id}/read", post(messages::mark_read))
         // Conversations
         .route("/v1/conversations", get(conversations::list_conversations))
@@ -40,17 +45,44 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/contacts/{node_id}", delete(contacts::delete_contact))
         .route("/v1/contacts/{node_id}/trust", get(contacts::get_trust))
         .route("/v1/contacts/{node_id}/vouch", post(contacts::add_vouch))
-        .route("/v1/contacts/{node_id}/verify", post(contacts::verify_session))
-        .route("/v1/contacts/{node_id}/safety-number", get(contacts::get_safety_number))
+        .route(
+            "/v1/contacts/{node_id}/verify",
+            post(contacts::verify_session),
+        )
+        .route(
+            "/v1/contacts/{node_id}/safety-number",
+            get(contacts::get_safety_number),
+        )
         // Groups
-        .route("/v1/groups", get(groups::list_groups).post(groups::create_group))
-        .route("/v1/groups/{group_id}/members", get(groups::list_members).post(groups::add_member))
-        .route("/v1/groups/{group_id}/members/{member_id}", delete(groups::remove_member))
-        .route("/v1/groups/{group_id}/messages", post(groups::send_group_message))
+        .route(
+            "/v1/groups",
+            get(groups::list_groups).post(groups::create_group),
+        )
+        .route(
+            "/v1/groups/{group_id}/members",
+            get(groups::list_members).post(groups::add_member),
+        )
+        .route(
+            "/v1/groups/{group_id}/members/{member_id}",
+            delete(groups::remove_member),
+        )
+        .route(
+            "/v1/groups/{group_id}/messages",
+            post(groups::send_group_message),
+        )
         // Channels
-        .route("/v1/channels", get(channels::list_channels).post(channels::create_channel))
-        .route("/v1/channels/{channel_id}/subscribe", post(channels::subscribe).delete(channels::unsubscribe))
-        .route("/v1/channels/{channel_id}/messages", get(channels::get_messages).post(channels::post_message))
+        .route(
+            "/v1/channels",
+            get(channels::list_channels).post(channels::create_channel),
+        )
+        .route(
+            "/v1/channels/{channel_id}/subscribe",
+            post(channels::subscribe).delete(channels::unsubscribe),
+        )
+        .route(
+            "/v1/channels/{channel_id}/messages",
+            get(channels::get_messages).post(channels::post_message),
+        )
         // Prekeys
         .route("/v1/prekeys/{node_id}", get(prekeys::get_cached_bundle))
         // Emergency
@@ -173,17 +205,29 @@ fn event_summary(event: &NodeEvent) -> (String, String) {
             peer_id, transport, ..
         } => (
             "peer_discovered".to_string(),
-            format!("{} via {}", &hex::encode(peer_id.as_bytes())[..16], transport),
+            format!(
+                "{} via {}",
+                &hex::encode(peer_id.as_bytes())[..16],
+                transport
+            ),
         ),
         NodeEvent::PeerLost {
             peer_id, transport, ..
         } => (
             "peer_lost".to_string(),
-            format!("{} via {}", &hex::encode(peer_id.as_bytes())[..16], transport),
+            format!(
+                "{} via {}",
+                &hex::encode(peer_id.as_bytes())[..16],
+                transport
+            ),
         ),
         NodeEvent::EmergencyBroadcast { source, level, .. } => (
             "emergency".to_string(),
-            format!("level {} from {}", level, &hex::encode(source.as_bytes())[..16]),
+            format!(
+                "level {} from {}",
+                level,
+                &hex::encode(source.as_bytes())[..16]
+            ),
         ),
     }
 }
@@ -221,20 +265,16 @@ fn convert_node_event(event: NodeEvent) -> Option<WsServerMessage> {
                 status,
             })
         }
-        NodeEvent::PeerDiscovered { peer_id, transport } => {
-            Some(WsServerMessage::PeerEvent {
-                event: "discovered".to_string(),
-                peer_id: hex::encode(peer_id.as_bytes()),
-                transport,
-            })
-        }
-        NodeEvent::PeerLost { peer_id, transport } => {
-            Some(WsServerMessage::PeerEvent {
-                event: "lost".to_string(),
-                peer_id: hex::encode(peer_id.as_bytes()),
-                transport,
-            })
-        }
+        NodeEvent::PeerDiscovered { peer_id, transport } => Some(WsServerMessage::PeerEvent {
+            event: "discovered".to_string(),
+            peer_id: hex::encode(peer_id.as_bytes()),
+            transport,
+        }),
+        NodeEvent::PeerLost { peer_id, transport } => Some(WsServerMessage::PeerEvent {
+            event: "lost".to_string(),
+            peer_id: hex::encode(peer_id.as_bytes()),
+            transport,
+        }),
         NodeEvent::EmergencyBroadcast {
             source,
             level,

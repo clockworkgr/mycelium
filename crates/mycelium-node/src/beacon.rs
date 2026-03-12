@@ -96,9 +96,7 @@ impl Beacon {
         let neighbor_count = u16::from_le_bytes([data[offset], data[offset + 1]]);
         offset += 2;
 
-        let lamport_clock = u64::from_le_bytes(
-            data[offset..offset + 8].try_into().ok()?,
-        );
+        let lamport_clock = u64::from_le_bytes(data[offset..offset + 8].try_into().ok()?);
         offset += 8;
 
         // Optional group discovery hash

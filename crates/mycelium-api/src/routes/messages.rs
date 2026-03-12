@@ -98,15 +98,19 @@ pub async fn delete_conversation(
     let peer = parse_node_id(&peer_id)?;
     let local_id = state.node.node_id;
 
-    state.node.db.delete_conversation(&local_id, &peer).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError {
-                error: e.to_string(),
-                code: 500,
-            }),
-        )
-    })?;
+    state
+        .node
+        .db
+        .delete_conversation(&local_id, &peer)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError {
+                    error: e.to_string(),
+                    code: 500,
+                }),
+            )
+        })?;
 
     Ok(StatusCode::NO_CONTENT)
 }

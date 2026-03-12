@@ -33,9 +33,7 @@ impl Database {
     pub fn list_group_blobs(&self) -> Result<Vec<Vec<u8>>, StorageError> {
         let conn = self.conn();
         let mut stmt = conn.prepare("SELECT value FROM config WHERE key LIKE 'group:%'")?;
-        let rows = stmt.query_map([], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
         let mut result = Vec::new();
         for row in rows {
             result.push(row?);
@@ -46,10 +44,8 @@ impl Database {
     /// Remove a saved group blob.
     pub fn remove_group_blob(&self, group_id: &[u8; 32]) -> Result<(), StorageError> {
         let key = format!("group:{}", bytes_to_hex(group_id));
-        self.conn().execute(
-            "DELETE FROM config WHERE key = ?1",
-            params![key],
-        )?;
+        self.conn()
+            .execute("DELETE FROM config WHERE key = ?1", params![key])?;
         Ok(())
     }
 }

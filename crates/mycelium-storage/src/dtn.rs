@@ -118,7 +118,11 @@ impl Database {
     }
 
     /// Update the copies_remaining for a DTN bundle.
-    pub fn update_dtn_copies(&self, message_id: &MessageId, copies: u8) -> Result<(), StorageError> {
+    pub fn update_dtn_copies(
+        &self,
+        message_id: &MessageId,
+        copies: u8,
+    ) -> Result<(), StorageError> {
         self.conn().execute(
             "UPDATE dtn_store SET copies_remaining = ?1 WHERE message_id = ?2",
             params![copies as i32, message_id.as_bytes().as_slice()],
@@ -128,11 +132,11 @@ impl Database {
 
     /// Get total DTN storage used in bytes.
     pub fn dtn_storage_used(&self) -> Result<usize, StorageError> {
-        let total: i64 = self.conn().query_row(
-            "SELECT COALESCE(SUM(size), 0) FROM dtn_store",
-            [],
-            |row| row.get(0),
-        )?;
+        let total: i64 =
+            self.conn()
+                .query_row("SELECT COALESCE(SUM(size), 0) FROM dtn_store", [], |row| {
+                    row.get(0)
+                })?;
         Ok(total as usize)
     }
 }

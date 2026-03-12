@@ -40,9 +40,7 @@ impl Database {
                 |row| {
                     let peer_bytes: Vec<u8> = row.get(0)?;
                     Ok(SessionRecord {
-                        peer_id: NodeId::from_bytes(
-                            peer_bytes.try_into().unwrap_or([0; 32]),
-                        ),
+                        peer_id: NodeId::from_bytes(peer_bytes.try_into().unwrap_or([0; 32])),
                         session_data: row.get(1)?,
                         safety_number: row.get(2)?,
                         is_verified: row.get::<_, i32>(3)? != 0,
@@ -55,9 +53,8 @@ impl Database {
     /// List all stored sessions.
     pub fn list_sessions(&self) -> Result<Vec<SessionRecord>, StorageError> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT peer_id, session_data, safety_number, is_verified FROM sessions",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT peer_id, session_data, safety_number, is_verified FROM sessions")?;
 
         let rows = stmt.query_map([], |row| {
             let peer_bytes: Vec<u8> = row.get(0)?;

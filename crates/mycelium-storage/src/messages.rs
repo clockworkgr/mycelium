@@ -157,18 +157,15 @@ impl Database {
              ORDER BY last_time DESC",
         )?;
 
-        let rows = stmt.query_map(
-            params![local_id.as_bytes().as_slice()],
-            |row| {
-                let pid_bytes: Vec<u8> = row.get(0)?;
-                Ok(ConversationSummaryRecord {
-                    peer_id: NodeId::from_bytes(pid_bytes.try_into().unwrap_or([0; 32])),
-                    last_message_time: row.get::<_, i64>(1)? as u64,
-                    message_count: row.get::<_, i64>(2)? as u32,
-                    has_unread: row.get::<_, i64>(3)? > 0,
-                })
-            },
-        )?;
+        let rows = stmt.query_map(params![local_id.as_bytes().as_slice()], |row| {
+            let pid_bytes: Vec<u8> = row.get(0)?;
+            Ok(ConversationSummaryRecord {
+                peer_id: NodeId::from_bytes(pid_bytes.try_into().unwrap_or([0; 32])),
+                last_message_time: row.get::<_, i64>(1)? as u64,
+                message_count: row.get::<_, i64>(2)? as u32,
+                has_unread: row.get::<_, i64>(3)? > 0,
+            })
+        })?;
 
         let mut result = Vec::new();
         for row in rows {
@@ -235,11 +232,7 @@ impl Database {
     }
 
     /// Count unread incoming messages from a peer.
-    pub fn unread_count(
-        &self,
-        local_id: &NodeId,
-        peer_id: &NodeId,
-    ) -> Result<u32, StorageError> {
+    pub fn unread_count(&self, local_id: &NodeId, peer_id: &NodeId) -> Result<u32, StorageError> {
         let count: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM messages
              WHERE source = ?1 AND destination = ?2 AND is_incoming = 1 AND status = 'received'",
@@ -253,10 +246,7 @@ impl Database {
     }
 
     /// Count total unread incoming messages across all peers.
-    pub fn total_unread_count(
-        &self,
-        local_id: &NodeId,
-    ) -> Result<u32, StorageError> {
+    pub fn total_unread_count(&self, local_id: &NodeId) -> Result<u32, StorageError> {
         let count: i64 = self.conn().query_row(
             "SELECT COUNT(*) FROM messages
              WHERE destination = ?1 AND is_incoming = 1 AND status = 'received'",

@@ -10,8 +10,8 @@ use mycelium_protocol::types::MessageId;
 
 use crate::state::AppState;
 use crate::types::{
-    ApiError, ChannelMessageResponse, ChannelResponse, CreateChannelRequest,
-    CreateChannelResponse, MessageQueryParams, PostChannelMessageRequest, SendMessageResponse,
+    ApiError, ChannelMessageResponse, ChannelResponse, CreateChannelRequest, CreateChannelResponse,
+    MessageQueryParams, PostChannelMessageRequest, SendMessageResponse,
 };
 
 /// Helper: parse a hex-encoded 32-byte channel ID.
@@ -94,11 +94,7 @@ pub async fn list_channels(
     let result: Vec<ChannelResponse> = channels
         .into_iter()
         .map(|ch| {
-            let subscribed = state
-                .node
-                .db
-                .is_subscribed(&ch.channel_id)
-                .unwrap_or(false);
+            let subscribed = state.node.db.is_subscribed(&ch.channel_id).unwrap_or(false);
             ChannelResponse {
                 channel_id: hex::encode(ch.channel_id),
                 name: ch.name,

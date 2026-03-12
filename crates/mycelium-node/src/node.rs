@@ -14,8 +14,8 @@ use mycelium_core::routing::coordinator::{RoutingCoordinator, RoutingDecision};
 use mycelium_core::transport::manager::TransportManager;
 use mycelium_core::transport::{TransportError, TransportEvent};
 use mycelium_crypto::double_ratchet::RatchetHeader;
-use mycelium_crypto::identity::Identity;
 use mycelium_crypto::group::{GroupError, SenderKey, SenderKeyGroup};
+use mycelium_crypto::identity::Identity;
 use mycelium_crypto::session::{SessionError, SessionManager};
 use mycelium_crypto::wot::TrustGraph;
 use mycelium_crypto::x3dh::{PrekeyBundle, PrekeyState};
@@ -39,6 +39,7 @@ use crate::rate_limiter::RateLimiter;
 
 /// Errors from high-level node operations.
 #[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
 pub enum NodeError {
     #[error("no session with peer")]
     NoSession,
@@ -101,7 +102,8 @@ pub struct Node {
     /// Handle to BLE transport for platform FFI callbacks.
     pub ble_transport: Arc<RwLock<Option<Arc<mycelium_core::transport::ble::BleTransport>>>>,
     /// Handle to Wi-Fi Direct transport for platform FFI callbacks.
-    pub wifi_transport: Arc<RwLock<Option<Arc<mycelium_core::transport::wifi_direct::WifiDirectTransport>>>>,
+    pub wifi_transport:
+        Arc<RwLock<Option<Arc<mycelium_core::transport::wifi_direct::WifiDirectTransport>>>>,
     /// Broadcast channel for node events (consumed by API server / WebSocket clients).
     pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
     /// Dedup set for channel messages (prevents re-processing flooded messages).
@@ -110,6 +112,7 @@ pub struct Node {
     pub local_group_hash: Option<[u8; 8]>,
 }
 
+#[allow(dead_code)]
 impl Node {
     /// Create a new node with the given config.
     pub fn new(config: NodeConfig, db: Database, identity: Identity) -> Self {
@@ -141,7 +144,7 @@ impl Node {
         let local_group_hash = config.group_seed.as_ref().and_then(|hex_str| {
             let key_bytes = hex::decode(hex_str).ok()?;
             if key_bytes.len() == 32 {
-                use sha2::{Sha256, Digest};
+                use sha2::{Digest, Sha256};
                 let hash = Sha256::digest(&key_bytes);
                 let mut truncated = [0u8; 8];
                 truncated.copy_from_slice(&hash[..8]);
@@ -622,15 +625,16 @@ impl Node {
             let internet = Arc::new(InternetTransport::new(
                 self.node_id,
                 InternetConfig {
-                    listen_addr: format!("0.0.0.0:{}", inet_cfg.listen_port)
-                        .parse()
-                        .unwrap(),
+                    listen_addr: format!("0.0.0.0:{}", inet_cfg.listen_port).parse().unwrap(),
                     bootstrap_nodes: bootstrap,
                     max_connections: 64,
                 },
             ));
             self.transport_manager.add_transport(internet).await;
-            info!("Registered Internet transport on port {}", inet_cfg.listen_port);
+            info!(
+                "Registered Internet transport on port {}",
+                inet_cfg.listen_port
+            );
         }
     }
 
@@ -885,12 +889,9 @@ impl Node {
             }
             RoutingDecision::EnterDtn => {
                 let mut r = self.routing.write().await;
-                if r.fallback_to_dtn(
-                    message_id,
-                    envelope.destination,
-                    self.node_id,
-                    serialized,
-                ).is_ok() {
+                if r.fallback_to_dtn(message_id, envelope.destination, self.node_id, serialized)
+                    .is_ok()
+                {
                     if let Some(bundle) = r.dtn().get_bundle(&message_id) {
                         persist_dtn_bundle(&self.db, bundle);
                     }
@@ -906,6 +907,7 @@ impl Node {
     }
 
     /// Initiate a session and send SessionInit + first message.
+    #[allow(clippy::too_many_arguments)]
     async fn initiate_and_send_session(
         &self,
         destination: NodeId,
@@ -1075,11 +1077,12 @@ impl Node {
                 // Execute DTN actions
                 for action in dtn_actions {
                     match action {
-                        DtnAction::SendToPeer { peer: target, bundle } => {
-                            let payload = wire::serialize_dtn_relay(
-                                &bundle.message_id,
-                                &bundle.payload,
-                            );
+                        DtnAction::SendToPeer {
+                            peer: target,
+                            bundle,
+                        } => {
+                            let payload =
+                                wire::serialize_dtn_relay(&bundle.message_id, &bundle.payload);
                             let envelope = Envelope {
                                 source: bundle.source,
                                 destination: bundle.destination,
@@ -1103,16 +1106,27 @@ impl Node {
                                             r.dtn_mut().remove_bundle(&bundle.message_id);
                                         }
                                         let _ = db.remove_dtn_bundle(&bundle.message_id);
-                                        debug!("DTN delivered bundle {} to destination {}", bundle.message_id, target);
+                                        debug!(
+                                            "DTN delivered bundle {} to destination {}",
+                                            bundle.message_id, target
+                                        );
                                     } else {
                                         // Sprayed to a relay — update copies_remaining
                                         {
                                             let r = routing.read().await;
-                                            if let Some(our) = r.dtn().get_bundle(&bundle.message_id) {
-                                                let _ = db.update_dtn_copies(&bundle.message_id, our.copies_remaining);
+                                            if let Some(our) =
+                                                r.dtn().get_bundle(&bundle.message_id)
+                                            {
+                                                let _ = db.update_dtn_copies(
+                                                    &bundle.message_id,
+                                                    our.copies_remaining,
+                                                );
                                             }
                                         }
-                                        debug!("DTN spray: sent bundle {} to relay {}", bundle.message_id, target);
+                                        debug!(
+                                            "DTN spray: sent bundle {} to relay {}",
+                                            bundle.message_id, target
+                                        );
                                     }
                                 }
                                 Err(e) => {
@@ -1219,9 +1233,7 @@ impl Node {
 
                 // If the envelope was forwarded (source != peer), learn a reverse
                 // route back to the source via the peer who relayed it to us.
-                if envelope.source != *peer
-                    && envelope.source != local_id
-                    && envelope.hop_count > 0
+                if envelope.source != *peer && envelope.source != local_id && envelope.hop_count > 0
                 {
                     let mut r = routing.write().await;
                     r.aodv_mut().update_route(
@@ -1282,7 +1294,10 @@ impl Node {
                     }
                     if !rl.check_message(peer, trust_hops) {
                         if rl.record_violation(peer) {
-                            warn!("Auto-blacklisted peer {} after repeated rate violations", peer);
+                            warn!(
+                                "Auto-blacklisted peer {} after repeated rate violations",
+                                peer
+                            );
                         } else {
                             debug!("Rate limited peer {} (trust_hops={})", peer, trust_hops);
                         }
@@ -1336,10 +1351,8 @@ impl Node {
                                 cache.insert(envelope.source, (bundle, Instant::now()));
                             }
                             let serialized = bp.serialize();
-                            let _ = db.cache_prekey_bundle(
-                                envelope.source.as_bytes(),
-                                &serialized[1..],
-                            );
+                            let _ = db
+                                .cache_prekey_bundle(envelope.source.as_bytes(), &serialized[1..]);
                             debug!(
                                 "Cached prekey bundle from {} while forwarding",
                                 envelope.source
@@ -1381,11 +1394,7 @@ impl Node {
                     let allowed = {
                         let mut rl = rate_limiter.write().await;
                         if payload_type == WirePayloadType::DtnRelay {
-                            rl.check_dtn_relay(
-                                &envelope.source,
-                                trust_hops,
-                                body.len(),
-                            )
+                            rl.check_dtn_relay(&envelope.source, trust_hops, body.len())
                         } else {
                             rl.check_message(&envelope.source, trust_hops)
                         }
@@ -1431,13 +1440,7 @@ impl Node {
                         .await;
                     }
                     WirePayloadType::AodvRerr => {
-                        Self::handle_aodv_rerr(
-                            body,
-                            routing,
-                            transport_manager,
-                            local_id,
-                        )
-                        .await;
+                        Self::handle_aodv_rerr(body, routing, transport_manager, local_id).await;
                     }
                     WirePayloadType::EncryptedMessage => {
                         Self::handle_encrypted_message(
@@ -1528,33 +1531,14 @@ impl Node {
                         .await;
                     }
                     WirePayloadType::Receipt => {
-                        Self::handle_receipt(
-                            &envelope,
-                            body,
-                            db,
-                            local_id,
-                            event_tx,
-                        );
+                        Self::handle_receipt(&envelope, body, db, local_id, event_tx);
                     }
                     WirePayloadType::GroupMessage => {
-                        Self::handle_group_message(
-                            &envelope,
-                            body,
-                            groups,
-                            db,
-                            local_id,
-                        )
-                        .await;
+                        Self::handle_group_message(&envelope, body, groups, db, local_id).await;
                     }
                     WirePayloadType::SenderKeyDistribution => {
-                        Self::handle_sender_key_distribution(
-                            &envelope,
-                            body,
-                            groups,
-                            db,
-                            local_id,
-                        )
-                        .await;
+                        Self::handle_sender_key_distribution(&envelope, body, groups, db, local_id)
+                            .await;
                     }
                     WirePayloadType::ChannelMessage => {
                         Self::handle_channel_message(
@@ -1571,7 +1555,10 @@ impl Node {
                     WirePayloadType::ChannelSubscribe
                     | WirePayloadType::ChannelUnsubscribe
                     | WirePayloadType::ChannelModeration => {
-                        debug!("Channel control message {:?} received, not yet handled", payload_type);
+                        debug!(
+                            "Channel control message {:?} received, not yet handled",
+                            payload_type
+                        );
                     }
                     WirePayloadType::EmergencyBroadcast => {
                         Self::handle_emergency_broadcast(
@@ -1631,14 +1618,8 @@ impl Node {
             r.handle_aodv_message(AodvMessage::RouteRequest(rreq), received_from)
         };
 
-        Self::execute_aodv_action(
-            action,
-            routing,
-            transport_manager,
-            local_id,
-            pending_routes,
-        )
-        .await;
+        Self::execute_aodv_action(action, routing, transport_manager, local_id, pending_routes)
+            .await;
     }
 
     async fn handle_aodv_rrep(
@@ -1672,14 +1653,8 @@ impl Node {
             r.handle_aodv_message(AodvMessage::RouteReply(rrep), received_from)
         };
 
-        Self::execute_aodv_action(
-            action,
-            routing,
-            transport_manager,
-            local_id,
-            pending_routes,
-        )
-        .await;
+        Self::execute_aodv_action(action, routing, transport_manager, local_id, pending_routes)
+            .await;
     }
 
     async fn handle_aodv_rerr(
@@ -1709,11 +1684,7 @@ impl Node {
 
         // For RERR, we only care about BroadcastRerr
         if let AodvAction::BroadcastRerr(rerr) = action {
-            let payload = wire::serialize_aodv_rerr(
-                &rerr.unreachable,
-                &rerr.source,
-                rerr.dest_seq,
-            );
+            let payload = wire::serialize_aodv_rerr(&rerr.unreachable, &rerr.source, rerr.dest_seq);
             let envelope = Envelope {
                 source: local_id,
                 destination: NodeId::ZERO,
@@ -1808,15 +1779,14 @@ impl Node {
                         "Sending queued envelope for {} via {}",
                         destination, next_hop
                     );
-                    let _ = transport_manager.send(&next_hop, &route.envelope_bytes).await;
+                    let _ = transport_manager
+                        .send(&next_hop, &route.envelope_bytes)
+                        .await;
                 }
             }
             AodvAction::BroadcastRerr(rerr) => {
-                let payload = wire::serialize_aodv_rerr(
-                    &rerr.unreachable,
-                    &rerr.source,
-                    rerr.dest_seq,
-                );
+                let payload =
+                    wire::serialize_aodv_rerr(&rerr.unreachable, &rerr.source, rerr.dest_seq);
                 let envelope = Envelope {
                     source: local_id,
                     destination: NodeId::ZERO,
@@ -1841,6 +1811,7 @@ impl Node {
 
     // --- Message handlers ---
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_encrypted_message(
         envelope: &Envelope,
         body: &[u8],
@@ -1965,6 +1936,7 @@ impl Node {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_session_init(
         envelope: &Envelope,
         body: &[u8],
@@ -2020,7 +1992,9 @@ impl Node {
         Self::persist_session(session_manager, db, &envelope.source).await;
 
         // Decrypt the enclosed first message
-        if !init.encrypted_payload.is_empty() && init.encrypted_payload[0] == WirePayloadType::EncryptedMessage as u8 {
+        if !init.encrypted_payload.is_empty()
+            && init.encrypted_payload[0] == WirePayloadType::EncryptedMessage as u8
+        {
             let enc = match EncryptedPayload::deserialize_body(&init.encrypted_payload[1..]) {
                 Ok(e) => e,
                 Err(e) => {
@@ -2135,12 +2109,7 @@ impl Node {
             payload: bundle_payload.serialize(),
         };
 
-        Self::route_envelope_static(
-            &response_envelope,
-            routing,
-            transport_manager,
-        )
-        .await;
+        Self::route_envelope_static(&response_envelope, routing, transport_manager).await;
         debug!("Sent prekey bundle to {}", envelope.source);
     }
 
@@ -2309,6 +2278,7 @@ impl Node {
         Self::persist_session(session_manager, db, &peer_id).await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_dtn_relay(
         envelope: &Envelope,
         body: &[u8],
@@ -2421,7 +2391,11 @@ impl Node {
                 let trust_hops = {
                     let tg = trust_graph.read().await;
                     let score = tg.trust_score(&local_id, &envelope.source);
-                    if score.value > 0.0 { score.hops } else { u8::MAX }
+                    if score.value > 0.0 {
+                        score.hops
+                    } else {
+                        u8::MAX
+                    }
                 };
                 let mut rl = rate_limiter.write().await;
                 if !rl.check_dtn_relay(&envelope.source, trust_hops, relay_size) {
@@ -2466,7 +2440,10 @@ impl Node {
         let inner_envelope = match Envelope::deserialize(&bundle.payload) {
             Ok(e) => e,
             Err(e) => {
-                debug!("DTN local delivery: failed to deserialize inner envelope: {}", e);
+                debug!(
+                    "DTN local delivery: failed to deserialize inner envelope: {}",
+                    e
+                );
                 return;
             }
         };
@@ -2632,14 +2609,14 @@ impl Node {
             return;
         }
 
-        let (group_id, chain_key, iteration) =
-            match wire::deserialize_sender_key_distribution(body) {
-                Ok(v) => v,
-                Err(e) => {
-                    debug!("Bad sender key distribution: {}", e);
-                    return;
-                }
-            };
+        let (group_id, chain_key, iteration) = match wire::deserialize_sender_key_distribution(body)
+        {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("Bad sender key distribution: {}", e);
+                return;
+            }
+        };
 
         let sender_key = SenderKey {
             chain_key,
@@ -2662,6 +2639,7 @@ impl Node {
 
     // --- Beacon handler ---
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_beacon(
         envelope: &Envelope,
         body: &[u8],
@@ -2734,8 +2712,7 @@ impl Node {
         let _ = db.save_contact(&contact);
 
         // Auto-trust peers with matching group discovery hash
-        if let (Some(local_hash), Some(peer_hash)) =
-            (local_group_hash, beacon.group_discovery_hash)
+        if let (Some(local_hash), Some(peer_hash)) = (local_group_hash, beacon.group_discovery_hash)
         {
             if local_hash == peer_hash {
                 info!(
@@ -2781,7 +2758,10 @@ impl Node {
         {
             let mut seen_set = seen.write().await;
             if !seen_set.insert(envelope.message_id) {
-                debug!("Duplicate channel message {}, skipping", envelope.message_id);
+                debug!(
+                    "Duplicate channel message {}, skipping",
+                    envelope.message_id
+                );
                 return;
             }
             // Cap the dedup set to prevent unbounded growth
@@ -2857,7 +2837,10 @@ impl Node {
         {
             let mut seen_set = seen.write().await;
             if !seen_set.insert(envelope.message_id) {
-                debug!("Duplicate emergency broadcast {}, skipping", envelope.message_id);
+                debug!(
+                    "Duplicate emergency broadcast {}, skipping",
+                    envelope.message_id
+                );
                 return;
             }
             if seen_set.len() > 10_000 {
@@ -2941,10 +2924,15 @@ impl Node {
     ) {
         debug!(
             "handle_receipt: from={}, msg_id={}, body_len={}",
-            envelope.source, envelope.message_id, body.len()
+            envelope.source,
+            envelope.message_id,
+            body.len()
         );
         if envelope.destination != local_id {
-            info!("Receipt not for us (dest={}), ignoring", envelope.destination);
+            info!(
+                "Receipt not for us (dest={}), ignoring",
+                envelope.destination
+            );
             return;
         }
 
@@ -3011,17 +2999,26 @@ impl Node {
             RoutingDecision::SendRealtime { next_hop } => {
                 let data = envelope.serialize();
                 let _ = transport_manager.send(&next_hop, &data).await;
-                info!("Delivery receipt for {} sent to {} via {}", message_id, to, next_hop);
+                info!(
+                    "Delivery receipt for {} sent to {} via {}",
+                    message_id, to, next_hop
+                );
             }
             _ => {
-                info!("Delivery receipt for {} to {} dropped (no route)", message_id, to);
+                info!(
+                    "Delivery receipt for {} to {} dropped (no route)",
+                    message_id, to
+                );
             }
         }
     }
 
     /// Mark messages from a peer as read and send read receipts.
     pub async fn mark_read_and_notify(&self, peer: NodeId) -> usize {
-        let msg_ids = match self.db.mark_messages_read_returning_ids(&self.node_id, &peer) {
+        let msg_ids = match self
+            .db
+            .mark_messages_read_returning_ids(&self.node_id, &peer)
+        {
             Ok(ids) => ids,
             Err(e) => {
                 info!("Failed to mark messages as read: {}", e);
@@ -3075,10 +3072,16 @@ impl Node {
             RoutingDecision::SendRealtime { next_hop } => {
                 let data = envelope.serialize();
                 let _ = transport_manager.send(&next_hop, &data).await;
-                info!("Read receipt for {} sent to {} via {}", message_id, to, next_hop);
+                info!(
+                    "Read receipt for {} sent to {} via {}",
+                    message_id, to, next_hop
+                );
             }
             _ => {
-                info!("Read receipt for {} to {} dropped (no route)", message_id, to);
+                info!(
+                    "Read receipt for {} to {} dropped (no route)",
+                    message_id, to
+                );
             }
         }
     }
@@ -3144,6 +3147,7 @@ fn build_ad(source: NodeId, destination: NodeId) -> Vec<u8> {
     ad
 }
 
+#[allow(dead_code)]
 fn content_type_str(ct: ContentType) -> String {
     match ct {
         ContentType::Text => "text".to_string(),

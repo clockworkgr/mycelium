@@ -101,9 +101,7 @@ impl RatchetState {
         plaintext: &[u8],
         ad: &[u8],
     ) -> Result<(RatchetHeader, Vec<u8>), RatchetError> {
-        let chain_key = self
-            .chain_key_send
-            .ok_or(RatchetError::NoSendingChain)?;
+        let chain_key = self.chain_key_send.ok_or(RatchetError::NoSendingChain)?;
 
         let (new_chain_key, message_key) = kdf_ck(&chain_key);
         self.chain_key_send = Some(new_chain_key);
@@ -156,9 +154,7 @@ impl RatchetState {
         self.skip_message_keys(header.message_number)?;
 
         // Derive the message key
-        let chain_key = self
-            .chain_key_recv
-            .ok_or(RatchetError::NoReceivingChain)?;
+        let chain_key = self.chain_key_recv.ok_or(RatchetError::NoReceivingChain)?;
         let (new_chain_key, message_key) = kdf_ck(&chain_key);
         self.chain_key_recv = Some(new_chain_key);
         self.recv_count = header.message_number + 1;
@@ -430,12 +426,12 @@ fn kdf_ck(chain_key: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     // Signal protocol uses HMAC-SHA256 with different constants
     let mut hasher = Sha256::new();
     hasher.update(chain_key);
-    hasher.update(&[0x01]); // message key constant
+    hasher.update([0x01]); // message key constant
     let message_key_hash = hasher.finalize();
 
     let mut hasher = Sha256::new();
     hasher.update(chain_key);
-    hasher.update(&[0x02]); // chain key constant
+    hasher.update([0x02]); // chain key constant
     let chain_key_hash = hasher.finalize();
 
     let mut new_chain = [0u8; 32];
@@ -471,7 +467,13 @@ fn encrypt_aead(
     let nonce = aes_gcm::Nonce::from_slice(nonce);
 
     cipher
-        .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad: &aad })
+        .encrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| RatchetError::EncryptionFailed)
 }
 
@@ -499,7 +501,13 @@ fn decrypt_aead(
     let nonce = aes_gcm::Nonce::from_slice(nonce);
 
     cipher
-        .decrypt(nonce, aes_gcm::aead::Payload { msg: ciphertext, aad: &aad })
+        .decrypt(
+            nonce,
+            aes_gcm::aead::Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| RatchetError::DecryptionFailed)
 }
 

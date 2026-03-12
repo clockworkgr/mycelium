@@ -36,7 +36,7 @@ impl Database {
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect::<String>();
-        conn.pragma_update(None, "key", &format!("x'{}'", hex_key))?;
+        conn.pragma_update(None, "key", format!("x'{}'", hex_key))?;
 
         // Verify the database is accessible (will fail if key is wrong)
         conn.pragma_query_value(None, "cipher_version", |row| row.get::<_, String>(0))

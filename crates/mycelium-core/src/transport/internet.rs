@@ -16,9 +16,7 @@ use tracing::{debug, info, warn};
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
 use super::{Transport, TransportError, TransportEvent, TransportType};
-use crate::dht::rpc::{
-    deserialize_wire_message, serialize_wire_message, InternetWireMessage,
-};
+use crate::dht::rpc::{deserialize_wire_message, serialize_wire_message, InternetWireMessage};
 use crate::dht::{DhtConfig, DhtEngine, PeerInfo};
 
 /// Configuration for the Internet transport.
@@ -204,15 +202,11 @@ impl InternetTransport {
             .await
             .map_err(|e| TransportError::Other(e.to_string()))?;
 
-        deserialize_wire_message(&data)
-            .map_err(|e| TransportError::Other(e.to_string()))
+        deserialize_wire_message(&data).map_err(|e| TransportError::Other(e.to_string()))
     }
 
     /// Connect to a peer at the given address.
-    pub async fn connect_to(
-        &self,
-        addr: SocketAddr,
-    ) -> Result<NodeId, TransportError> {
+    pub async fn connect_to(&self, addr: SocketAddr) -> Result<NodeId, TransportError> {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| TransportError::Other(format!("Connect to {}: {}", addr, e)))?;
@@ -244,11 +238,7 @@ impl InternetTransport {
 
         let peer_id = match deserialize_wire_message(&data) {
             Ok(InternetWireMessage::Hello { node_id, .. }) => node_id,
-            _ => {
-                return Err(TransportError::Other(
-                    "Expected Hello response".to_string(),
-                ))
-            }
+            _ => return Err(TransportError::Other("Expected Hello response".to_string())),
         };
 
         // Store connection

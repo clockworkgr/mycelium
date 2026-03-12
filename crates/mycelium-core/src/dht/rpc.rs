@@ -42,9 +42,7 @@ pub enum DhtMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DhtResponse {
     /// Response to Ping.
-    Pong {
-        responder_id: NodeId,
-    },
+    Pong { responder_id: NodeId },
     /// Response to FindNode or FindValue (when value not found).
     FoundNodes {
         responder_id: NodeId,
@@ -56,9 +54,7 @@ pub enum DhtResponse {
         value: SocketAddr,
     },
     /// Response to Store.
-    Stored {
-        responder_id: NodeId,
-    },
+    Stored { responder_id: NodeId },
 }
 
 /// Wire format for messages exchanged over TCP.
@@ -66,19 +62,13 @@ pub enum DhtResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InternetWireMessage {
     /// Mesh envelope data (forwarded between nodes).
-    MeshData {
-        sender_id: NodeId,
-        data: Vec<u8>,
-    },
+    MeshData { sender_id: NodeId, data: Vec<u8> },
     /// DHT protocol message.
     Dht(DhtMessage),
     /// DHT protocol response.
     DhtReply(DhtResponse),
     /// Handshake: first message after connecting.
-    Hello {
-        node_id: NodeId,
-        listen_port: u16,
-    },
+    Hello { node_id: NodeId, listen_port: u16 },
 }
 
 /// Serialize a wire message to bytes (4-byte length prefix + JSON).
@@ -131,6 +121,9 @@ mod tests {
         });
         let bytes = serialize_wire_message(&msg);
         let decoded = deserialize_wire_message(&bytes[4..]).unwrap();
-        assert!(matches!(decoded, InternetWireMessage::Dht(DhtMessage::Ping { .. })));
+        assert!(matches!(
+            decoded,
+            InternetWireMessage::Dht(DhtMessage::Ping { .. })
+        ));
     }
 }

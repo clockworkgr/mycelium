@@ -63,7 +63,7 @@ export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 ```bash
 make build          # Debug build
 make build-release  # Release build
-make test           # Run all 144 workspace tests
+make test           # Run all 186 workspace tests
 make lint           # cargo fmt --check + cargo clippy
 ```
 
@@ -161,29 +161,28 @@ cd flutter && flutter test
 ```
 mycelium/
 ├── crates/
-│   ├── mycelium-protocol/    # Wire format types + binary codec
-│   ├── mycelium-crypto/      # Ed25519, X3DH, Double Ratchet, Sender Key
-│   ├── mycelium-core/        # Transport trait, BLE/WiFi/Mock, AODV, DTN
-│   ├── mycelium-storage/     # SQLCipher database, CRUD operations
-│   ├── mycelium-node/        # Node daemon, event loop, message pipeline
-│   ├── mycelium-api/         # Local REST + WebSocket API server (See ADR-001)
-│   └── mycelium-ffi/         # C FFI bindings for mobile
-├── flutter/                  # Flutter mobile app
+│   ├── mycelium-protocol/    # Wire format types + binary codec (29 tests)
+│   ├── mycelium-crypto/      # Ed25519, X3DH, Double Ratchet, Sender Key, WoT, Discovery (43 tests)
+│   ├── mycelium-core/        # Transports (BLE/WiFi/LoRa/BT/Internet/Plugin/Mock), AODV, DTN, DHT (51 tests)
+│   ├── mycelium-storage/     # SQLCipher database, CRUD, channels (9 tests)
+│   ├── mycelium-node/        # Node daemon, event loop, message pipeline, CLI (43 tests)
+│   ├── mycelium-api/         # Local REST (47 endpoints) + WebSocket API server (11 tests)
+│   └── mycelium-ffi/         # C FFI bindings for mobile (49+ extern functions)
+├── flutter/                  # Flutter mobile app (47 Dart files, 14 screens)
 │   ├── lib/src/
-│   │   ├── ffi/              # Generated FFI bindings
-│   │   ├── models/           # Data models (NodeId, Message, Contact)
-│   │   ├── providers/        # Riverpod state management
-│   │   ├── screens/          # UI screens
-│   │   ├── service/          # MyceliumService, BleManager
-│   │   ├── widgets/          # Reusable UI components
-│   │   └── router/           # GoRouter navigation
-│   └── android/              # Android platform code (Kotlin BLE)
+│   │   ├── ffi/              # FFI library loading
+│   │   ├── models/           # Data models (NodeId, Message, Contact, Group, etc.)
+│   │   ├── providers/        # Riverpod state management (8 providers)
+│   │   ├── screens/          # UI screens (14 screens)
+│   │   ├── service/          # ApiClient, WsService, MyceliumService, BleManager, etc.
+│   │   ├── widgets/          # Reusable UI components (6 widgets)
+│   │   └── router/           # GoRouter navigation (6-tab shell + onboarding)
+│   └── android/              # Android platform code (Kotlin BLE + Wi-Fi Direct)
 ├── scripts/                  # Build and utility scripts
-├── openwrt/                  # OpenWrt supernode package
-├── testbed/                  # Docker-based mesh simulation
 ├── docs/adr/                 # Architecture Decision Records
 ├── ARCHITECTURE.md           # Comprehensive codebase documentation
-├── IMPLEMENTATION_SPEC.md    # Next-phase implementation specification
+├── IMPLEMENTATION_SPEC.md    # Implementation roadmap and design decisions
+├── REMAINING_WORK.md         # Task tracking (124/146 complete = 85%)
 ├── MYCELIUM_SPEC.md          # Protocol specification
 └── CLAUDE.md                 # AI assistant instructions
 ```
@@ -194,7 +193,7 @@ mycelium/
 
 - One feature per commit. Each commit should leave tests passing and the build green.
 - Commit message format: `<scope>: <description>`
-  - Scopes: `protocol`, `crypto`, `core`, `storage`, `node`, `ffi`, `flutter`, `ble`, `docs`, `build`, `test`
+  - Scopes: `protocol`, `crypto`, `core`, `storage`, `node`, `api`, `ffi`, `flutter`, `ble`, `docs`, `build`, `test`
   - Example: `core: add multi-hop message forwarding via AODV`
 - Reference ADRs in commits when making architectural decisions: `See ADR-001`
 - Update documentation (ARCHITECTURE.md, etc.) in the same commit as the feature they describe

@@ -147,6 +147,7 @@ impl NodeConfig {
     }
 
     /// Save config to a TOML file.
+    #[allow(dead_code)]
     pub fn save(&self, path: &str) -> Result<(), anyhow::Error> {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;

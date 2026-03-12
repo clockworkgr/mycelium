@@ -189,18 +189,17 @@ impl TransportManager {
     /// Select the best transport for a peer based on link quality scores.
     async fn select_transport(&self, peer: &NodeId) -> Option<TransportType> {
         let pt = self.peer_transports.read().await;
-        pt.get(peer)
-            .and_then(|infos| {
-                infos
-                    .iter()
-                    .max_by(|a, b| {
-                        a.quality
-                            .score()
-                            .partial_cmp(&b.quality.score())
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|info| info.transport_type)
-            })
+        pt.get(peer).and_then(|infos| {
+            infos
+                .iter()
+                .max_by(|a, b| {
+                    a.quality
+                        .score()
+                        .partial_cmp(&b.quality.score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|info| info.transport_type)
+        })
     }
 
     /// Get all known peers across all transports.
