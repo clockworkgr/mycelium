@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'src/providers/ws_events_provider.dart';
 import 'src/router/app_router.dart';
@@ -21,14 +22,21 @@ void main() async {
     },
   );
 
+  // Check onboarding status
+  final prefs = await SharedPreferences.getInstance();
+  final displayName = prefs.getString('display_name');
+  onboardingComplete = displayName != null && displayName.isNotEmpty;
+
   // Initialize the node (will reconnect if daemon is already running)
-  try {
-    final appDir = await getApplicationDocumentsDirectory();
-    final dataDir = '${appDir.path}/mycelium';
-    await MyceliumService.instance.initialize(dataDir, 'User');
-    await MyceliumService.instance.start();
-  } catch (e) {
-    debugPrint('Failed to initialize Mycelium: $e');
+  if (onboardingComplete) {
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final dataDir = '${appDir.path}/mycelium';
+      await MyceliumService.instance.initialize(dataDir, displayName!);
+      await MyceliumService.instance.start();
+    } catch (e) {
+      debugPrint('Failed to initialize Mycelium: $e');
+    }
   }
 
   runApp(const ProviderScope(child: MyceliumApp()));

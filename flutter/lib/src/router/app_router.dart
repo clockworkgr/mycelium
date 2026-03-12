@@ -11,13 +11,50 @@ import '../screens/debug_screen.dart';
 import '../screens/groups_screen.dart';
 import '../screens/channels_screen.dart';
 import '../screens/settings_screen.dart';
+import '../screens/welcome_screen.dart';
+import '../screens/name_setup_screen.dart';
+import '../screens/join_method_screen.dart';
+import '../screens/seed_phrase_screen.dart';
 
 final _rootNavigatorKey = GlobalKey<NavigatorState>();
+
+/// Whether onboarding has been completed. Set from main.dart before runApp.
+bool onboardingComplete = false;
 
 final appRouter = GoRouter(
   navigatorKey: _rootNavigatorKey,
   initialLocation: '/conversations',
+  redirect: (context, state) {
+    final onboarding = state.matchedLocation.startsWith('/onboarding');
+    if (!onboardingComplete && !onboarding) {
+      return '/onboarding';
+    }
+    if (onboardingComplete && onboarding) {
+      return '/conversations';
+    }
+    return null;
+  },
   routes: [
+    // Onboarding flow
+    GoRoute(
+      path: '/onboarding',
+      builder: (context, state) => const WelcomeScreen(),
+      routes: [
+        GoRoute(
+          path: 'name',
+          builder: (context, state) => const NameSetupScreen(),
+        ),
+        GoRoute(
+          path: 'join',
+          builder: (context, state) => const JoinMethodScreen(),
+        ),
+        GoRoute(
+          path: 'seed',
+          builder: (context, state) => const SeedPhraseScreen(),
+        ),
+      ],
+    ),
+    // Main app (shell with bottom nav)
     StatefulShellRoute.indexedStack(
       builder: (context, state, navigationShell) {
         return ScaffoldWithNav(navigationShell: navigationShell);
