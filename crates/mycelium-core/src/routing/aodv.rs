@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use mycelium_protocol::types::NodeId;
@@ -39,6 +39,8 @@ pub struct AodvRouter {
     route_lifetime: Duration,
     /// RREQ dedup window.
     rreq_dedup_window: Duration,
+    /// Known supernode peers — routes via supernodes get preference.
+    known_supernodes: HashSet<NodeId>,
 }
 
 /// AODV control messages.
@@ -102,6 +104,7 @@ impl AodvRouter {
             seen_rreqs: Vec::new(),
             route_lifetime: Duration::from_secs(300),
             rreq_dedup_window: Duration::from_secs(10),
+            known_supernodes: HashSet::new(),
         }
     }
 
@@ -364,10 +367,23 @@ impl AodvRouter {
         let should_update = match self.routes.get(&destination) {
             None => true,
             Some(existing) => {
-                sequence_number > existing.sequence_number
-                    || (sequence_number == existing.sequence_number
-                        && hop_count < existing.hop_count)
-                    || !existing.is_valid
+                if sequence_number > existing.sequence_number || !existing.is_valid {
+                    true
+                } else if sequence_number == existing.sequence_number {
+                    if hop_count < existing.hop_count {
+                        true
+                    } else if hop_count == existing.hop_count {
+                        // Same hops + same seq: prefer supernode next-hop
+                        let new_via_supernode = self.known_supernodes.contains(&next_hop);
+                        let old_via_supernode =
+                            self.known_supernodes.contains(&existing.next_hop);
+                        new_via_supernode && !old_via_supernode
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
             }
         };
 
@@ -400,6 +416,16 @@ impl AodvRouter {
     fn cleanup_seen_rreqs(&mut self) {
         let cutoff = Instant::now() - self.rreq_dedup_window;
         self.seen_rreqs.retain(|r| r.received_at > cutoff);
+    }
+
+    /// Register a peer as a supernode. Routes via supernodes get preference.
+    pub fn register_supernode(&mut self, node_id: NodeId) {
+        self.known_supernodes.insert(node_id);
+    }
+
+    /// Check if a peer is a known supernode.
+    pub fn is_supernode(&self, node_id: &NodeId) -> bool {
+        self.known_supernodes.contains(node_id)
     }
 }
 
@@ -580,5 +606,30 @@ mod tests {
         // Route should still be in table but expired
         router.expire_routes();
         assert!(router.find_route(&node(2)).is_none());
+    }
+
+    #[test]
+    fn test_supernode_route_preference() {
+        let mut router = AodvRouter::new(node(1));
+
+        // Register node(3) as a supernode
+        router.register_supernode(node(3));
+        assert!(router.is_supernode(&node(3)));
+        assert!(!router.is_supernode(&node(2)));
+
+        // Add a route through non-supernode (node 2), 2 hops, seq 5
+        router.update_route(node(10), node(2), 2, 5);
+        let route = router.find_route(&node(10)).unwrap();
+        assert_eq!(route.next_hop, node(2));
+
+        // Same seq, same hops, but via supernode → should replace
+        router.update_route(node(10), node(3), 2, 5);
+        let route = router.find_route(&node(10)).unwrap();
+        assert_eq!(route.next_hop, node(3));
+
+        // Non-supernode with same seq/hops should NOT replace supernode route
+        router.update_route(node(10), node(4), 2, 5);
+        let route = router.find_route(&node(10)).unwrap();
+        assert_eq!(route.next_hop, node(3)); // still via supernode
     }
 }

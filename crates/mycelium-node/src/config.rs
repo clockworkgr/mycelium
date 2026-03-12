@@ -108,7 +108,7 @@ impl Default for NodeConfig {
                 ttl_hours: 72,
                 spray_copies: 8,
             },
-            beacon_interval_secs: 10,
+            beacon_interval_secs: 30,
             api: ApiConfig::default(),
             group_seed: None,
         }
@@ -130,10 +130,11 @@ impl NodeConfig {
         Ok(())
     }
 
-    /// Supernode defaults.
+    /// Supernode defaults: faster beacons, larger DTN, full transport.
     pub fn supernode() -> Self {
         Self {
             node_type: NodeTypeConfig::Supernode,
+            beacon_interval_secs: 10,
             dtn: DtnStorageConfig {
                 max_storage_mb: 2048,
                 per_identity_quota_mb: 50,

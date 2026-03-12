@@ -1494,6 +1494,7 @@ impl Node {
                             db,
                             lamport_clock,
                             trust_graph,
+                            routing,
                             local_id,
                             local_group_hash,
                         )
@@ -2640,6 +2641,7 @@ impl Node {
         db: &Database,
         lamport_clock: &RwLock<LamportClock>,
         trust_graph: &RwLock<TrustGraph>,
+        routing: &RwLock<RoutingCoordinator>,
         local_id: NodeId,
         local_group_hash: Option<[u8; 8]>,
     ) {
@@ -2664,6 +2666,13 @@ impl Node {
         {
             let mut clock = lamport_clock.write().await;
             clock.merge(LamportClock(beacon.lamport_clock));
+        }
+
+        // Register supernodes for route preference
+        if beacon.node_type == NodeType::Supernode {
+            let mut r = routing.write().await;
+            r.aodv_mut().register_supernode(beacon.node_id);
+            debug!("Registered supernode: {}", beacon.node_id);
         }
 
         // Create or update contact from beacon
