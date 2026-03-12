@@ -18,6 +18,9 @@ pub struct NodeConfig {
     /// Local API server configuration.
     #[serde(default)]
     pub api: ApiConfig,
+    /// Optional group discovery seed (hex-encoded 32-byte key derived from passphrase).
+    #[serde(default)]
+    pub group_seed: Option<String>,
 }
 
 /// Local API server configuration (REST + WebSocket). See ADR-001.
@@ -107,6 +110,7 @@ impl Default for NodeConfig {
             },
             beacon_interval_secs: 10,
             api: ApiConfig::default(),
+            group_seed: None,
         }
     }
 }
