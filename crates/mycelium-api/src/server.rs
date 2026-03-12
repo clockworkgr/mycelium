@@ -14,7 +14,7 @@ use mycelium_node::config::ApiConfig;
 use mycelium_node::events::NodeEvent;
 use mycelium_node::node::Node;
 
-use crate::routes::{contacts, conversations, groups, messages, network, node};
+use crate::routes::{channels, contacts, conversations, groups, messages, network, node};
 use crate::state::AppState;
 use crate::types::WsServerMessage;
 use crate::ws;
@@ -47,6 +47,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/groups/{group_id}/members", get(groups::list_members).post(groups::add_member))
         .route("/v1/groups/{group_id}/members/{member_id}", delete(groups::remove_member))
         .route("/v1/groups/{group_id}/messages", post(groups::send_group_message))
+        // Channels
+        .route("/v1/channels", get(channels::list_channels).post(channels::create_channel))
+        .route("/v1/channels/{channel_id}/subscribe", post(channels::subscribe).delete(channels::unsubscribe))
+        .route("/v1/channels/{channel_id}/messages", get(channels::get_messages).post(channels::post_message))
         // Network diagnostics
         .route("/v1/network/status", get(network::get_status))
         .route("/v1/network/routes", get(network::get_routes))

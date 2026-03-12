@@ -126,6 +126,44 @@ pub struct CreateGroupResponse {
     pub group_id: String,
 }
 
+// --- Channels ---
+
+#[derive(Debug, Serialize)]
+pub struct ChannelResponse {
+    pub channel_id: String,
+    pub name: String,
+    pub creator_id: String,
+    pub created_at: u64,
+    pub subscribed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateChannelRequest {
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateChannelResponse {
+    pub channel_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChannelMessageResponse {
+    pub message_id: String,
+    pub channel_id: String,
+    pub source: String,
+    pub data: String,
+    pub content_type: u8,
+    pub timestamp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PostChannelMessageRequest {
+    pub data: String,
+    #[serde(default)]
+    pub content_type: u8,
+}
+
 // --- Trust ---
 
 #[derive(Debug, Serialize)]
@@ -254,6 +292,24 @@ pub enum WsServerMessage {
         message_id: String,
         status: String, // "sent", "delivered", "read", "failed"
     },
+    #[serde(rename = "channel_message")]
+    ChannelMessage {
+        channel_id: String,
+        source: String,
+        message_id: String,
+        data: String,
+        content_type: u8,
+        timestamp: u64,
+    },
+}
+
+// --- Events ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EventEntry {
+    pub uptime_secs: u64,
+    pub event_type: String,
+    pub detail: String,
 }
 
 // --- Error ---
