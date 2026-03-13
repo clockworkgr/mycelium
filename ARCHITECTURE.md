@@ -608,9 +608,10 @@ Long-range, low-bandwidth transport for rural/emergency scenarios:
 - **LoraConfig:** frequency (default 915 MHz US, 868 MHz EU), spreading factor (SF7-SF12), bandwidth (125-500 kHz), TX power, duty cycle limit
 - **Duty cycle enforcement:** Tracks airtime and enforces configurable duty cycle (1% EU default)
 - **Airtime calculation:** Based on SF, BW, and payload size per LoRa modulation formula
-- **MTU:** Varies by SF — 222 bytes (SF7-9), 115 bytes (SF10), 51 bytes (SF11-12)
-- **Presets:** `LoraConfig::eu_default()` (868 MHz, SF9, 1% duty), `LoraConfig::us_default()` (915 MHz, SF9, 10% duty)
-- **Status:** Rust transport complete. Platform bridges (BLE GATT to LoRa module, USB serial) not yet implemented.
+- **MTU:** Varies by SF — 222 bytes (SF7-8), 115 bytes (SF9), 51 bytes (SF10-12)
+- **Adaptive Data Rate (ADR):** Per-peer SF negotiation. Starts at configured SF, lowers after 10 consecutive successes, raises after 2 consecutive failures. Discovery beacons always use SF12 for max range. Disabled via `adaptive_data_rate: false`.
+- **Presets:** `LoraConfig::eu_868()` (868 MHz, 1% duty), `LoraConfig::us_915()` (915 MHz, no duty limit)
+- **Status:** Rust transport complete with ADR. Platform bridges (BLE GATT to LoRa module, USB serial) not yet implemented.
 
 ### BT Classic SPP Transport (`transport/bt_classic.rs`)
 
@@ -737,7 +738,7 @@ pub struct StoredMessage {
 }
 ```
 
-**Tests:** 51 tests covering AODV routing (9 tests: discovery, RREP, link break, dedup, supernode preference), DTN (5 tests: store, spray, deliver, quota, eviction), DHT (16 tests: k-bucket, routing table, XOR distance, message serialization), LoRa (7 tests), BT Classic (2 tests), internet (3 tests), Wi-Fi Direct routing (5 tests), mock (2 tests), plugin registry (3 tests).
+**Tests:** 64 tests covering AODV routing (9 tests: discovery, RREP, link break, dedup, supernode preference), DTN (5 tests: store, spray, deliver, quota, eviction), DHT (16 tests: k-bucket, routing table, XOR distance, message serialization), LoRa (20 tests), BT Classic (2 tests), internet (3 tests), Wi-Fi Direct routing (5 tests), mock (2 tests), plugin registry (3 tests).
 
 ---
 
@@ -1440,7 +1441,7 @@ BLE scan finds device with Mycelium service UUID
 |-------|------------|-------|----------------|
 | mycelium-protocol | 3 modules | 29 | Type display, lamport ops, envelope roundtrips, all 12 payload roundtrips, channel/emergency types |
 | mycelium-crypto | 7 modules | 43 | Identity (8), X3DH (9), ratchet (5), sessions (2), WoT (12), groups (4), discovery (3) |
-| mycelium-core | 11 modules | 51 | AODV (9), DTN (5), DHT (16), LoRa (7), BT Classic (2), internet (3), Wi-Fi Direct (5), mock (2), plugin (3) |
+| mycelium-core | 11 modules | 64 | AODV (9), DTN (5), DHT (16), LoRa (7), BT Classic (2), internet (3), Wi-Fi Direct (5), mock (2), plugin (3) |
 | mycelium-storage | 3 modules | 9 | Messages (2), vouches (2), channels (5) |
 | mycelium-node | 4 test files + 3 modules | 43 | Lifecycle (8), pipeline (10), persistence (11), beacon (9), battery (2), rate limiter (4) |
 | mycelium-api | 1 test file | 11 | REST endpoints, JSON responses, error handling, contact CRUD, 404s |
@@ -1494,7 +1495,7 @@ BLE scan finds device with Mycelium service UUID
 | §15 Onboarding | Seed phrase groups | **Implemented** | Group discovery key (HKDF), beacon matching, 4 onboarding screens, QR scanning |
 | §16 Battery Management | Adaptive power | **Implemented** | 5 power modes, platform battery injection via FFI, beacon battery field |
 | §17 UI | Core screens | **Implemented** | 14 screens: Chat, Contacts, Groups, Channels, Settings, Debug, Onboarding (4), QR, Verify |
-| §18 Docker Testbed | CI/CD testing | **Not started** | Unit/integration tests only (186 tests) |
+| §18 Docker Testbed | CI/CD testing | **Not started** | Unit/integration tests only (199 tests) |
 
 ### Deviations from Spec
 

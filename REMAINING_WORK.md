@@ -282,7 +282,7 @@
 
 - [x] **15.1.1** Add `LoraTransport` struct implementing `Transport` trait in `mycelium-core/src/transport/lora.rs`
 - [x] **15.1.2** Add `LoraConfig`: frequency (915/868 MHz), spreading factor, bandwidth, TX power
-- [ ] **15.1.3** Add adaptive data rate: start SF12 for discovery, negotiate down to SF7 for data
+- [x] **15.1.3** Add adaptive data rate: start SF12 for discovery, negotiate down to SF7 for data
 - [ ] **15.1.4** Add `LoraFrame` serialization: compact header for low-bandwidth (minimize overhead)
 - [x] **15.1.5** Add duty cycle enforcement (1% for EU, configurable)
 
@@ -359,9 +359,9 @@ Not broken down — will be planned when v0.1 ships.
 | 12 | 14 | 14 | 0 | Onboarding + seed phrase (crypto, beacon, Flutter screens, FFI) |
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
 | 14 | 12 | 7 | 5 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
-| 15 | 14 | 4 | 10 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
+| 15 | 14 | 5 | 9 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
 | 16 | 10 | 4 | 6 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **146** | **125** | **21** | **86% complete** |
+| **Total** | **146** | **126** | **20** | **86% complete** |
 
 ### Remaining Work Breakdown
 
