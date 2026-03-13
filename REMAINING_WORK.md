@@ -244,9 +244,9 @@
 
 ### 14.1 Cross-compile for OpenWRT
 
-- [ ] **14.1.1** Add `mipsel-unknown-linux-musl` and `aarch64-unknown-linux-musl` Rust targets
-- [ ] **14.1.2** Create `scripts/build-openwrt.sh` cross-compile script
-- [ ] **14.1.3** Create `openwrt/` directory with Makefile for `.ipk` package
+- [x] **14.1.1** Add `mipsel-unknown-linux-musl` and `aarch64-unknown-linux-musl` Rust targets
+- [x] **14.1.2** Create `scripts/build-openwrt.sh` cross-compile script
+- [x] **14.1.3** Create `openwrt/` directory with Makefile for `.ipk` package
 - [ ] **14.1.4** Test standalone `mycelium-node` binary runs on OpenWRT router
 
 ### 14.2 Supernode configuration — COMPLETE
@@ -358,10 +358,10 @@ Not broken down — will be planned when v0.1 ships.
 | 11 | 31 | 31 | 0 | Channels + emergency broadcast (protocol, storage, API, Flutter UI) |
 | 12 | 14 | 14 | 0 | Onboarding + seed phrase (crypto, beacon, Flutter screens, FFI) |
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
-| 14 | 12 | 7 | 5 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
+| 14 | 12 | 10 | 2 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
 | 15 | 14 | 6 | 8 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
 | 16 | 10 | 4 | 6 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **146** | **127** | **19** | **87% complete** |
+| **Total** | **146** | **130** | **16** | **89% complete** |
 
 ### Remaining Work Breakdown
 
@@ -370,8 +370,8 @@ Not broken down — will be planned when v0.1 ships.
 - USB serial bridge (4 tasks)
 - BT Classic Kotlin/Dart bridge (2 tasks)
 
-**OpenWRT Packaging (7 tasks):**
-- Cross-compile scripts and targets (4 tasks)
+**OpenWRT Packaging (4 tasks):**
+- Test on actual router hardware (1 task)
 - LuCI web plugin (3 tasks)
 
 **Protocol Adapters (9 tasks):**

@@ -1,47 +1,108 @@
 #!/bin/sh /etc/rc.common
-# Mycelium mesh daemon init script
+# Mycelium mesh daemon init script for OpenWRT (procd)
 
 START=99
 STOP=10
 
 USE_PROCD=1
 PROG=/usr/bin/mycelium-node
+CONF=/tmp/mycelium.toml
 
 start_service() {
-    local data_dir display_name node_type
+    local enabled data_dir display_name node_type beacon_interval
+    local api_enabled api_bind api_port
+    local ble wifi_direct lora internet_tunnel internet_listen_port
+    local dtn_max dtn_quota dtn_ttl dtn_spray
 
     config_load mycelium
-    config_get data_dir main data_dir '/tmp/mycelium'
+
+    # Main daemon config
+    config_get enabled main enabled '1'
+    [ "$enabled" = "1" ] || return 0
+
+    config_get data_dir main data_dir '/var/lib/mycelium'
     config_get display_name main display_name 'OpenWRT-Supernode'
     config_get node_type main node_type 'supernode'
+    config_get beacon_interval main beacon_interval '10'
+
+    # API config
+    config_get api_enabled main api_enabled '1'
+    config_get api_bind main api_bind '0.0.0.0'
+    config_get api_port main api_port '9735'
+
+    # Transport config
+    config_get ble transports ble '0'
+    config_get wifi_direct transports wifi_direct '0'
+    config_get lora transports lora '0'
+    config_get internet_tunnel transports internet_tunnel '1'
+    config_get internet_listen_port transports internet_listen_port '9736'
+
+    # DTN config
+    config_get dtn_max dtn max_storage_mb '2048'
+    config_get dtn_quota dtn per_identity_quota_mb '50'
+    config_get dtn_ttl dtn ttl_hours '72'
+    config_get dtn_spray dtn spray_copies '8'
 
     mkdir -p "$data_dir"
 
-    # Generate config TOML from UCI
-    cat > /tmp/mycelium.toml <<EOF
+    # Convert UCI booleans to TOML
+    bool_toml() { [ "$1" = "1" ] && echo "true" || echo "false"; }
+
+    # Collect bootstrap nodes
+    local bootstrap_toml=""
+    config_list_foreach transports internet_bootstrap _add_bootstrap
+    bootstrap_toml="${_BOOTSTRAP_LIST:-}"
+
+    # Generate TOML config from UCI settings
+    cat > "$CONF" <<EOF
 data_dir = "$data_dir"
 display_name = "$display_name"
-node_type = "Supernode"
-beacon_interval_secs = 10
+node_type = "$([ "$node_type" = "supernode" ] && echo "Supernode" || echo "Phone")"
+beacon_interval_secs = $beacon_interval
+
+[api]
+enabled = $(bool_toml "$api_enabled")
+bind_address = "$api_bind"
+port = $api_port
 
 [transports]
-wifi_direct = false
-ble = false
-lora = false
-internet_tunnel = false
-mock = true
+ble = $(bool_toml "$ble")
+wifi_direct = $(bool_toml "$wifi_direct")
+lora = $(bool_toml "$lora")
+internet_tunnel = $(bool_toml "$internet_tunnel")
+mock = false
+
+[transports.internet]
+listen_port = $internet_listen_port
+bootstrap_nodes = [$bootstrap_toml]
 
 [dtn]
-max_storage_mb = 2048
-per_identity_quota_mb = 50
-ttl_hours = 72
-spray_copies = 8
+max_storage_mb = $dtn_max
+per_identity_quota_mb = $dtn_quota
+ttl_hours = $dtn_ttl
+spray_copies = $dtn_spray
 EOF
 
     procd_open_instance
-    procd_set_param command "$PROG" /tmp/mycelium.toml
-    procd_set_param respawn
+    procd_set_param command "$PROG" "$CONF"
+    procd_set_param respawn 3600 5 5
     procd_set_param stdout 1
     procd_set_param stderr 1
+    procd_set_param file "$CONF"
     procd_close_instance
+}
+
+_BOOTSTRAP_LIST=""
+_add_bootstrap() {
+    local val="$1"
+    [ -z "$val" ] && return
+    if [ -z "$_BOOTSTRAP_LIST" ]; then
+        _BOOTSTRAP_LIST="\"$val\""
+    else
+        _BOOTSTRAP_LIST="$_BOOTSTRAP_LIST, \"$val\""
+    fi
+}
+
+service_triggers() {
+    procd_add_reload_trigger "mycelium"
 }

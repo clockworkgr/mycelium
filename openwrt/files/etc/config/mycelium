@@ -1,6 +1,26 @@
-config main 'main'
-	option data_dir '/tmp/mycelium'
+# Mycelium mesh daemon configuration (UCI format)
+# See: mycelium-node --help
+
+config daemon 'main'
+	option enabled '1'
+	option data_dir '/var/lib/mycelium'
 	option display_name 'OpenWRT-Supernode'
 	option node_type 'supernode'
-	option dtn_storage_mb '2048'
 	option beacon_interval '10'
+	option api_enabled '1'
+	option api_bind '0.0.0.0'
+	option api_port '9735'
+
+config transport 'transports'
+	option ble '0'
+	option wifi_direct '0'
+	option lora '0'
+	option internet_tunnel '1'
+	option internet_listen_port '9736'
+	list internet_bootstrap ''
+
+config dtn 'dtn'
+	option max_storage_mb '2048'
+	option per_identity_quota_mb '50'
+	option ttl_hours '72'
+	option spray_copies '8'

@@ -1,4 +1,5 @@
 .PHONY: build build-release test lint clean android android-release \
+       openwrt openwrt-release \
        flutter-get flutter-gen flutter-analyze flutter-apk flutter-run \
        check help
 
@@ -22,7 +23,7 @@ fmt:
 
 clean:
 	cargo clean
-	rm -rf android-libs/
+	rm -rf android-libs/ openwrt-bin/
 
 # --- Android Cross-Compilation ---
 
@@ -31,6 +32,14 @@ android:
 
 android-release:
 	./scripts/build-android.sh --release
+
+# --- OpenWRT Cross-Compilation ---
+
+openwrt:
+	./scripts/build-openwrt.sh
+
+openwrt-release:
+	./scripts/build-openwrt.sh --release
 
 # --- Flutter ---
 
@@ -76,6 +85,10 @@ help:
 	@echo "  Android:"
 	@echo "    android          Cross-compile FFI for Android (debug)"
 	@echo "    android-release  Cross-compile FFI for Android (release)"
+	@echo ""
+	@echo "  OpenWRT:"
+	@echo "    openwrt          Cross-compile node for OpenWRT (debug)"
+	@echo "    openwrt-release  Cross-compile node for OpenWRT (release)"
 	@echo ""
 	@echo "  Flutter:"
 	@echo "    flutter-get      flutter pub get"
