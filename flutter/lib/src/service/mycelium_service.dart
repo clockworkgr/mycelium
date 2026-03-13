@@ -4,6 +4,7 @@ import 'dart:ffi';
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../ffi/mycelium_bindings_generated.dart' as ffi;
 import '../ffi/native_library.dart';
@@ -83,11 +84,12 @@ class MyceliumService {
 
   /// Start the node event loop, daemon service, BLE, and WebSocket.
   Future<bool> start() async {
-    // If reconnecting to existing daemon, just start WS + BLE + WiFi Direct
+    // If reconnecting to existing daemon, just start WS + BLE + WiFi Direct + Internet
     if (_reconnected) {
       _startWebSocket();
       await _startBle();
       await _startWifiDirect();
+      await _startInternet();
       await _startDaemonService();
       return true;
     }
@@ -100,6 +102,7 @@ class MyceliumService {
       _startWebSocket();
       await _startBle();
       await _startWifiDirect();
+      await _startInternet();
       await _startDaemonService();
     }
     return ok;
@@ -209,6 +212,36 @@ class MyceliumService {
       await _wifiDirectManager!.start(nodeId.bytes);
     } catch (e) {
       debugPrint('Wi-Fi Direct init failed: $e');
+    }
+  }
+
+  Future<void> _startInternet() async {
+    if (_handle == null) return;
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final enabled = prefs.getBool('internet_transport_enabled') ?? false;
+      if (!enabled) return;
+
+      final bootstrapNodes = prefs.getString('internet_bootstrap_nodes') ?? '';
+      final port = prefs.getInt('internet_listen_port') ?? 9736;
+
+      if (bootstrapNodes.isEmpty) {
+        bindings.mycelium_register_internet_transport(_handle!);
+      } else {
+        final csvNative = toNativeString(bootstrapNodes);
+        try {
+          bindings.mycelium_register_internet_transport_configured(
+            _handle!,
+            port,
+            csvNative,
+          );
+        } finally {
+          calloc.free(csvNative);
+        }
+      }
+      debugPrint('Internet transport registered (port=$port)');
+    } catch (e) {
+      debugPrint('Internet transport init failed: $e');
     }
   }
 

@@ -16,6 +16,8 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tracing::info;
 
+use mycelium_core::transport::internet::{InternetConfig, InternetTransport};
+use mycelium_core::transport::Transport;
 use mycelium_crypto::identity::Identity;
 use mycelium_node::config::NodeConfig;
 use mycelium_node::node::Node;
@@ -2060,4 +2062,154 @@ pub unsafe extern "C" fn mycelium_bt_classic_dequeue_send(
         }
         None => 0,
     }
+}
+
+// --- Internet Transport API ---
+
+/// Register the Internet (TCP) transport with default settings (port 9736).
+///
+/// Returns 0 on success, -1 on null handle.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_register_internet_transport(handle: *mut MyceliumNode) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let internet = Arc::new(InternetTransport::new(
+        node.node_id,
+        InternetConfig::default(),
+    ));
+    runtime().block_on(async {
+        node.transport_manager
+            .replace_transport(internet.clone())
+            .await;
+        *node.internet_transport.write().await = Some(internet);
+    });
+    0
+}
+
+/// Register the Internet (TCP) transport with custom port and bootstrap nodes.
+///
+/// `bootstrap_csv` is a comma-separated list of "ip:port" entries (or NULL for none).
+///
+/// Returns 0 on success, -1 on null handle, -2 on invalid port.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `bootstrap_csv` must be a valid C string or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_register_internet_transport_configured(
+    handle: *mut MyceliumNode,
+    port: u16,
+    bootstrap_csv: *const c_char,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    if port == 0 {
+        return -2;
+    }
+
+    let bootstrap: Vec<std::net::SocketAddr> = if !bootstrap_csv.is_null() {
+        let csv = CStr::from_ptr(bootstrap_csv).to_string_lossy();
+        csv.split(',')
+            .filter_map(|s| s.trim().parse().ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let config = InternetConfig {
+        listen_addr: format!("0.0.0.0:{}", port).parse().unwrap(),
+        bootstrap_nodes: bootstrap,
+        max_connections: 64,
+    };
+
+    let node = &(*handle).node;
+    let internet = Arc::new(InternetTransport::new(node.node_id, config));
+    runtime().block_on(async {
+        node.transport_manager
+            .replace_transport(internet.clone())
+            .await;
+        *node.internet_transport.write().await = Some(internet);
+    });
+    0
+}
+
+/// Connect to a peer at the given "ip:port" address via the Internet transport.
+///
+/// On success, writes the peer's 32-byte NodeId into `out_peer_id` and returns 0.
+/// Returns -1 on null args, -2 if transport not registered, -3 on connection failure.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `addr` must be a valid C string.
+/// - `out_peer_id` must point to 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_internet_connect_to(
+    handle: *mut MyceliumNode,
+    addr: *const c_char,
+    out_peer_id: *mut [u8; 32],
+) -> i32 {
+    if handle.is_null() || addr.is_null() || out_peer_id.is_null() {
+        return -1;
+    }
+
+    let addr_str = CStr::from_ptr(addr).to_string_lossy();
+    let sock_addr: std::net::SocketAddr = match addr_str.parse() {
+        Ok(a) => a,
+        Err(_) => {
+            set_last_error(format!("Invalid address: {}", addr_str));
+            return -3;
+        }
+    };
+
+    let node = &(*handle).node;
+
+    runtime().block_on(async {
+        let guard = node.internet_transport.read().await;
+        if let Some(ref inet) = *guard {
+            match inet.connect_to(sock_addr).await {
+                Ok(peer_id) => {
+                    (*out_peer_id) = *peer_id.as_bytes();
+                    0
+                }
+                Err(e) => {
+                    set_last_error(format!("Connect failed: {}", e));
+                    -3
+                }
+            }
+        } else {
+            set_last_error("Internet transport not registered");
+            -2
+        }
+    })
+}
+
+/// Get the number of connected Internet transport peers.
+///
+/// Returns the peer count (>= 0), or -1 on null handle, -2 if not registered.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_internet_peer_count(handle: *mut MyceliumNode) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+
+    runtime().block_on(async {
+        let guard = node.internet_transport.read().await;
+        if let Some(ref inet) = *guard {
+            inet.connected_peers().len() as i32
+        } else {
+            -2
+        }
+    })
 }

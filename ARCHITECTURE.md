@@ -847,6 +847,7 @@ pub struct Node {
     pub transport_manager: Arc<TransportManager>,
     pub ble_transport: Arc<RwLock<Option<Arc<BleTransport>>>>,
     pub wifi_transport: Arc<RwLock<Option<Arc<WifiDirectTransport>>>>,
+    pub internet_transport: Arc<RwLock<Option<Arc<InternetTransport>>>>,
     pub prekey_cache: Arc<RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>>,
     routing: Arc<RwLock<RoutingCoordinator>>,
     session_manager: Arc<RwLock<SessionManager>>,
@@ -1094,7 +1095,7 @@ thread_local! {
 - **Error reporting:** `mycelium_last_error()` retrieves last error, `mycelium_clear_error()` clears it
 - **Plaintext lifetime:** `MessageInfo.plaintext` pointers valid only until next `mycelium_get_messages()` call on the same thread
 
-### Function Groups (49 functions)
+### Function Groups (53 functions)
 
 | Group | Functions | Description |
 |-------|-----------|-------------|
@@ -1106,7 +1107,8 @@ thread_local! {
 | Groups | `create_group`, `add_group_member`, `remove_group_member`, `group_member_count`, `get_group_members`, `send_group_message` | Group management |
 | Trust | `add_vouch`, `trust_score`, `verify_session`, `safety_number` | Web of Trust |
 | Network | `network_status`, `update_battery` | Status and battery |
-| Transport | `register_ble_transport`, `register_wifi_direct_transport`, `register_lora_transport`, `register_lora_transport_configured`, `register_bt_classic_transport` | Register transports |
+| Transport | `register_ble_transport`, `register_wifi_direct_transport`, `register_lora_transport`, `register_lora_transport_configured`, `register_bt_classic_transport`, `register_internet_transport`, `register_internet_transport_configured` | Register transports |
+| Internet | `internet_connect_to`, `internet_peer_count` | Internet transport operations |
 | BLE Events | `ble_on_peer_discovered`, `ble_on_peer_lost`, `ble_on_data_received` | Platform → Rust |
 | Wi-Fi Events | `wifi_on_peer_connected`, `wifi_on_peer_disconnected`, `wifi_on_data_received` | Platform → Rust |
 | LoRa Events | `lora_on_peer_discovered`, `lora_on_peer_lost`, `lora_on_data_received`, `lora_report_tx_success`, `lora_report_tx_failure` | Platform → Rust (incl. ADR) |
@@ -1595,7 +1597,7 @@ BLE scan finds device with Mycelium service UUID
 | §3.1 BLE | Transport | **Implemented** | Full dual-role GATT, fragmentation, write queue |
 | §3.1 BT Classic | Transport | **Partial** | Rust `BtClassicTransport` complete (16KB MTU, outbox pattern). Kotlin/Dart bridge not started. |
 | §3.1 LoRa | Transport | **Partial** | Rust `LoraTransport` complete (config, duty cycle, 7 tests). Platform bridges not started. |
-| §3.1 Internet Tunnel | Transport | **Partial** | Rust `InternetTransport` struct + config. TCP networking not wired. |
+| §3.1 Internet Tunnel | Transport | **Partial** | Rust `InternetTransport` + DHT + config. FFI registration (4 functions) + API status + Flutter settings UI. TCP works peer-to-peer. |
 | §3.2 Transport Handoff | Seamless migration | **Partial** | TransportManager sends via first available, no session migration |
 | §3.3 iOS Strategy | BLE relay | **Not started** | Deferred to v0.2 |
 | §4.1 AODV Routing | Reactive routing | **Implemented** | RREQ/RREP/RERR, route table, expiry, supernode preference |
@@ -1617,7 +1619,7 @@ BLE scan finds device with Mycelium service UUID
 | §9 Emergency Broadcast | Tiered emergencies | **Implemented** | Wire types, trust-gated handler (3 levels), REST API, Flutter UI, history |
 | §10 OpenWRT Supernode | Router package | **Partial** | CLI `--supernode`, auto-config (2GB DTN, 0.0.0.0 bind), route preference, prekey cache API. Cross-compile + LuCI not started. |
 | §11 Rate Limiting | Trust + rate hybrid | **Implemented** | Per-tier limits, auto-blacklist, wired to trust graph |
-| §12 Internet Tunnel | Opportunistic tunnel | **Partial** | Rust transport struct + DHT (Kademlia) module. TCP relay not wired. |
+| §12 Internet Tunnel | Opportunistic tunnel | **Partial** | Rust transport + DHT (Kademlia) + FFI (4 functions) + API visibility + Flutter settings UI. Node field stores reference. |
 | §13 Protocol Versioning | Backwards compat | **Partial** | Version field in envelope, no negotiation yet |
 | §14 Plugin System | Transport plugins | **Implemented** | `TransportPlugin` trait, `PluginRegistry`, `PluginConfig` in `NodeConfig`. Meshtastic/Reticulum adapters not started. |
 | §15 Onboarding | Seed phrase groups | **Implemented** | Group discovery key (HKDF), beacon matching, 4 onboarding screens, QR scanning |

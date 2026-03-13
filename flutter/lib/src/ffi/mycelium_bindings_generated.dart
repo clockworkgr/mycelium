@@ -631,6 +631,25 @@ class MyceliumBindings {
       int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
           ffi.Pointer<ffi.Uint8>, int)>();
 
+  /// Set the node's display name (used in beacons). Call before mycelium_node_start().
+  int mycelium_set_node_display_name(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Char> name,
+  ) {
+    return _mycelium_set_node_display_name(
+      handle,
+      name,
+    );
+  }
+
+  late final _mycelium_set_node_display_namePtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Char>)>>('mycelium_set_node_display_name');
+  late final _mycelium_set_node_display_name =
+      _mycelium_set_node_display_namePtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>)>();
+
   /// Get current network status. Returns 0 on success.
   int mycelium_network_status(
     ffi.Pointer<MyceliumNode> handle,
@@ -920,6 +939,85 @@ class MyceliumBindings {
   late final _mycelium_wifi_set_send_callback =
       _mycelium_wifi_set_send_callbackPtr.asFunction<
           int Function(ffi.Pointer<MyceliumNode>, TransportSendCallback)>();
+
+  /// Register Internet (TCP) transport with defaults (port 9736). Returns 0 on success.
+  int mycelium_register_internet_transport(
+    ffi.Pointer<MyceliumNode> handle,
+  ) {
+    return _mycelium_register_internet_transport(
+      handle,
+    );
+  }
+
+  late final _mycelium_register_internet_transportPtr = _lookup<
+          ffi.NativeFunction<ffi.Int32 Function(ffi.Pointer<MyceliumNode>)>>(
+      'mycelium_register_internet_transport');
+  late final _mycelium_register_internet_transport =
+      _mycelium_register_internet_transportPtr
+          .asFunction<int Function(ffi.Pointer<MyceliumNode>)>();
+
+  /// Register Internet (TCP) transport with custom port and bootstrap nodes.
+  /// bootstrap_csv is a comma-separated "ip:port" list (or NULL).
+  /// Returns 0 on success, -1 on null handle, -2 on invalid port.
+  int mycelium_register_internet_transport_configured(
+    ffi.Pointer<MyceliumNode> handle,
+    int port,
+    ffi.Pointer<ffi.Char> bootstrap_csv,
+  ) {
+    return _mycelium_register_internet_transport_configured(
+      handle,
+      port,
+      bootstrap_csv,
+    );
+  }
+
+  late final _mycelium_register_internet_transport_configuredPtr = _lookup<
+          ffi.NativeFunction<
+              ffi.Int32 Function(ffi.Pointer<MyceliumNode>, ffi.Uint16,
+                  ffi.Pointer<ffi.Char>)>>(
+      'mycelium_register_internet_transport_configured');
+  late final _mycelium_register_internet_transport_configured =
+      _mycelium_register_internet_transport_configuredPtr.asFunction<
+          int Function(
+              ffi.Pointer<MyceliumNode>, int, ffi.Pointer<ffi.Char>)>();
+
+  /// Connect to a peer at "ip:port". Writes 32-byte peer NodeId into out_peer_id.
+  /// Returns 0 on success, -1 null args, -2 not registered, -3 connect failure.
+  int mycelium_internet_connect_to(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Char> addr,
+    ffi.Pointer<ffi.Uint8> out_peer_id,
+  ) {
+    return _mycelium_internet_connect_to(
+      handle,
+      addr,
+      out_peer_id,
+    );
+  }
+
+  late final _mycelium_internet_connect_toPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>,
+              ffi.Pointer<ffi.Uint8>)>>('mycelium_internet_connect_to');
+  late final _mycelium_internet_connect_to =
+      _mycelium_internet_connect_toPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>,
+              ffi.Pointer<ffi.Uint8>)>();
+
+  /// Get connected Internet peer count. Returns count >= 0, -1 null, -2 not registered.
+  int mycelium_internet_peer_count(
+    ffi.Pointer<MyceliumNode> handle,
+  ) {
+    return _mycelium_internet_peer_count(
+      handle,
+    );
+  }
+
+  late final _mycelium_internet_peer_countPtr = _lookup<
+          ffi.NativeFunction<ffi.Int32 Function(ffi.Pointer<MyceliumNode>)>>(
+      'mycelium_internet_peer_count');
+  late final _mycelium_internet_peer_count = _mycelium_internet_peer_countPtr
+      .asFunction<int Function(ffi.Pointer<MyceliumNode>)>();
 }
 
 final class MyceliumNode extends ffi.Opaque {}

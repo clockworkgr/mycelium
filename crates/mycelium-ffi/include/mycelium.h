@@ -296,6 +296,31 @@ int32_t mycelium_wifi_dequeue_send(
 int32_t mycelium_ble_set_send_callback(MyceliumNode *handle, TransportSendCallback callback);
 int32_t mycelium_wifi_set_send_callback(MyceliumNode *handle, TransportSendCallback callback);
 
+/* --- Internet Transport --- */
+
+/** Register Internet (TCP) transport with defaults (port 9736). Returns 0 on success. */
+int32_t mycelium_register_internet_transport(MyceliumNode *handle);
+
+/** Register Internet (TCP) transport with custom port and bootstrap nodes.
+ *  bootstrap_csv is a comma-separated "ip:port" list (or NULL).
+ *  Returns 0 on success, -1 on null handle, -2 on invalid port. */
+int32_t mycelium_register_internet_transport_configured(
+    MyceliumNode *handle,
+    uint16_t port,
+    const char *bootstrap_csv
+);
+
+/** Connect to a peer at "ip:port". Writes 32-byte peer NodeId into out_peer_id.
+ *  Returns 0 on success, -1 null args, -2 not registered, -3 connect failure. */
+int32_t mycelium_internet_connect_to(
+    MyceliumNode *handle,
+    const char *addr,
+    uint8_t out_peer_id[32]
+);
+
+/** Get connected Internet peer count. Returns count >= 0, -1 null, -2 not registered. */
+int32_t mycelium_internet_peer_count(MyceliumNode *handle);
+
 #ifdef __cplusplus
 }
 #endif

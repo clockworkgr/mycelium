@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:qr_flutter/qr_flutter.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../providers/developer_mode_provider.dart';
 import '../providers/network_status_provider.dart';
@@ -9,8 +10,48 @@ import '../service/api_client.dart';
 import '../widgets/network_status_card.dart';
 import '../widgets/node_id_display.dart';
 
-class SettingsScreen extends ConsumerWidget {
+class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
+
+  @override
+  ConsumerState<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+  bool _internetEnabled = false;
+  final _bootstrapController = TextEditingController();
+  bool _internetPrefsLoaded = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadInternetPrefs();
+  }
+
+  @override
+  void dispose() {
+    _bootstrapController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadInternetPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        _internetEnabled = prefs.getBool('internet_transport_enabled') ?? false;
+        _bootstrapController.text =
+            prefs.getString('internet_bootstrap_nodes') ?? '';
+        _internetPrefsLoaded = true;
+      });
+    }
+  }
+
+  Future<void> _saveInternetPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('internet_transport_enabled', _internetEnabled);
+    await prefs.setString(
+        'internet_bootstrap_nodes', _bootstrapController.text.trim());
+  }
 
   void _showQrDialog(BuildContext context, String hex) {
     showDialog(
@@ -132,7 +173,7 @@ class SettingsScreen extends ConsumerWidget {
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final service = ref.watch(myceliumServiceProvider);
     final networkAsync = ref.watch(networkStatusProvider);
 
@@ -221,6 +262,59 @@ class SettingsScreen extends ConsumerWidget {
             ),
           ),
           const SizedBox(height: 16),
+
+          // Internet transport
+          if (_internetPrefsLoaded)
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Internet Transport',
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 4),
+                    const Text(
+                      'Connect to peers over TCP/IP (requires network access)',
+                      style: TextStyle(color: Colors.grey, fontSize: 12),
+                    ),
+                    SwitchListTile(
+                      title: const Text('Enable'),
+                      contentPadding: EdgeInsets.zero,
+                      value: _internetEnabled,
+                      onChanged: (value) {
+                        setState(() => _internetEnabled = value);
+                        _saveInternetPrefs();
+                      },
+                    ),
+                    if (_internetEnabled) ...[
+                      TextField(
+                        controller: _bootstrapController,
+                        decoration: const InputDecoration(
+                          labelText: 'Bootstrap Nodes',
+                          hintText: 'ip:port, ip:port, ...',
+                          border: OutlineInputBorder(),
+                          helperText: 'Comma-separated supernode addresses',
+                        ),
+                        onChanged: (_) => _saveInternetPrefs(),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Changes take effect on next app restart.',
+                        style: TextStyle(
+                          color: Colors.orange,
+                          fontSize: 12,
+                          fontStyle: FontStyle.italic,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+          if (_internetPrefsLoaded) const SizedBox(height: 16),
 
           // Developer mode toggle
           Card(

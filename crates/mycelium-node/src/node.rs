@@ -111,6 +111,9 @@ pub struct Node {
     #[allow(dead_code)]
     pub bt_classic_transport:
         Arc<RwLock<Option<Arc<mycelium_core::transport::bt_classic::BtClassicTransport>>>>,
+    /// Handle to Internet transport for API visibility and FFI registration.
+    pub internet_transport:
+        Arc<RwLock<Option<Arc<mycelium_core::transport::internet::InternetTransport>>>>,
     /// Broadcast channel for node events (consumed by API server / WebSocket clients).
     pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
     /// Dedup set for channel messages (prevents re-processing flooded messages).
@@ -189,6 +192,7 @@ impl Node {
             wifi_transport: Arc::new(RwLock::new(None)),
             lora_transport: Arc::new(RwLock::new(None)),
             bt_classic_transport: Arc::new(RwLock::new(None)),
+            internet_transport: Arc::new(RwLock::new(None)),
             event_tx,
             seen_channel_messages: Arc::new(RwLock::new(HashSet::new())),
             local_group_hash,
@@ -639,7 +643,8 @@ impl Node {
                     max_connections: 64,
                 },
             ));
-            self.transport_manager.add_transport(internet).await;
+            self.transport_manager.add_transport(internet.clone()).await;
+            *self.internet_transport.write().await = Some(internet);
             info!(
                 "Registered Internet transport on port {}",
                 inet_cfg.listen_port

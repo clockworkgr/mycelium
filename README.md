@@ -160,7 +160,7 @@ mycelium/
 │   ├── mycelium-storage/     # SQLCipher database (9 tests)
 │   ├── mycelium-node/        # Node daemon + CLI (43 tests)
 │   ├── mycelium-api/         # REST + WebSocket API server (11 tests)
-│   └── mycelium-ffi/         # C FFI for mobile (49+ functions)
+│   └── mycelium-ffi/         # C FFI for mobile (53+ functions)
 ├── flutter/                  # Flutter Android app (47 Dart files)
 ├── scripts/                  # Build scripts
 ├── docs/adr/                 # Architecture Decision Records

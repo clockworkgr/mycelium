@@ -167,7 +167,7 @@ mycelium/
 │   ├── mycelium-storage/     # SQLCipher database, CRUD, channels (9 tests)
 │   ├── mycelium-node/        # Node daemon, event loop, message pipeline, CLI (43 tests)
 │   ├── mycelium-api/         # Local REST (47 endpoints) + WebSocket API server (11 tests)
-│   └── mycelium-ffi/         # C FFI bindings for mobile (49+ extern functions)
+│   └── mycelium-ffi/         # C FFI bindings for mobile (53+ extern functions)
 ├── flutter/                  # Flutter mobile app (47 Dart files, 14 screens)
 │   ├── lib/src/
 │   │   ├── ffi/              # FFI library loading

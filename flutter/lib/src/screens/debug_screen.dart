@@ -256,7 +256,13 @@ class _DebugScreenState extends State<DebugScreen> {
     final peerCount = t['peer_count'] ?? 0;
     final mtu = t['mtu'] ?? 0;
     final peers = (t['peers'] as List<dynamic>?) ?? [];
-    final label = name == 'ble' ? 'BLE' : 'Wi-Fi Direct';
+    final label = const {
+      'ble': 'BLE',
+      'wifi_direct': 'Wi-Fi Direct',
+      'lora': 'LoRa',
+      'bt_classic': 'Bluetooth Classic',
+      'internet': 'Internet (TCP)',
+    }[name] ?? name;
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 8),

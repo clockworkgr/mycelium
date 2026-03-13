@@ -283,6 +283,43 @@ pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStat
         }
     }
 
+    // Internet transport
+    {
+        let guard = state.node.internet_transport.read().await;
+        if let Some(ref inet) = *guard {
+            let peers = inet.connected_peers();
+            let peer_infos: Vec<TransportPeerInfo> = peers
+                .iter()
+                .map(|p| {
+                    let lq = inet.link_quality(p);
+                    TransportPeerInfo {
+                        node_id: hex::encode(p.as_bytes()),
+                        rssi: lq.and_then(|q| q.rssi),
+                        throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                        latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                    }
+                })
+                .collect();
+            transports.push(TransportInfo {
+                name: "internet".to_string(),
+                registered: true,
+                peer_count: peer_infos.len(),
+                mtu: inet.mtu(),
+                outbox_depth: 0,
+                peers: peer_infos,
+            });
+        } else {
+            transports.push(TransportInfo {
+                name: "internet".to_string(),
+                registered: false,
+                peer_count: 0,
+                peers: Vec::new(),
+                mtu: 0,
+                outbox_depth: 0,
+            });
+        }
+    }
+
     Json(TransportStatusResponse { transports })
 }
 
@@ -314,6 +351,22 @@ pub async fn get_peers(State(state): State<AppState>) -> Json<Vec<PeerResponse>>
                 peers.push(PeerResponse {
                     node_id: hex::encode(p.as_bytes()),
                     transport: "wifi_direct".to_string(),
+                    rssi: lq.and_then(|q| q.rssi),
+                    throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                    latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    {
+        let guard = state.node.internet_transport.read().await;
+        if let Some(ref inet) = *guard {
+            for p in inet.connected_peers() {
+                let lq = inet.link_quality(&p);
+                peers.push(PeerResponse {
+                    node_id: hex::encode(p.as_bytes()),
+                    transport: "internet".to_string(),
                     rssi: lq.and_then(|q| q.rssi),
                     throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
                     latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
