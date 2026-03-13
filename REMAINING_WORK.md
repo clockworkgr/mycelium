@@ -289,8 +289,8 @@
 ### 15.2 BLE GATT connection to LoRa module
 
 - [x] **15.2.1** Define LoRa GATT service UUID and characteristics (TX, RX, config)
-- [ ] **15.2.2** Add Kotlin `LoraService.kt`: scan for LoRa module BLE service UUID, connect, read/write characteristics
-- [ ] **15.2.3** Add Dart `lora_manager.dart`: bridge between Kotlin LoRa service and Rust FFI
+- [x] **15.2.2** Add Kotlin `LoraService.kt`: scan for LoRa module BLE service UUID, connect, read/write characteristics
+- [x] **15.2.3** Add Dart `lora_manager.dart`: bridge between Kotlin LoRa service and Rust FFI
 - [x] **15.2.4** Add FFI functions: `mycelium_lora_data_received()`, `mycelium_lora_poll_outbox()`
 
 ### 15.3 USB Serial connection
@@ -359,14 +359,13 @@ Not broken down — will be planned when v0.1 ships.
 | 12 | 14 | 14 | 0 | Onboarding + seed phrase (crypto, beacon, Flutter screens, FFI) |
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
 | 14 | 12 | 11 | 1 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
-| 15 | 14 | 9 | 5 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
+| 15 | 14 | 11 | 3 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
 | 16 | 10 | 4 | 6 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **146** | **136** | **10** | **93% complete** |
+| **Total** | **146** | **138** | **8** | **95% complete** |
 
 ### Remaining Work Breakdown
 
-**Platform Integration (7 tasks):**
-- LoRa Kotlin/Dart bridge (2 tasks: 15.2.2, 15.2.3)
+**Platform Integration (5 tasks):**
 - USB serial bridge (4 tasks: 15.3.1-15.3.4)
 - BT Classic Kotlin service (1 task: 15.4.2)
 
