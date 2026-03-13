@@ -10,6 +10,14 @@ use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, info, warn};
 
+/// Bind a TCP listener with SO_REUSEADDR to allow quick rebinding.
+async fn bind_reuseaddr(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(128)
+}
+
 use mycelium_node::config::ApiConfig;
 use mycelium_node::events::NodeEvent;
 use mycelium_node::node::Node;
@@ -170,19 +178,42 @@ pub async fn start_server(
         }
     });
 
-    let app = build_router(state);
-
     let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port)
         .parse()
         .expect("invalid API bind address");
 
-    let listener = TcpListener::bind(addr).await?;
+    let listener = bind_reuseaddr(addr).await?;
     info!("API server listening on {}", addr);
 
     let handle = tokio::spawn(async move {
-        if let Err(e) = axum::serve(listener, app).await {
-            tracing::error!("API server error: {}", e);
+        // First run with the already-bound listener
+        let app = build_router(state.clone());
+        match axum::serve(listener, app).await {
+            Ok(()) => warn!("API server exited cleanly (unexpected)"),
+            Err(e) => tracing::error!("API server error: {}", e),
         }
+
+        // Auto-restart loop with SO_REUSEADDR for reliable rebinding
+        for restart in 1..=30u32 {
+            warn!("API server restart #{} on {}", restart, addr);
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            let new_listener = match bind_reuseaddr(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("API server rebind failed: {}", e);
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
+                }
+            };
+            let new_app = build_router(state.clone());
+            info!("API server restarted on {}", addr);
+            match axum::serve(new_listener, new_app).await {
+                Ok(()) => warn!("API server exited cleanly on restart #{}", restart),
+                Err(e) => tracing::error!("API server error on restart #{}: {}", restart, e),
+            }
+        }
+        tracing::error!("API server giving up after 30 restarts");
     });
 
     Ok(handle)

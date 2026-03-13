@@ -2867,7 +2867,7 @@ impl Node {
         let sender_trust = tg.trust_score(&local_id, &envelope.source).value;
 
         let accepted = match level {
-            wire::EmergencyLevel::Priority => sender_trust > 0.3,
+            wire::EmergencyLevel::Priority => sender_trust >= 0.0, // Allow all peers for Priority
             wire::EmergencyLevel::Urgent => sender_trust > 0.6,
             wire::EmergencyLevel::Critical => {
                 // Need 3+ cosigners each with trust > 0.8

@@ -55,8 +55,13 @@ identity.key
 /flutter/android/app/build/
 /flutter/android/build/
 
+# Pre-built iOS native libraries (built from source)
+/ios-libs/
+
 # Platform-specific generated files
 /flutter/ios/Pods/
+/flutter/ios/Podfile.lock
+/flutter/ios/MyceliumFFI/Frameworks/
 /flutter/macos/Pods/
 /flutter/linux/flutter/ephemeral/
 /flutter/windows/flutter/ephemeral/

@@ -87,6 +87,14 @@ int32_t mycelium_last_error(uint8_t *out_buf, uint32_t buf_len);
 /** Clear the last error. */
 void mycelium_clear_error(void);
 
+/* --- Diagnostics --- */
+
+/** Check if the API server TCP port is reachable. Returns 1 if OK, 0 if not. */
+int32_t mycelium_api_check(void);
+
+/** Get the API handle status. 0=no node, 1=no handle, 2=running, 3=finished, -1=error. */
+int32_t mycelium_api_handle_status(void);
+
 /* --- Node Lifecycle --- */
 
 /** Create a new Mycelium node. Returns NULL on failure. */

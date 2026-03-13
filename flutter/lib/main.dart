@@ -32,10 +32,13 @@ void main() async {
     try {
       final appDir = await getApplicationDocumentsDirectory();
       final dataDir = '${appDir.path}/mycelium';
+      debugPrint('Mycelium: dataDir=$dataDir displayName=$displayName');
       await MyceliumService.instance.initialize(dataDir, displayName!);
-      await MyceliumService.instance.start();
-    } catch (e) {
-      debugPrint('Failed to initialize Mycelium: $e');
+      final started = await MyceliumService.instance.start();
+      debugPrint('Mycelium: node started=$started, lastErr=${MyceliumService.instance.lastStartError}');
+    } catch (e, st) {
+      debugPrint('Failed to initialize Mycelium: $e\n$st');
+      MyceliumService.instance.lastStartError = 'Init failed: $e';
     }
   }
 

@@ -60,6 +60,14 @@ final wsEventBridgeProvider = Provider<void>((ref) {
         debugPrint('WS: peer ${event.event} ${event.peerId.substring(0, 8)}...');
       case WsNetworkEvent():
         ref.invalidate(networkStatusProvider);
+      case WsEmergencyEvent():
+        debugPrint('WS: emergency from ${event.source.substring(0, 8)}... level=${event.level}');
+        // Show emergency notification regardless of active chat
+        NotificationService.instance.showMessageNotification(
+          senderName: 'EMERGENCY (Level ${event.level})',
+          messageText: event.message,
+          peerHex: event.source,
+        );
     }
   });
 

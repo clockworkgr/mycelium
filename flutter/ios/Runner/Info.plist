@@ -50,6 +50,8 @@
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
 	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>Mycelium uses the camera to scan peer QR codes for adding contacts.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>Mycelium uses Bluetooth to discover nearby mesh peers and exchange messages.</string>
 	<key>NSBluetoothPeripheralUsageDescription</key>

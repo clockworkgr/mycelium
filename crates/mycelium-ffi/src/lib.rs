@@ -131,6 +131,52 @@ pub struct NetworkStatus {
     pub dtn_queue_size: u32,
 }
 
+/// Diagnostic: check if the API server port is reachable from the Rust side.
+/// Returns 1 if TCP connect to 127.0.0.1:9735 succeeds, 0 if not.
+/// If it fails, the error reason is stored in LAST_ERROR.
+#[no_mangle]
+pub extern "C" fn mycelium_api_check() -> i32 {
+    use std::net::TcpStream;
+    match TcpStream::connect_timeout(
+        &"127.0.0.1:9735".parse().unwrap(),
+        std::time::Duration::from_secs(2),
+    ) {
+        Ok(_) => 1,
+        Err(e) => {
+            set_last_error(format!("API check failed: {}", e));
+            0
+        }
+    }
+}
+
+/// Diagnostic: check the API server handle status.
+/// Returns: 0 = no node, 1 = node exists but no API handle, 2 = API handle exists (task running),
+///          3 = API handle exists (task finished).
+#[no_mangle]
+pub extern "C" fn mycelium_api_handle_status() -> i32 {
+    let ptr = ACTIVE_NODE.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return 0;
+    }
+    let mycelium = unsafe { &*ptr };
+    match mycelium.api_handle.lock() {
+        Ok(guard) => match guard.as_ref() {
+            None => 1,
+            Some(handle) => {
+                if handle.is_finished() {
+                    3
+                } else {
+                    2
+                }
+            }
+        },
+        Err(_) => {
+            set_last_error("API handle mutex poisoned");
+            -1
+        }
+    }
+}
+
 /// Create a new Mycelium node.
 ///
 /// # Safety
@@ -177,22 +223,32 @@ pub unsafe extern "C" fn mycelium_node_new(
         ..NodeConfig::default()
     };
 
-    let _ = std::fs::create_dir_all(&data_dir);
+    if let Err(e) = std::fs::create_dir_all(&data_dir) {
+        set_last_error(format!("create_dir_all({}): {}", data_dir, e));
+        return std::ptr::null_mut();
+    }
 
     // Load or generate identity
     let identity_path = format!("{}/identity.key", data_dir);
     let identity = if let Ok(bytes) = std::fs::read(&identity_path) {
         let arr: [u8; 96] = match bytes.try_into() {
             Ok(a) => a,
-            Err(_) => return std::ptr::null_mut(),
+            Err(_) => {
+                set_last_error(format!("identity file wrong size at {}", identity_path));
+                return std::ptr::null_mut();
+            }
         };
         match Identity::from_bytes(&arr) {
             Ok(id) => id,
-            Err(_) => return std::ptr::null_mut(),
+            Err(e) => {
+                set_last_error(format!("identity deserialize: {}", e));
+                return std::ptr::null_mut();
+            }
         }
     } else {
         let id = Identity::generate();
-        if std::fs::write(&identity_path, id.to_bytes()).is_err() {
+        if let Err(e) = std::fs::write(&identity_path, id.to_bytes()) {
+            set_last_error(format!("identity write({}): {}", identity_path, e));
             return std::ptr::null_mut();
         }
         id
@@ -209,7 +265,10 @@ pub unsafe extern "C" fn mycelium_node_new(
     };
     let db = match Database::open(&db_path, &db_key) {
         Ok(db) => db,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => {
+            set_last_error(format!("db open({}): {}", db_path, e));
+            return std::ptr::null_mut();
+        }
     };
 
     let node = Arc::new(Node::new(config, db, identity));
@@ -229,32 +288,46 @@ pub unsafe extern "C" fn mycelium_node_new(
 pub unsafe extern "C" fn mycelium_node_start(handle: *mut MyceliumNode) -> bool {
     let mycelium = &(*handle);
     let node = &mycelium.node;
-    let started = runtime().block_on(async { node.start().await.is_ok() });
+    let start_result = runtime().block_on(async { node.start().await });
 
-    if started {
-        // Start the API server on localhost:9735
-        let api_config = &node.config.api;
-        if api_config.enabled {
-            let node_clone = Arc::clone(node);
-            let config = api_config.clone();
-            match runtime().block_on(mycelium_api::start_server(node_clone, &config)) {
-                Ok(api_task) => {
-                    info!(
-                        "API server started on {}:{}",
-                        config.bind_address, config.port
-                    );
-                    if let Ok(mut guard) = mycelium.api_handle.lock() {
-                        *guard = Some(api_task);
-                    }
+    match start_result {
+        Ok(()) => {
+            info!("Node started successfully");
+        }
+        Err(e) => {
+            let msg = format!("Node start failed: {}", e);
+            info!("{}", msg);
+            set_last_error(&msg);
+            return false;
+        }
+    }
+
+    // Start the API server on localhost:9735
+    let api_config = &node.config.api;
+    if api_config.enabled {
+        let node_clone = Arc::clone(node);
+        let config = api_config.clone();
+        match runtime().block_on(mycelium_api::start_server(node_clone, &config)) {
+            Ok(api_task) => {
+                info!(
+                    "API server started on {}:{}",
+                    config.bind_address, config.port
+                );
+                if let Ok(mut guard) = mycelium.api_handle.lock() {
+                    *guard = Some(api_task);
                 }
-                Err(e) => {
-                    info!("API server failed to start: {}", e);
-                }
+            }
+            Err(e) => {
+                let msg = format!("API server failed to start: {}", e);
+                info!("{}", msg);
+                set_last_error(&msg);
+                // Node started but API server failed — still return true
+                // so the caller knows the node is running
             }
         }
     }
 
-    started
+    true
 }
 
 /// Stop the node and API server.

@@ -44,6 +44,18 @@ class WsPeerEvent extends WsEvent {
   });
 }
 
+class WsEmergencyEvent extends WsEvent {
+  final String source;
+  final int level;
+  final String message;
+
+  WsEmergencyEvent({
+    required this.source,
+    required this.level,
+    required this.message,
+  });
+}
+
 class WsNetworkEvent extends WsEvent {
   final int neighborCount;
   final bool isConnected;
@@ -139,6 +151,12 @@ class WsService {
             neighborCount: json['neighbor_count'] as int? ?? 0,
             isConnected: json['is_connected'] as bool? ?? false,
             dtnQueueSize: json['dtn_queue_size'] as int? ?? 0,
+          ));
+        case 'emergency':
+          _eventController.add(WsEmergencyEvent(
+            source: json['source'] as String? ?? '',
+            level: json['level'] as int? ?? 0,
+            message: json['message'] as String? ?? '',
           ));
       }
     } catch (e) {

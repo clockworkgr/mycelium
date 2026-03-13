@@ -82,8 +82,13 @@ class MyceliumService {
     }
   }
 
+  /// Last error from FFI init/start, if any. Visible in debug screen + banner.
+  String? lastStartError;
+
   /// Start the node event loop, daemon service, BLE, and WebSocket.
   Future<bool> start() async {
+    lastStartError = null;
+
     // If reconnecting to existing daemon, just start WS + BLE + WiFi Direct + Internet
     if (_reconnected) {
       _startWebSocket();
@@ -96,16 +101,30 @@ class MyceliumService {
 
     _ensureHandle();
     final ok = bindings.mycelium_node_start(_handle!);
-    if (ok) {
-      // Cache the node ID from FFI
-      _cachedNodeId = _getNodeIdFromFfi();
-      _startWebSocket();
-      await _startBle();
-      await _startWifiDirect();
-      await _startInternet();
-      await _startDaemonService();
+    if (!ok) {
+      lastStartError = getLastError();
+      debugPrint('Mycelium: node start failed: $lastStartError');
+      return false;
     }
-    return ok;
+
+    // Check if the API server had an error (node started but API may have failed)
+    final postStartError = getLastError();
+    if (postStartError != 'Unknown error' && postStartError.isNotEmpty) {
+      lastStartError = postStartError;
+      debugPrint('Mycelium: post-start warning: $lastStartError');
+    }
+
+    // Diagnostic: check API server from Rust side
+    _runApiDiagnostics();
+
+    // Cache the node ID from FFI
+    _cachedNodeId = _getNodeIdFromFfi();
+    _startWebSocket();
+    await _startBle();
+    await _startWifiDirect();
+    await _startInternet();
+    await _startDaemonService();
+    return true;
   }
 
   /// Reconnect to an already-running daemon (API server responding).
@@ -415,6 +434,44 @@ class MyceliumService {
     _cachedNodeId = null;
     _reconnected = false;
     _instance = null;
+  }
+
+  /// Run API server diagnostics from Rust side.
+  void _runApiDiagnostics() {
+    try {
+      final lib = defaultTargetPlatform == TargetPlatform.android
+          ? DynamicLibrary.open('libmycelium_ffi.so')
+          : DynamicLibrary.process();
+
+      // Check handle status
+      final apiHandleStatus = lib.lookupFunction<
+          Int32 Function(), int Function()>('mycelium_api_handle_status');
+      final handleStatus = apiHandleStatus();
+      final handleLabels = {
+        0: 'no node',
+        1: 'node exists, no API handle',
+        2: 'API handle exists (running)',
+        3: 'API handle exists (FINISHED)',
+        -1: 'mutex poisoned',
+      };
+      final handleLabel = handleLabels[handleStatus] ?? 'unknown($handleStatus)';
+      debugPrint('Mycelium: API handle status: $handleLabel');
+
+      // TCP connect check from Rust
+      final apiCheck = lib.lookupFunction<
+          Int32 Function(), int Function()>('mycelium_api_check');
+      final checkResult = apiCheck();
+      if (checkResult == 1) {
+        debugPrint('Mycelium: API TCP check: OK (reachable from Rust)');
+      } else {
+        final checkError = getLastError();
+        debugPrint('Mycelium: API TCP check: FAILED ($checkError)');
+        lastStartError = 'Handle: $handleLabel | TCP: $checkError';
+      }
+    } catch (e) {
+      debugPrint('Mycelium: diagnostics failed: $e');
+      lastStartError = 'Diagnostics failed: $e';
+    }
   }
 
   // --- Helpers ---

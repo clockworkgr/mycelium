@@ -1,6 +1,10 @@
 import 'dart:async';
+import 'dart:ffi';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import '../service/api_client.dart';
+import '../service/ffi_helpers.dart';
+import '../service/mycelium_service.dart';
 
 /// Debug panel showing network diagnostics.
 ///
@@ -104,6 +108,20 @@ class _DebugScreenState extends State<DebugScreen> {
                       style: const TextStyle(fontSize: 12, color: Colors.grey),
                       textAlign: TextAlign.center,
                     ),
+                    const SizedBox(height: 12),
+                    Text(
+                      _liveRustDiagnostic(),
+                      style: const TextStyle(fontSize: 12, color: Colors.orange),
+                      textAlign: TextAlign.center,
+                    ),
+                    if (MyceliumService.instance.lastStartError != null) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        'Startup: ${MyceliumService.instance.lastStartError}',
+                        style: const TextStyle(fontSize: 12, color: Colors.orange),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -576,6 +594,37 @@ class _DebugScreenState extends State<DebugScreen> {
     if (s < 60) return '${s}s';
     if (s < 3600) return '${s ~/ 60}m ${s % 60}s';
     return '${s ~/ 3600}h ${(s % 3600) ~/ 60}m';
+  }
+
+  String _liveRustDiagnostic() {
+    try {
+      final lib = defaultTargetPlatform == TargetPlatform.android
+          ? DynamicLibrary.open('libmycelium_ffi.so')
+          : DynamicLibrary.process();
+
+      final apiHandleStatus = lib.lookupFunction<
+          Int32 Function(), int Function()>('mycelium_api_handle_status');
+      final handleStatus = apiHandleStatus();
+      final handleLabels = {
+        0: 'no node',
+        1: 'node exists, no API handle',
+        2: 'API running',
+        3: 'API task FINISHED/CRASHED',
+        -1: 'mutex poisoned',
+      };
+      final handleLabel = handleLabels[handleStatus] ?? 'unknown($handleStatus)';
+
+      final apiCheck = lib.lookupFunction<
+          Int32 Function(), int Function()>('mycelium_api_check');
+      final checkResult = apiCheck();
+      final tcpLabel = checkResult == 1
+          ? 'TCP OK'
+          : 'TCP FAIL: ${getLastError()}';
+
+      return 'Rust: $handleLabel | $tcpLabel';
+    } catch (e) {
+      return 'Rust diagnostics failed: $e';
+    }
   }
 
   String _formatBytes(dynamic bytes) {

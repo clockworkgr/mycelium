@@ -6,8 +6,8 @@ import UIKit
 
     private var bleService: BleService?
     private var loraService: LoraService?
-    private var bleEventSink: FlutterEventSink?
-    private var loraEventSink: FlutterEventSink?
+    fileprivate var bleEventSink: FlutterEventSink?
+    fileprivate var loraEventSink: FlutterEventSink?
 
     override func application(
         _ application: UIApplication,

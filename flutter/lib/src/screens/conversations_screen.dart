@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../providers/conversations_provider.dart';
+import '../service/mycelium_service.dart';
 import '../widgets/conversation_tile.dart';
 
 class ConversationsScreen extends ConsumerWidget {
@@ -14,7 +15,18 @@ class ConversationsScreen extends ConsumerWidget {
 
     return Scaffold(
       appBar: AppBar(title: const Text('Mycelium Mesh')),
-      body: conversationsAsync.when(
+      body: Column(children: [
+        if (MyceliumService.instance.lastStartError != null)
+          Container(
+            width: double.infinity,
+            color: Colors.orange.shade100,
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              MyceliumService.instance.lastStartError!,
+              style: const TextStyle(fontSize: 11, color: Colors.black87),
+            ),
+          ),
+        Expanded(child: conversationsAsync.when(
         data: (conversations) {
           if (conversations.isEmpty) {
             return const Center(
@@ -54,7 +66,8 @@ class ConversationsScreen extends ConsumerWidget {
         },
         loading: () => const Center(child: CircularProgressIndicator()),
         error: (err, _) => Center(child: Text('Error: $err')),
-      ),
+      )),
+      ]),
       floatingActionButton: FloatingActionButton(
         onPressed: () => _showNewMessageDialog(context),
         child: const Icon(Icons.edit),

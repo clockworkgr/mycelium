@@ -6,7 +6,7 @@ Pod::Spec.new do |s|
   s.license      = { :type => 'MIT' }
   s.author       = 'Mycelium'
   s.source       = { :path => '.' }
-  s.platform     = :ios, '15.0'
+  s.platform     = :ios, '15.5'
   s.static_framework = true
 
   s.vendored_libraries = 'Frameworks/libmycelium_ffi.a'
@@ -16,7 +16,7 @@ Pod::Spec.new do |s|
   s.frameworks = 'Security', 'SystemConfiguration'
   s.libraries  = 'c++', 'resolv'
 
-  s.pod_target_xcconfig = {
-    'OTHER_LDFLAGS' => '-force_load "${PODS_ROOT}/../MyceliumFFI/Frameworks/libmycelium_ffi.a"',
-  }
+  # Do NOT use -force_load here — it pulls in bundled OpenSSL/SQLCipher
+  # symbols that conflict with the Flutter/Dart engine and crash the VM.
+  # Instead, we keep symbols alive via the exported_symbols file.
 end

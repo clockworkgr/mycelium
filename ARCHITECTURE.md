@@ -1078,7 +1078,7 @@ Connect to `/v1/ws`. JSON-framed messages:
 
 ## 11. mycelium-ffi
 
-**Purpose:** C FFI bridge between Rust and mobile platforms. Exposes 65+ `extern "C"` functions.
+**Purpose:** C FFI bridge between Rust and mobile platforms. Exposes 64 `extern "C"` functions.
 
 ### Architecture
 
@@ -1104,12 +1104,13 @@ thread_local! {
 - **Error reporting:** `mycelium_last_error()` retrieves last error, `mycelium_clear_error()` clears it
 - **Plaintext lifetime:** `MessageInfo.plaintext` pointers valid only until next `mycelium_get_messages()` call on the same thread
 
-### Function Groups (53 functions)
+### Function Groups (64 functions)
 
 | Group | Functions | Description |
 |-------|-----------|-------------|
 | Error | `last_error`, `clear_error` | Thread-local error retrieval |
-| Lifecycle | `node_new`, `node_start`, `node_stop`, `node_id`, `node_free` | Node creation/destruction |
+| Lifecycle | `node_new`, `node_start`, `node_stop`, `node_id`, `node_free`, `node_get_existing`, `set_node_display_name` | Node creation/destruction |
+| Diagnostics | `api_check`, `api_handle_status` | Runtime health checks (API TCP probe, handle state) |
 | Messaging | `send_message`, `get_messages`, `set_message_callback` | Send/receive messages |
 | Conversations | `get_conversations`, `delete_conversation`, `mark_read`, `unread_count`, `total_unread_count` | Conversation management |
 | Contacts | `contact_count`, `get_contacts`, `set_display_name`, `get_display_name` | Contact CRUD |
@@ -1460,7 +1461,7 @@ Same channel names as Android for Dart compatibility:
 - `NSBluetoothAlwaysUsageDescription` / `NSBluetoothPeripheralUsageDescription`
 - `NSLocalNetworkUsageDescription` (for TCP transport)
 - `NSBonjourServices`: `_mycelium._tcp`
-- Minimum deployment target: iOS 15.0
+- Minimum deployment target: iOS 15.5
 
 ---
 

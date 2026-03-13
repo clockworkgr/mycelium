@@ -19,9 +19,22 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Use Command Line Tools SDK when Xcode license is not accepted
-export SDKROOT="${SDKROOT:-/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk}"
-export DEVELOPER_DIR="${DEVELOPER_DIR:-/Library/Developer/CommandLineTools}"
+# iOS builds require the Xcode iOS SDK (not CommandLineTools macOS SDK).
+# Try xcrun first; fall back to manual Xcode path.
+IOS_SDK="$(xcrun --show-sdk-path --sdk iphoneos 2>/dev/null || true)"
+if [[ -z "$IOS_SDK" || ! -d "$IOS_SDK" ]]; then
+    # Fallback: look for Xcode.app directly
+    IOS_SDK="/Applications/Xcode.app/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS.sdk"
+fi
+if [[ ! -d "$IOS_SDK" ]]; then
+    echo "ERROR: iOS SDK not found. Install Xcode with iOS platform support."
+    exit 1
+fi
+export SDKROOT="$IOS_SDK"
+export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+
+# Set minimum iOS deployment target (must match Podfile / Xcode project).
+export IPHONEOS_DEPLOYMENT_TARGET="15.5"
 
 # Ensure rustup-managed toolchain is on PATH (ahead of Homebrew).
 # When Homebrew rustc is on PATH, it won't have cross-compilation targets.

@@ -1,2 +1,7 @@
 #include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"
 #include "Generated.xcconfig"
+
+MYCELIUM_FFI_DIR=$(SRCROOT)/MyceliumFFI/Frameworks
+LIBRARY_SEARCH_PATHS=$(inherited) $(MYCELIUM_FFI_DIR) ${PODS_CONFIGURATION_BUILD_DIR}
+HEADER_SEARCH_PATHS=$(inherited) $(MYCELIUM_FFI_DIR)/include
+OTHER_LDFLAGS=$(inherited) -force_load $(MYCELIUM_FFI_DIR)/libmycelium_ffi.a -lc++ -lresolv -framework Security -framework SystemConfiguration -u _mycelium_last_error -u _mycelium_node_new -u _mycelium_node_start -u _mycelium_node_stop -u _mycelium_node_id -u _mycelium_node_free -u _mycelium_register_ble_transport -u _mycelium_ble_on_peer_discovered -u _mycelium_ble_on_data_received -u _mycelium_ble_dequeue_send -u _mycelium_register_lora_transport -u _mycelium_register_internet_transport -u _mycelium_api_check -u _mycelium_api_handle_status -u _mycelium_clear_error

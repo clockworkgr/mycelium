@@ -65,8 +65,9 @@ class JoinMethodScreen extends StatelessWidget {
       final dataDir = '${appDir.path}/mycelium';
       await MyceliumService.instance.initialize(dataDir, displayName);
       await MyceliumService.instance.start();
-    } catch (e) {
-      debugPrint('Failed to initialize Mycelium: $e');
+    } catch (e, st) {
+      debugPrint('Failed to initialize Mycelium: $e\n$st');
+      MyceliumService.instance.lastStartError = 'Init failed: $e';
     }
 
     onboardingComplete = true;
