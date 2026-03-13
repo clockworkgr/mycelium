@@ -303,7 +303,7 @@
 ### 15.4 Bluetooth Classic SPP transport — PARTIAL (Rust complete)
 
 - [x] **15.4.1** Add `BtClassicTransport` struct implementing `Transport` trait
-- [ ] **15.4.2** Add Kotlin `BtClassicService.kt`: SPP RFCOMM socket connection
+- [x] **15.4.2** Add Kotlin `BtClassicService.kt`: SPP RFCOMM socket connection
 - [x] **15.4.3** Add Dart bridge and FFI functions (FFI complete; Dart bridge requires platform)
 - [x] **15.4.4** MTU: ~2 Mbps, no fragmentation needed (large frames)
 
@@ -359,17 +359,14 @@ Not broken down — will be planned when v0.1 ships.
 | 12 | 14 | 14 | 0 | Onboarding + seed phrase (crypto, beacon, Flutter screens, FFI) |
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
 | 14 | 12 | 11 | 1 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
-| 15 | 14 | 13 | 1 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
+| 15 | 14 | 14 | 0 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
 | 16 | 10 | 4 | 6 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **146** | **142** | **4** | **97% complete** |
+| **Total** | **146** | **143** | **3** | **98% complete** |
 
 ### Remaining Work Breakdown
 
-**Platform Integration (1 task):**
-- BT Classic Kotlin service (1 task: 15.4.2)
-
 **OpenWRT (1 task):**
-- Test on actual router hardware (1 task)
+- Test on actual router hardware (1 task: 14.1.4)
 
 **Protocol Adapters (9 tasks):**
 - Meshtastic adapter crate (5 tasks)
