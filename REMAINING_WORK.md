@@ -316,7 +316,7 @@
 - [x] **16.1.1** Define `TransportPlugin` trait in `mycelium-core`: `name()`, `discover_peers()`, `send()`, `recv()`, `link_quality()`
 - [x] **16.1.2** Add plugin registration in `PluginRegistry` with factory pattern
 - [x] **16.1.3** Add plugin configuration in `NodeConfig`: list of enabled plugins with config
-- [ ] **16.1.4** Document plugin API in `docs/plugin-api.md`
+- [x] **16.1.4** Document plugin API in `docs/plugin-api.md`
 
 ### 16.2 Meshtastic adapter
 
@@ -360,8 +360,8 @@ Not broken down — will be planned when v0.1 ships.
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
 | 14 | 12 | 7 | 5 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
 | 15 | 14 | 4 | 10 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
-| 16 | 10 | 3 | 7 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **146** | **124** | **22** | **85% complete** |
+| 16 | 10 | 4 | 6 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
+| **Total** | **146** | **125** | **21** | **86% complete** |
 
 ### Remaining Work Breakdown
 
@@ -377,9 +377,6 @@ Not broken down — will be planned when v0.1 ships.
 **Protocol Adapters (9 tasks):**
 - Meshtastic adapter crate (5 tasks)
 - Reticulum adapter crate (4 tasks)
-
-**Documentation (1 task):**
-- Plugin API docs (1 task)
 
 **Optional Enhancements (2 tasks):**
 - LoRa adaptive data rate (1 task)

@@ -645,6 +645,7 @@ pub trait TransportPlugin: Transport {
 - **PluginRegistry:** Factory pattern — register `PluginFactory` by name, create instances from config
 - **PluginConfig:** `name`, `enabled`, `settings: HashMap<String, String>`
 - **NodeConfig integration:** `plugins: Vec<PluginConfigEntry>` in TOML config file
+- **Documentation:** See [`docs/plugin-api.md`](docs/plugin-api.md) for the full plugin development guide
 
 ### Kademlia DHT (`dht/`)
 
