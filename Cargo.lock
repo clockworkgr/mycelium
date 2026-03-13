@@ -867,6 +867,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycelium-meshtastic"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "mycelium-core",
+ "mycelium-protocol",
+ "rand 0.8.5",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mycelium-node"
 version = "0.1.0"
 dependencies = [

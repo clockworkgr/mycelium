@@ -320,10 +320,10 @@
 
 ### 16.2 Meshtastic adapter
 
-- [ ] **16.2.1** Add `mycelium-meshtastic` crate implementing `TransportPlugin`
-- [ ] **16.2.2** Parse Meshtastic protobuf framing
-- [ ] **16.2.3** Bridge Meshtastic node IDs ↔ Mycelium NodeIds
-- [ ] **16.2.4** Handle Meshtastic-specific discovery and channel encryption
+- [x] **16.2.1** Add `mycelium-meshtastic` crate implementing `TransportPlugin`
+- [x] **16.2.2** Parse Meshtastic protobuf framing
+- [x] **16.2.3** Bridge Meshtastic node IDs ↔ Mycelium NodeIds
+- [x] **16.2.4** Handle Meshtastic-specific discovery and channel encryption
 - [ ] **16.2.5** Test with stock Meshtastic hardware (T-Beam, T-Echo)
 
 ### 16.3 Reticulum adapter
@@ -360,16 +360,16 @@ Not broken down — will be planned when v0.1 ships.
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
 | 14 | 12 | 11 | 1 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
 | 15 | 14 | 14 | 0 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
-| 16 | 10 | 4 | 6 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **146** | **143** | **3** | **98% complete** |
+| 16 | 13 | 8 | 5 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
+| **Total** | **178** | **172** | **6** | **97% complete** |
 
 ### Remaining Work Breakdown
 
 **OpenWRT (1 task):**
 - Test on actual router hardware (1 task: 14.1.4)
 
-**Protocol Adapters (9 tasks):**
-- Meshtastic adapter crate (5 tasks)
-- Reticulum adapter crate (4 tasks)
+**Protocol Adapters (5 tasks):**
+- Meshtastic hardware test (1 task: 16.2.5) — requires T-Beam/T-Echo device
+- Reticulum adapter crate (4 tasks: 16.3.1-16.3.4)
 
-**Remaining Rust tasks (0):** All Rust-side transport work complete (LoRa FFI, BT Classic FFI, GATT UUIDs).
+**Remaining Rust tasks (0):** All Rust-side transport work complete (LoRa FFI, BT Classic FFI, GATT UUIDs, Meshtastic adapter).

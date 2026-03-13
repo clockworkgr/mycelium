@@ -8,6 +8,7 @@ members = [
     "crates/mycelium-node",
     "crates/mycelium-api",
     "crates/mycelium-ffi",
+    "crates/mycelium-meshtastic",
 ]
 
 [workspace.package]

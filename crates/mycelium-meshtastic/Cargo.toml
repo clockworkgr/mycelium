@@ -1,0 +1,21 @@
+[package]
+name = "mycelium-meshtastic"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Meshtastic protocol adapter for Mycelium mesh network"
+
+[dependencies]
+mycelium-protocol = { path = "../mycelium-protocol" }
+mycelium-core = { path = "../mycelium-core" }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }

@@ -19,14 +19,15 @@
 9. [mycelium-node](#9-mycelium-node)
 10. [mycelium-api](#10-mycelium-api)
 11. [mycelium-ffi](#11-mycelium-ffi)
-12. [Flutter App](#12-flutter-app)
-13. [Android BLE Stack](#13-android-ble-stack)
-14. [Build System](#14-build-system)
-15. [Wire Format Reference](#15-wire-format-reference)
-16. [Cryptographic Architecture](#16-cryptographic-architecture)
-17. [Routing Architecture](#17-routing-architecture)
-18. [Test Coverage](#18-test-coverage)
-19. [Spec Compliance Matrix](#19-spec-compliance-matrix)
+12. [mycelium-meshtastic](#12-mycelium-meshtastic)
+13. [Flutter App](#13-flutter-app)
+14. [Android BLE Stack](#14-android-ble-stack)
+15. [Build System](#15-build-system)
+16. [Wire Format Reference](#16-wire-format-reference)
+17. [Cryptographic Architecture](#17-cryptographic-architecture)
+18. [Routing Architecture](#18-routing-architecture)
+19. [Test Coverage](#19-test-coverage)
+20. [Spec Compliance Matrix](#20-spec-compliance-matrix)
 
 ---
 
@@ -34,7 +35,7 @@
 
 Mycelium is a mobile mesh messaging application that operates without internet or cellular infrastructure. It creates ad-hoc mesh networks using Bluetooth Low Energy on standard smartphones, with end-to-end encryption, delay-tolerant networking, and a Web of Trust identity system.
 
-**Architecture:** Rust core library (7 crates) compiled to a shared library (`libmycelium_ffi.so`) via C FFI, consumed by a Flutter/Dart frontend (47 Dart files, 14 screens) with Kotlin platform code for Android BLE and Wi-Fi Direct. A local REST + WebSocket API server (47 endpoints) enables the Flutter app and future clients to communicate with the node daemon.
+**Architecture:** Rust core library (8 crates) compiled to a shared library (`libmycelium_ffi.so`) via C FFI, consumed by a Flutter/Dart frontend (47 Dart files, 14 screens) with Kotlin platform code for Android BLE and Wi-Fi Direct. A local REST + WebSocket API server (47 endpoints) enables the Flutter app and future clients to communicate with the node daemon.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -145,9 +146,11 @@ mycelium/
 │   │   │   ├── emergency.rs            # /v1/emergency/*
 │   │   │   └── network.rs              # /v1/network/* (diagnostics)
 │   │   └── tests/api_test.rs           # Integration tests (11 tests)
-│   └── mycelium-ffi/                   # C FFI bindings
-│       ├── src/lib.rs                  # 65 extern "C" functions (~2000 lines)
-│       └── include/mycelium.h          # C header
+│   ├── mycelium-ffi/                   # C FFI bindings
+│   │   ├── src/lib.rs                  # 65 extern "C" functions (~2000 lines)
+│   │   └── include/mycelium.h          # C header
+│   └── mycelium-meshtastic/            # Meshtastic protocol adapter
+│       └── src/lib.rs                  # MeshtasticTransport, NodeIdBridge, ChannelKey (12 tests)
 └── flutter/                            # Flutter mobile app (47 Dart files)
     ├── pubspec.yaml                    # Dependencies
     ├── ffigen.yaml                     # FFI codegen config
@@ -236,6 +239,9 @@ mycelium-node      (tracing-subscriber, anyhow, toml)
        ↑            ↑
 mycelium-ffi       mycelium-api   (axum, tower-http, hex)
 (cdylib+staticlib)  (REST + WebSocket API server)
+
+mycelium-meshtastic  (depends on protocol + core; sha2, aes-gcm, rand)
+(Meshtastic protocol adapter plugin)
 ```
 
 All crates share workspace-level dependency versions. Key version constraints:
@@ -1118,7 +1124,44 @@ Defines:
 
 ---
 
-## 12. Flutter App
+## 12. mycelium-meshtastic
+
+**Purpose:** Protocol adapter bridging Meshtastic LoRa mesh devices (T-Beam, T-Echo, etc.) into the Mycelium network. Meshtastic nodes appear as Mycelium peers with translated identities and messages.
+
+**Dependencies:** `mycelium-protocol`, `mycelium-core`, `sha2`, `aes-gcm`, `rand`, `tokio`, `async-trait`, `tracing`
+
+### Key Types
+
+| Type | Description |
+|------|-------------|
+| `MeshtasticPacket` | Simplified binary packet with `[4B magic][2B length][15B header][payload]` framing |
+| `NodeIdBridge` | Bidirectional mapping: Meshtastic 4-byte node numbers ↔ Mycelium 32-byte NodeIds via `SHA-256("meshtastic:" \|\| node_num_le)` |
+| `ChannelKey` | AES-256 key derived from channel passphrase via SHA-256 (default: "LongFast") |
+| `MeshtasticTransport` | Implements `Transport` + `TransportPlugin` traits; MTU 237, outbox polling pattern |
+| `MeshtasticConfig` | Channel name, local node number, hop limit (default: 3) |
+
+### Protocol Differences
+
+| Feature | Meshtastic | Mycelium |
+|---------|-----------|----------|
+| Node ID | 4-byte number | 32-byte Ed25519 pubkey |
+| Encryption | AES-256-CTR with PSK | X3DH + Double Ratchet |
+| Routing | Flooding with hop limit | AODV reactive routing |
+| Frame format | Protobuf | Custom binary codec |
+
+### Tests (12 tests)
+
+- Packet serialization roundtrip, error cases (too short, bad magic)
+- Node ID bridge determinism, uniqueness, reverse lookup
+- Channel key derivation consistency
+- Transport lifecycle (start/stop/peer discovery)
+- Send with outbox dequeue verification
+- Plugin interface configuration
+- Serial data parsing
+
+---
+
+## 13. Flutter App
 
 **Purpose:** Android mobile UI with 47 Dart files and 14 screens. Uses Flutter with Riverpod for state management, GoRouter for navigation, REST API client for data operations, and WebSocket for real-time events.
 
@@ -1206,7 +1249,7 @@ shared_preferences: ^2.3.3          # Persistent settings
 
 ---
 
-## 13. Android BLE Stack
+## 14. Android BLE Stack
 
 **Purpose:** Full dual-role BLE implementation (GATT server + client) in Kotlin. Handles peer discovery, data exchange, fragmentation, and identity mapping.
 
@@ -1302,7 +1345,7 @@ private val writeQueue = ConcurrentLinkedQueue<WriteOperation>()
 
 ---
 
-## 14. Build System
+## 15. Build System
 
 ### Workspace Build
 
@@ -1346,7 +1389,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 15. Wire Format Reference
+## 16. Wire Format Reference
 
 ### Envelope Layout (106-byte header)
 
@@ -1384,7 +1427,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 16. Cryptographic Architecture
+## 17. Cryptographic Architecture
 
 ### Key Hierarchy
 
@@ -1427,7 +1470,7 @@ Group Messaging (Sender Keys):
 
 ---
 
-## 17. Routing Architecture
+## 18. Routing Architecture
 
 ### Decision Flow
 
@@ -1470,7 +1513,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 18. Test Coverage
+## 19. Test Coverage
 
 ### By Crate
 
@@ -1483,7 +1526,8 @@ BLE scan finds device with Mycelium service UUID
 | mycelium-node | 4 test files + 3 modules | 43 | Lifecycle (8), pipeline (10), persistence (11), beacon (9), battery (2), rate limiter (4) |
 | mycelium-api | 1 test file | 11 | REST endpoints, JSON responses, error handling, contact CRUD, 404s |
 | mycelium-ffi | — | 0 | No unit tests (integration via Flutter) |
-| **Total** | | **186** | |
+| mycelium-meshtastic | 1 module | 12 | Packet roundtrip (3), node ID bridge (3), channel keys (2), transport lifecycle (1), send (1), plugin (1), serial (1) |
+| **Total** | | **235** | |
 
 ### Integration Test Highlights
 
@@ -1495,7 +1539,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 19. Spec Compliance Matrix
+## 20. Spec Compliance Matrix
 
 | Spec Section | Feature | Status | Notes |
 |-------------|---------|--------|-------|
