@@ -1,7 +1,7 @@
 # Mycelium Architecture Document
 
 **Version:** 0.1.0
-**Last Updated:** 2026-03-11
+**Last Updated:** 2026-03-13
 **Spec Reference:** `MYCELIUM_SPEC.md` v0.1-draft
 
 ---
@@ -23,12 +23,13 @@
 13. [mycelium-reticulum](#13-mycelium-reticulum)
 14. [Flutter App](#14-flutter-app)
 15. [Android BLE Stack](#15-android-ble-stack)
-16. [Build System](#16-build-system)
-17. [Wire Format Reference](#17-wire-format-reference)
-18. [Cryptographic Architecture](#18-cryptographic-architecture)
-19. [Routing Architecture](#19-routing-architecture)
-20. [Test Coverage](#20-test-coverage)
-21. [Spec Compliance Matrix](#21-spec-compliance-matrix)
+16. [iOS BLE Stack](#16-ios-ble-stack)
+17. [Build System](#17-build-system)
+18. [Wire Format Reference](#18-wire-format-reference)
+19. [Cryptographic Architecture](#19-cryptographic-architecture)
+20. [Routing Architecture](#20-routing-architecture)
+21. [Test Coverage](#21-test-coverage)
+22. [Spec Compliance Matrix](#22-spec-compliance-matrix)
 
 ---
 
@@ -213,14 +214,22 @@ mycelium/
     │           ├── seed_phrase_screen.dart
     │           ├── qr_scanner_screen.dart
     │           └── verify_screen.dart    # Session verification
-    └── android/
-        └── app/src/main/
-            ├── AndroidManifest.xml       # BLE + Wi-Fi + camera permissions
-            ├── kotlin/.../
-            │   ├── MainActivity.kt       # Platform channels + battery bridge
-            │   ├── BleService.kt         # Full BLE stack (~600 lines)
-            │   └── WifiDirectService.kt  # Wi-Fi Direct P2P + TCP sockets
-            └── build.gradle.kts          # Rust build integration
+    ├── android/
+    │   └── app/src/main/
+    │       ├── AndroidManifest.xml       # BLE + Wi-Fi + camera permissions
+    │       ├── kotlin/.../
+    │       │   ├── MainActivity.kt       # Platform channels + battery bridge
+    │       │   ├── BleService.kt         # Full BLE stack (~600 lines)
+    │       │   └── WifiDirectService.kt  # Wi-Fi Direct P2P + TCP sockets
+    │       └── build.gradle.kts          # Rust build integration
+    └── ios/
+        ├── Runner/
+        │   ├── AppDelegate.swift         # Platform channels (BLE, LoRa, daemon)
+        │   ├── BleService.swift          # CoreBluetooth dual-role GATT (~650 lines)
+        │   ├── LoraService.swift         # CoreBluetooth GATT client for LoRa module (~250 lines)
+        │   └── Info.plist                # BLE background modes, permissions
+        └── MyceliumFFI/                  # CocoaPods vendored Rust static lib
+            └── Frameworks/               # libmycelium_ffi.a + mycelium.h
 ```
 
 ---
@@ -1246,8 +1255,9 @@ main.dart → App (GoRouter with 6-tab indexed shell + onboarding redirect)
 - Events: `WsMessageEvent`, `WsReceiptEvent`, `WsPeerEvent`, `WsNetworkEvent`
 - Auto-reconnect with 2-second exponential backoff
 
-**NotificationService** (Android local notifications):
-- High-importance channel with sound/vibration
+**NotificationService** (cross-platform local notifications):
+- Android: High-importance channel with sound/vibration
+- iOS: `DarwinInitializationSettings` with alert/badge/sound permissions
 - Active chat suppression (no notifications when chat is open)
 - Tap handler navigates to chat screen
 
@@ -1393,7 +1403,68 @@ private val writeQueue = ConcurrentLinkedQueue<WriteOperation>()
 
 ---
 
-## 16. Build System
+## 16. iOS BLE Stack
+
+**Purpose:** Full dual-role BLE implementation in Swift using CoreBluetooth. Mirrors the Android Kotlin stack with iOS-specific adaptations (background restoration, no foreground service).
+
+### Architecture
+
+- **`BleService.swift`** (~650 lines): CoreBluetooth dual-role GATT (peripheral + central) with background restoration
+- **`LoraService.swift`** (~250 lines): CoreBluetooth GATT client for external LoRa radio modules
+- **`AppDelegate.swift`** (~250 lines): Platform channel handlers for BLE, LoRa, and daemon lifecycle
+
+### Differences from Android
+
+| Feature | Android | iOS |
+|---------|---------|-----|
+| Foreground service | `MyceliumDaemonService` | BLE background modes (no service needed) |
+| Wi-Fi Direct | `WifiP2pManager` | Not available — skipped |
+| Scan cycling | Required (30s kill) | Not required (but used for reconnection) |
+| MTU negotiation | `gatt.requestMtu(512)` | `maximumWriteValueLength(for:)` |
+| Background | Foreground service | `bluetooth-central` + `bluetooth-peripheral` UIBackgroundModes |
+| State restoration | N/A | `CBCentralManagerOptionRestoreIdentifierKey` |
+| Library loading | `DynamicLibrary.open('libmycelium_ffi.so')` | `DynamicLibrary.process()` (statically linked) |
+
+### Background Restoration
+
+iOS may kill backgrounded apps. CoreBluetooth state restoration ensures BLE survives:
+
+```swift
+centralManager = CBCentralManager(
+    delegate: self, queue: nil,
+    options: [CBCentralManagerOptionRestoreIdentifierKey: "com.mycelium.ble.central"]
+)
+```
+
+`willRestoreState` delegates recover connected peripherals after app relaunch.
+
+### FFI Integration
+
+The Rust static library (`libmycelium_ffi.a`) is vendored via a local CocoaPods podspec (`flutter/ios/MyceliumFFI/MyceliumFFI.podspec`). `-force_load` prevents the linker from stripping FFI symbols only called at runtime via `DynamicLibrary.process()`.
+
+### Platform Channels
+
+Same channel names as Android for Dart compatibility:
+
+| Channel | Type | Methods |
+|---------|------|---------|
+| `com.mycelium.daemon` | Method | `startDaemon`, `stopDaemon`, `isDaemonRunning` (all no-op on iOS) |
+| `com.mycelium.ble` | Method | `start(nodeId)`, `stop`, `sendData(peerId, data)` |
+| `com.mycelium.ble/events` | Event | `peerDiscovered`, `peerLost`, `dataReceived` |
+| `com.mycelium.lora` | Method | `start`, `stop`, `sendData`, `readConfig`, `writeConfig` |
+| `com.mycelium.lora/events` | Event | `moduleConnected`, `moduleDisconnected`, `dataReceived`, `txSuccess`, `txFailure` |
+
+### iOS Permissions (Info.plist)
+
+- `UIBackgroundModes`: `bluetooth-central`, `bluetooth-peripheral`
+- `NSBluetoothAlwaysUsageDescription` / `NSBluetoothPeripheralUsageDescription`
+- `NSLocalNetworkUsageDescription` (for TCP transport)
+- `NSBonjourServices`: `_mycelium._tcp`
+- Minimum deployment target: iOS 15.0
+
+---
+
+## 17. Build System
 
 ### Workspace Build
 
@@ -1437,7 +1508,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 17. Wire Format Reference
+## 18. Wire Format Reference
 
 ### Envelope Layout (106-byte header)
 
@@ -1475,7 +1546,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 18. Cryptographic Architecture
+## 19. Cryptographic Architecture
 
 ### Key Hierarchy
 
@@ -1518,7 +1589,7 @@ Group Messaging (Sender Keys):
 
 ---
 
-## 19. Routing Architecture
+## 20. Routing Architecture
 
 ### Decision Flow
 
@@ -1561,7 +1632,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 20. Test Coverage
+## 21. Test Coverage
 
 ### By Crate
 
@@ -1588,7 +1659,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 21. Spec Compliance Matrix
+## 22. Spec Compliance Matrix
 
 | Spec Section | Feature | Status | Notes |
 |-------------|---------|--------|-------|
@@ -1599,7 +1670,7 @@ BLE scan finds device with Mycelium service UUID
 | §3.1 LoRa | Transport | **Partial** | Rust `LoraTransport` complete (config, duty cycle, 7 tests). Platform bridges not started. |
 | §3.1 Internet Tunnel | Transport | **Partial** | Rust `InternetTransport` + DHT + config. FFI registration (4 functions) + API status + Flutter settings UI. TCP works peer-to-peer. |
 | §3.2 Transport Handoff | Seamless migration | **Partial** | TransportManager sends via first available, no session migration |
-| §3.3 iOS Strategy | BLE relay | **Not started** | Deferred to v0.2 |
+| §3.3 iOS Strategy | BLE relay | **Implemented** | Dual-role CoreBluetooth GATT, background restoration, LoRa BLE bridge |
 | §4.1 AODV Routing | Reactive routing | **Implemented** | RREQ/RREP/RERR, route table, expiry, supernode preference |
 | §4.1 DTN Spray-and-Wait | Store-and-forward | **Implemented** | Binary spray, per-identity quotas, eviction |
 | §4.2 Geographic Hash | Overlay routing | **Not started** | Deferred to v0.4 |
@@ -1634,8 +1705,8 @@ BLE scan finds device with Mycelium service UUID
 3. **API Serialization:** JSON (`serde_json`) instead of Protobuf. Simpler debugging, adequate performance for local API.
 4. **Group Crypto:** Simplified sender keys instead of full MLS tree ratchet (spec §6.2). Adequate for groups <20 members.
 5. **Onboarding:** Both seed phrase groups AND QR code scanning implemented (spec §15 only specified seed phrases).
-6. **Transport:** BLE and Wi-Fi Direct both implemented with platform bridges. LoRa, BT Classic, and Internet have Rust transports but no platform integration yet. Wi-Fi Direct uses TCP sockets over WifiP2pManager groups (ADR-003).
+6. **Transport:** BLE implemented with platform bridges on both Android and iOS. Wi-Fi Direct on Android only (not available on iOS). LoRa BLE bridge on both platforms. BT Classic and Internet have Rust transports but no platform integration yet. Wi-Fi Direct uses TCP sockets over WifiP2pManager groups (ADR-003).
 
 ---
 
-*This document reflects the codebase as of 2026-03-11. Update when significant architectural changes are made.*
+*This document reflects the codebase as of 2026-03-13. Update when significant architectural changes are made.*

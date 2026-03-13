@@ -44,6 +44,19 @@ flutter doctor
    rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
    ```
 
+### iOS Development
+
+1. Install Xcode (v15+ recommended) from the Mac App Store
+2. Accept the Xcode license: `sudo xcodebuild -license accept`
+3. Install the iOS Rust target:
+   ```bash
+   rustup target add aarch64-apple-ios
+   ```
+4. Install CocoaPods:
+   ```bash
+   gem install cocoapods
+   ```
+
 ### macOS Notes
 
 If Xcode license is not accepted (or Xcode not installed), use Command Line Tools:
@@ -91,6 +104,25 @@ The script auto-generates `.cargo/config.toml` with NDK linker paths. This file 
 3. Sets `CC_*`, `AR_*`, `RANLIB_*` env vars for OpenSSL cross-compilation
 4. Builds `mycelium-ffi` as a shared library for each target
 5. Copies `.so` files to `android-libs/<abi>/`
+
+### iOS Cross-Compilation
+
+```bash
+make ios               # Debug build for aarch64-apple-ios
+make ios-release       # Release build for aarch64-apple-ios
+./scripts/build-ios.sh # Direct invocation (accepts --release)
+```
+
+**What the script does:**
+1. Ensures `aarch64-apple-ios` target is installed via rustup
+2. Builds `mycelium-ffi` as a static library (`.a`)
+3. Copies `libmycelium_ffi.a` to `ios-libs/` and `flutter/ios/MyceliumFFI/Frameworks/`
+4. Copies `mycelium.h` header alongside the library
+
+**After building, install CocoaPods:**
+```bash
+cd flutter/ios && pod install
+```
 
 ### Flutter App
 
@@ -149,10 +181,18 @@ cd flutter && flutter test
 
 ### On-Device Testing
 
+**Android:**
 1. Build and install: `cd flutter && flutter run`
 2. Two phones needed for BLE messaging tests
 3. Both phones must have Bluetooth and Location enabled
 4. Grant all permissions when prompted
+
+**iOS:**
+1. Build Rust library: `make ios`
+2. Install CocoaPods: `cd flutter/ios && pod install`
+3. Build and install: `cd flutter && flutter run` (physical device required — BLE doesn't work in Simulator)
+4. Accept Bluetooth permission prompt on first launch
+5. Cross-platform testing: iPad + Android phone discover each other over BLE
 
 ---
 
@@ -177,7 +217,8 @@ mycelium/
 │   │   ├── service/          # ApiClient, WsService, MyceliumService, BleManager, etc.
 │   │   ├── widgets/          # Reusable UI components (6 widgets)
 │   │   └── router/           # GoRouter navigation (6-tab shell + onboarding)
-│   └── android/              # Android platform code (Kotlin BLE + Wi-Fi Direct)
+│   ├── android/              # Android platform code (Kotlin BLE + Wi-Fi Direct)
+│   └── ios/                  # iOS platform code (Swift BLE + LoRa)
 ├── scripts/                  # Build and utility scripts
 ├── docs/adr/                 # Architecture Decision Records
 ├── ARCHITECTURE.md           # Comprehensive codebase documentation

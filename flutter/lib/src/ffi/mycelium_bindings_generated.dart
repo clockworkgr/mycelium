@@ -1018,6 +1018,298 @@ class MyceliumBindings {
       'mycelium_internet_peer_count');
   late final _mycelium_internet_peer_count = _mycelium_internet_peer_countPtr
       .asFunction<int Function(ffi.Pointer<MyceliumNode>)>();
+
+  /// Register LoRa transport with default config. Returns 0 on success.
+  int mycelium_register_lora_transport(
+    ffi.Pointer<MyceliumNode> handle,
+  ) {
+    return _mycelium_register_lora_transport(
+      handle,
+    );
+  }
+
+  late final _mycelium_register_lora_transportPtr = _lookup<
+          ffi.NativeFunction<ffi.Int32 Function(ffi.Pointer<MyceliumNode>)>>(
+      'mycelium_register_lora_transport');
+  late final _mycelium_register_lora_transport =
+      _mycelium_register_lora_transportPtr
+          .asFunction<int Function(ffi.Pointer<MyceliumNode>)>();
+
+  /// Register LoRa transport with custom config. Returns 0 on success, -1 on invalid args.
+  int mycelium_register_lora_transport_configured(
+    ffi.Pointer<MyceliumNode> handle,
+    double frequency_mhz,
+    int spreading_factor,
+    int bandwidth_khz,
+    int tx_power_dbm,
+    double duty_cycle_limit,
+    bool adaptive_data_rate,
+  ) {
+    return _mycelium_register_lora_transport_configured(
+      handle,
+      frequency_mhz,
+      spreading_factor,
+      bandwidth_khz,
+      tx_power_dbm,
+      duty_cycle_limit,
+      adaptive_data_rate,
+    );
+  }
+
+  late final _mycelium_register_lora_transport_configuredPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Float,
+              ffi.Uint8,
+              ffi.Uint16,
+              ffi.Int8,
+              ffi.Float,
+              ffi.Bool)>>('mycelium_register_lora_transport_configured');
+  late final _mycelium_register_lora_transport_configured =
+      _mycelium_register_lora_transport_configuredPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, double, int, int, int, double,
+              bool)>();
+
+  int mycelium_lora_on_peer_discovered(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+  ) {
+    return _mycelium_lora_on_peer_discovered(
+      handle,
+      peer_id,
+    );
+  }
+
+  late final _mycelium_lora_on_peer_discoveredPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>)>>('mycelium_lora_on_peer_discovered');
+  late final _mycelium_lora_on_peer_discovered =
+      _mycelium_lora_on_peer_discoveredPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+
+  int mycelium_lora_on_peer_lost(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+  ) {
+    return _mycelium_lora_on_peer_lost(
+      handle,
+      peer_id,
+    );
+  }
+
+  late final _mycelium_lora_on_peer_lostPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>)>>('mycelium_lora_on_peer_lost');
+  late final _mycelium_lora_on_peer_lost =
+      _mycelium_lora_on_peer_lostPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+
+  int mycelium_lora_on_data_received(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Uint8> data,
+    int data_len,
+  ) {
+    return _mycelium_lora_on_data_received(
+      handle,
+      peer_id,
+      data,
+      data_len,
+    );
+  }
+
+  late final _mycelium_lora_on_data_receivedPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Uint32)>>('mycelium_lora_on_data_received');
+  late final _mycelium_lora_on_data_received =
+      _mycelium_lora_on_data_receivedPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>, int)>();
+
+  /// Dequeue one pending LoRa send. Returns 1 if dequeued, 0 if empty, -1 on error.
+  int mycelium_lora_dequeue_send(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> out_peer_id,
+    ffi.Pointer<ffi.Uint8> out_data,
+    int data_capacity,
+    ffi.Pointer<ffi.Uint32> out_data_len,
+  ) {
+    return _mycelium_lora_dequeue_send(
+      handle,
+      out_peer_id,
+      out_data,
+      data_capacity,
+      out_data_len,
+    );
+  }
+
+  late final _mycelium_lora_dequeue_sendPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Uint32,
+              ffi.Pointer<ffi.Uint32>)>>('mycelium_lora_dequeue_send');
+  late final _mycelium_lora_dequeue_send =
+      _mycelium_lora_dequeue_sendPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>, int, ffi.Pointer<ffi.Uint32>)>();
+
+  /// Report successful LoRa transmission for ADR negotiation.
+  int mycelium_lora_report_tx_success(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+  ) {
+    return _mycelium_lora_report_tx_success(
+      handle,
+      peer_id,
+    );
+  }
+
+  late final _mycelium_lora_report_tx_successPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>)>>('mycelium_lora_report_tx_success');
+  late final _mycelium_lora_report_tx_success =
+      _mycelium_lora_report_tx_successPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+
+  /// Report failed LoRa transmission for ADR negotiation.
+  int mycelium_lora_report_tx_failure(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+  ) {
+    return _mycelium_lora_report_tx_failure(
+      handle,
+      peer_id,
+    );
+  }
+
+  late final _mycelium_lora_report_tx_failurePtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>)>>('mycelium_lora_report_tx_failure');
+  late final _mycelium_lora_report_tx_failure =
+      _mycelium_lora_report_tx_failurePtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+
+  /// Register Bluetooth Classic SPP transport. Returns 0 on success.
+  int mycelium_register_bt_classic_transport(
+    ffi.Pointer<MyceliumNode> handle,
+  ) {
+    return _mycelium_register_bt_classic_transport(
+      handle,
+    );
+  }
+
+  late final _mycelium_register_bt_classic_transportPtr = _lookup<
+          ffi.NativeFunction<ffi.Int32 Function(ffi.Pointer<MyceliumNode>)>>(
+      'mycelium_register_bt_classic_transport');
+  late final _mycelium_register_bt_classic_transport =
+      _mycelium_register_bt_classic_transportPtr
+          .asFunction<int Function(ffi.Pointer<MyceliumNode>)>();
+
+  int mycelium_bt_classic_on_peer_connected(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+  ) {
+    return _mycelium_bt_classic_on_peer_connected(
+      handle,
+      peer_id,
+    );
+  }
+
+  late final _mycelium_bt_classic_on_peer_connectedPtr = _lookup<
+          ffi.NativeFunction<
+              ffi.Int32 Function(
+                  ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>>(
+      'mycelium_bt_classic_on_peer_connected');
+  late final _mycelium_bt_classic_on_peer_connected =
+      _mycelium_bt_classic_on_peer_connectedPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+
+  int mycelium_bt_classic_on_peer_disconnected(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+  ) {
+    return _mycelium_bt_classic_on_peer_disconnected(
+      handle,
+      peer_id,
+    );
+  }
+
+  late final _mycelium_bt_classic_on_peer_disconnectedPtr = _lookup<
+          ffi.NativeFunction<
+              ffi.Int32 Function(
+                  ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>>(
+      'mycelium_bt_classic_on_peer_disconnected');
+  late final _mycelium_bt_classic_on_peer_disconnected =
+      _mycelium_bt_classic_on_peer_disconnectedPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+
+  int mycelium_bt_classic_on_data_received(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Uint8> data,
+    int data_len,
+  ) {
+    return _mycelium_bt_classic_on_data_received(
+      handle,
+      peer_id,
+      data,
+      data_len,
+    );
+  }
+
+  late final _mycelium_bt_classic_on_data_receivedPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Uint32)>>('mycelium_bt_classic_on_data_received');
+  late final _mycelium_bt_classic_on_data_received =
+      _mycelium_bt_classic_on_data_receivedPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>, int)>();
+
+  /// Dequeue one pending BT Classic send. Returns 1 if dequeued, 0 if empty, -1 on error.
+  int mycelium_bt_classic_dequeue_send(
+    ffi.Pointer<MyceliumNode> handle,
+    ffi.Pointer<ffi.Uint8> out_peer_id,
+    ffi.Pointer<ffi.Uint8> out_data,
+    int data_capacity,
+    ffi.Pointer<ffi.Uint32> out_data_len,
+  ) {
+    return _mycelium_bt_classic_dequeue_send(
+      handle,
+      out_peer_id,
+      out_data,
+      data_capacity,
+      out_data_len,
+    );
+  }
+
+  late final _mycelium_bt_classic_dequeue_sendPtr = _lookup<
+      ffi.NativeFunction<
+          ffi.Int32 Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>,
+              ffi.Uint32,
+              ffi.Pointer<ffi.Uint32>)>>('mycelium_bt_classic_dequeue_send');
+  late final _mycelium_bt_classic_dequeue_send =
+      _mycelium_bt_classic_dequeue_sendPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Uint8>, int, ffi.Pointer<ffi.Uint32>)>();
 }
 
 final class MyceliumNode extends ffi.Opaque {}

@@ -45,5 +45,20 @@
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>bluetooth-central</string>
+		<string>bluetooth-peripheral</string>
+	</array>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Mycelium uses Bluetooth to discover nearby mesh peers and exchange messages.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>Mycelium advertises as a mesh node so nearby peers can discover you.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Mycelium uses the local network for TCP mesh transport.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_mycelium._tcp</string>
+	</array>
 </dict>
 </plist>

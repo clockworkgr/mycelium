@@ -204,11 +204,11 @@ Trust:     BFS with exponential decay (1.0, 0.5, 0.25, 0.125 over 4 hops)
 
 | Transport | MTU | Throughput | Range | Status |
 |-----------|-----|------------|-------|--------|
-| BLE | 512 B | ~100 kbps | 10-30m | Full (Android) |
-| Wi-Fi Direct | 65 KB | ~50 Mbps | 50-200m | Full (Android) |
-| LoRa | 51-222 B | ~1-37 kbps | 1-15 km | Rust only |
+| BLE | 512 B | ~100 kbps | 10-30m | Full (Android + iOS) |
+| Wi-Fi Direct | 65 KB | ~50 Mbps | 50-200m | Full (Android only) |
+| LoRa | 51-222 B | ~1-37 kbps | 1-15 km | Rust + BLE bridge (Android + iOS) |
 | BT Classic | 16 KB | ~2 Mbps | 10-100m | Rust only |
-| Internet | 65 KB | varies | global | Rust only |
+| Internet | 65 KB | varies | global | Rust + FFI |
 
 The `TransportPlugin` trait allows third-party transports (e.g., Meshtastic, Reticulum) to integrate as plugins.
 

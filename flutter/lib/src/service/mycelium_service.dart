@@ -204,6 +204,8 @@ class MyceliumService {
   }
 
   Future<void> _startWifiDirect() async {
+    // Wi-Fi Direct is only available on Android
+    if (defaultTargetPlatform != TargetPlatform.android) return;
     if (_handle == null) return; // No Wi-Fi Direct without FFI handle
     try {
       bindings.mycelium_register_wifi_direct_transport(_handle!);

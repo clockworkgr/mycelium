@@ -240,13 +240,15 @@ mycelium-ffi  mycelium-api (depends on all above; axum, tower-http, hex)
   - WebSocket: `/v1/ws` with 6 event types + protocol subscriptions
   - Default bind: `127.0.0.1:9735`
 - Flutter app: 47 Dart files, 14 screens, REST API + WebSocket as primary data interface
-  - BLE + Wi-Fi Direct transports working between phones
+  - Android: BLE + Wi-Fi Direct transports working between phones
+  - iOS: BLE transport with CoreBluetooth dual-role GATT, LoRa BLE bridge, background restoration
   - Onboarding flow, groups, channels, emergency broadcasts, debug panel
-  - Notifications with active chat suppression
+  - Notifications with active chat suppression (Android + iOS)
 - AODV routing with supernode route preference, multi-hop tested (3-4 node mock tests)
 - DTN spray-and-wait with 72h TTL, L=8 spray copies
 - Delivery receipts working end-to-end (Rust → WS push → Flutter UI)
-- LoRa, BT Classic transports: Rust implementations complete, platform bridges not started
+- LoRa: Rust transport complete, BLE bridge on Android + iOS, platform LoRa service on both
+- BT Classic: Rust transport complete, platform bridges not started
 - TransportPlugin API: trait + registry + config complete, no adapters yet
 - Supernode mode: `--supernode` CLI flag, 2GB DTN, faster beacons, prekey cache API
 - Next: External radio platform bridges, OpenWRT packaging, protocol adapters (see REMAINING_WORK.md)

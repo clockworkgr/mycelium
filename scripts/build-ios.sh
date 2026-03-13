@@ -75,12 +75,18 @@ if cargo build $BUILD_FLAGS --target "$TARGET" 2>&1; then
     cp "$PROJECT_ROOT/crates/mycelium-ffi/include/mycelium.h" "$HEADER_DIR/"
     echo "  -> $HEADER_DIR/mycelium.h"
 
+    # Copy to CocoaPods pod directory for Flutter integration
+    POD_DIR="$PROJECT_ROOT/flutter/ios/MyceliumFFI/Frameworks"
+    mkdir -p "$POD_DIR/include"
+    cp "$PROJECT_ROOT/target/$TARGET/$PROFILE_DIR/libmycelium_ffi.a" "$POD_DIR/"
+    echo "  -> $POD_DIR/libmycelium_ffi.a"
+    cp "$PROJECT_ROOT/crates/mycelium-ffi/include/mycelium.h" "$POD_DIR/include/"
+    echo "  -> $POD_DIR/include/mycelium.h"
+
     echo ""
     echo "Build successful."
     echo "Output: $OUT_DIR/"
-    echo ""
-    echo "To use in Xcode/CocoaPods, link libmycelium_ffi.a and add"
-    echo "the include/ directory to your header search paths."
+    echo "CocoaPods: $POD_DIR/"
 else
     echo "  FAILED: $TARGET"
     exit 1

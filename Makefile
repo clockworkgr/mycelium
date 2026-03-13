@@ -1,4 +1,5 @@
 .PHONY: build build-release test lint clean android android-release \
+       ios ios-release \
        openwrt openwrt-release \
        flutter-get flutter-gen flutter-analyze flutter-apk flutter-run \
        check help
@@ -32,6 +33,14 @@ android:
 
 android-release:
 	./scripts/build-android.sh --release
+
+# --- iOS Cross-Compilation ---
+
+ios:
+	./scripts/build-ios.sh
+
+ios-release:
+	./scripts/build-ios.sh --release
 
 # --- OpenWRT Cross-Compilation ---
 
@@ -85,6 +94,10 @@ help:
 	@echo "  Android:"
 	@echo "    android          Cross-compile FFI for Android (debug)"
 	@echo "    android-release  Cross-compile FFI for Android (release)"
+	@echo ""
+	@echo "  iOS:"
+	@echo "    ios              Cross-compile FFI for iOS (debug)"
+	@echo "    ios-release      Cross-compile FFI for iOS (release)"
 	@echo ""
 	@echo "  OpenWRT:"
 	@echo "    openwrt          Cross-compile node for OpenWRT (debug)"

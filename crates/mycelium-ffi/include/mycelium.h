@@ -321,6 +321,75 @@ int32_t mycelium_internet_connect_to(
 /** Get connected Internet peer count. Returns count >= 0, -1 null, -2 not registered. */
 int32_t mycelium_internet_peer_count(MyceliumNode *handle);
 
+/* --- LoRa Transport --- */
+
+/** Register LoRa transport with default config. Returns 0 on success. */
+int32_t mycelium_register_lora_transport(MyceliumNode *handle);
+
+/** Register LoRa transport with custom config. Returns 0 on success, -1 on invalid args. */
+int32_t mycelium_register_lora_transport_configured(
+    MyceliumNode *handle,
+    float frequency_mhz,
+    uint8_t spreading_factor,
+    uint16_t bandwidth_khz,
+    int8_t tx_power_dbm,
+    float duty_cycle_limit,
+    bool adaptive_data_rate
+);
+
+/* --- LoRa Transport Event Injection (Platform → Rust) --- */
+
+int32_t mycelium_lora_on_peer_discovered(MyceliumNode *handle, const uint8_t peer_id[32]);
+int32_t mycelium_lora_on_peer_lost(MyceliumNode *handle, const uint8_t peer_id[32]);
+int32_t mycelium_lora_on_data_received(
+    MyceliumNode *handle,
+    const uint8_t peer_id[32],
+    const uint8_t *data, uint32_t data_len
+);
+
+/* --- LoRa Outbox (Rust → Platform polling) --- */
+
+/** Dequeue one pending LoRa send. Returns 1 if dequeued, 0 if empty, -1 on error. */
+int32_t mycelium_lora_dequeue_send(
+    MyceliumNode *handle,
+    uint8_t out_peer_id[32],
+    uint8_t *out_data, uint32_t data_capacity,
+    uint32_t *out_data_len
+);
+
+/* --- LoRa ADR Feedback --- */
+
+/** Report successful LoRa transmission for ADR negotiation. */
+int32_t mycelium_lora_report_tx_success(MyceliumNode *handle, const uint8_t peer_id[32]);
+
+/** Report failed LoRa transmission for ADR negotiation. */
+int32_t mycelium_lora_report_tx_failure(MyceliumNode *handle, const uint8_t peer_id[32]);
+
+/* --- BT Classic Transport --- */
+
+/** Register Bluetooth Classic SPP transport. Returns 0 on success. */
+int32_t mycelium_register_bt_classic_transport(MyceliumNode *handle);
+
+/* --- BT Classic Event Injection (Platform → Rust) --- */
+
+int32_t mycelium_bt_classic_on_peer_connected(MyceliumNode *handle, const uint8_t peer_id[32]);
+int32_t mycelium_bt_classic_on_peer_disconnected(MyceliumNode *handle, const uint8_t peer_id[32]);
+int32_t mycelium_bt_classic_on_data_received(
+    MyceliumNode *handle,
+    const uint8_t peer_id[32],
+    const uint8_t *data, uint32_t data_len
+);
+
+/* --- BT Classic Outbox (Rust → Platform polling) --- */
+
+/** Dequeue one pending BT Classic send. Returns 1 if dequeued, 0 if empty, -1 on error. */
+int32_t mycelium_bt_classic_dequeue_send(
+    MyceliumNode *handle,
+    uint8_t out_peer_id[32],
+    uint8_t *out_data, uint32_t data_capacity,
+    uint32_t *out_data_len
+);
+
 #ifdef __cplusplus
 }
 #endif

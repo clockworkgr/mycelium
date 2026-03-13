@@ -339,7 +339,7 @@
 
 Not broken down — will be planned when v0.1 ships.
 
-- iOS app (SwiftUI shell, BLE-only)
+- ~~iOS app~~ — **Done**: CoreBluetooth BLE stack, LoRa BLE bridge, platform channels, CocoaPods FFI integration
 - Geographic hash overlay (topology-inferred regions)
 - Wi-Fi Aware (NAN) transport (Android 8+)
 - Multi-device linked device chain (CRDT sync)
