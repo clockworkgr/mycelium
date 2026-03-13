@@ -1661,3 +1661,403 @@ pub unsafe extern "C" fn mycelium_set_node_display_name(
 
     0
 }
+
+// --- LoRa Transport FFI ---
+
+/// Register the LoRa transport for this node.
+///
+/// Creates a LoRa transport with default config (US 915 MHz, SF10, ADR enabled).
+///
+/// Returns 0 on success.
+///
+/// # Safety
+/// - `handle` must be a valid pointer from `mycelium_node_new`.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_register_lora_transport(handle: *mut MyceliumNode) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let lora = Arc::new(mycelium_core::transport::lora::LoraTransport::new(
+        mycelium_core::transport::lora::LoraConfig::default(),
+    ));
+    runtime().block_on(async {
+        node.transport_manager.add_transport(lora.clone()).await;
+        *node.lora_transport.write().await = Some(lora);
+    });
+    0
+}
+
+/// Register the LoRa transport with custom configuration.
+///
+/// Returns 0 on success, -1 on invalid args.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_register_lora_transport_configured(
+    handle: *mut MyceliumNode,
+    frequency_mhz: f32,
+    spreading_factor: u8,
+    bandwidth_khz: u16,
+    tx_power_dbm: i8,
+    duty_cycle_limit: f32,
+    adaptive_data_rate: bool,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let config = mycelium_core::transport::lora::LoraConfig {
+        frequency_mhz,
+        spreading_factor,
+        bandwidth_khz,
+        tx_power_dbm,
+        duty_cycle_limit,
+        adaptive_data_rate,
+    };
+
+    let node = &(*handle).node;
+    let lora = Arc::new(mycelium_core::transport::lora::LoraTransport::new(config));
+    runtime().block_on(async {
+        node.transport_manager.add_transport(lora.clone()).await;
+        *node.lora_transport.write().await = Some(lora);
+    });
+    0
+}
+
+/// Notify the LoRa transport that a peer was discovered.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_lora_on_peer_discovered(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+
+    runtime().block_on(async {
+        let guard = node.lora_transport.read().await;
+        if let Some(lora) = guard.as_ref() {
+            lora.on_peer_discovered(peer).await;
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+/// Notify the LoRa transport that a peer was lost.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_lora_on_peer_lost(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+
+    runtime().block_on(async {
+        let guard = node.lora_transport.read().await;
+        if let Some(lora) = guard.as_ref() {
+            lora.on_peer_lost(peer).await;
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+/// Feed data received from the LoRa module into the transport layer.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+/// - `data` must point to `data_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_lora_on_data_received(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+    data: *const u8,
+    data_len: u32,
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() || data.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+    let payload = std::slice::from_raw_parts(data, data_len as usize).to_vec();
+
+    runtime().block_on(async {
+        let guard = node.lora_transport.read().await;
+        if let Some(lora) = guard.as_ref() {
+            lora.on_data_received(peer, payload).await;
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+/// Dequeue one pending LoRa send from the outbox.
+///
+/// Returns 1 if a packet was dequeued (fills out params), 0 if empty, -1 on error.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `out_peer_id` must point to 32 bytes.
+/// - `out_data` must point to `data_capacity` bytes.
+/// - `out_data_len` must point to a valid u32.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_lora_dequeue_send(
+    handle: *mut MyceliumNode,
+    out_peer_id: *mut [u8; 32],
+    out_data: *mut u8,
+    data_capacity: u32,
+    out_data_len: *mut u32,
+) -> i32 {
+    if handle.is_null() || out_peer_id.is_null() || out_data.is_null() || out_data_len.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+
+    let result = runtime().block_on(async {
+        let guard = node.lora_transport.read().await;
+        guard.as_ref().and_then(|lora| lora.dequeue_send())
+    });
+
+    match result {
+        Some((peer, data)) => {
+            let copy_len = data.len().min(data_capacity as usize);
+            (*out_peer_id) = *peer.as_bytes();
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, copy_len);
+            (*out_data_len) = copy_len as u32;
+            1
+        }
+        None => 0,
+    }
+}
+
+/// Report a successful LoRa transmission for ADR negotiation.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_lora_report_tx_success(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+
+    runtime().block_on(async {
+        let guard = node.lora_transport.read().await;
+        if let Some(lora) = guard.as_ref() {
+            lora.report_tx_success(&peer);
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+/// Report a failed LoRa transmission for ADR negotiation.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_lora_report_tx_failure(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+
+    runtime().block_on(async {
+        let guard = node.lora_transport.read().await;
+        if let Some(lora) = guard.as_ref() {
+            lora.report_tx_failure(&peer);
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+// --- BT Classic Transport FFI ---
+
+/// Register the Bluetooth Classic SPP transport for this node.
+///
+/// Returns 0 on success.
+///
+/// # Safety
+/// - `handle` must be a valid pointer from `mycelium_node_new`.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_register_bt_classic_transport(handle: *mut MyceliumNode) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let bt = Arc::new(mycelium_core::transport::bt_classic::BtClassicTransport::new());
+    runtime().block_on(async {
+        node.transport_manager.add_transport(bt.clone()).await;
+        *node.bt_classic_transport.write().await = Some(bt);
+    });
+    0
+}
+
+/// Notify the BT Classic transport that a peer connected via SPP.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_bt_classic_on_peer_connected(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+
+    runtime().block_on(async {
+        let guard = node.bt_classic_transport.read().await;
+        if let Some(bt) = guard.as_ref() {
+            bt.on_peer_connected(peer).await;
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+/// Notify the BT Classic transport that a peer disconnected.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_bt_classic_on_peer_disconnected(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+
+    runtime().block_on(async {
+        let guard = node.bt_classic_transport.read().await;
+        if let Some(bt) = guard.as_ref() {
+            bt.on_peer_disconnected(peer).await;
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+/// Feed data received from BT Classic into the transport layer.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `peer_id` must point to 32 bytes.
+/// - `data` must point to `data_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_bt_classic_on_data_received(
+    handle: *mut MyceliumNode,
+    peer_id: *const [u8; 32],
+    data: *const u8,
+    data_len: u32,
+) -> i32 {
+    if handle.is_null() || peer_id.is_null() || data.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let peer = NodeId::from_bytes(*peer_id);
+    let payload = std::slice::from_raw_parts(data, data_len as usize).to_vec();
+
+    runtime().block_on(async {
+        let guard = node.bt_classic_transport.read().await;
+        if let Some(bt) = guard.as_ref() {
+            bt.on_data_received(peer, payload).await;
+            0
+        } else {
+            -2
+        }
+    })
+}
+
+/// Dequeue one pending BT Classic send from the outbox.
+///
+/// Returns 1 if a packet was dequeued (fills out params), 0 if empty, -1 on error.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `out_peer_id` must point to 32 bytes.
+/// - `out_data` must point to `data_capacity` bytes.
+/// - `out_data_len` must point to a valid u32.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_bt_classic_dequeue_send(
+    handle: *mut MyceliumNode,
+    out_peer_id: *mut [u8; 32],
+    out_data: *mut u8,
+    data_capacity: u32,
+    out_data_len: *mut u32,
+) -> i32 {
+    if handle.is_null() || out_peer_id.is_null() || out_data.is_null() || out_data_len.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+
+    let result = runtime().block_on(async {
+        let guard = node.bt_classic_transport.read().await;
+        guard.as_ref().and_then(|bt| bt.dequeue_send())
+    });
+
+    match result {
+        Some((peer, data)) => {
+            let copy_len = data.len().min(data_capacity as usize);
+            (*out_peer_id) = *peer.as_bytes();
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, copy_len);
+            (*out_data_len) = copy_len as u32;
+            1
+        }
+        None => 0,
+    }
+}

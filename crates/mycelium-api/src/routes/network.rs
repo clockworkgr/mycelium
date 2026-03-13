@@ -209,6 +209,80 @@ pub async fn get_transports(State(state): State<AppState>) -> Json<TransportStat
         }
     }
 
+    // LoRa transport
+    {
+        let guard = state.node.lora_transport.read().await;
+        if let Some(ref lora) = *guard {
+            let peers = lora.connected_peers();
+            let peer_infos: Vec<TransportPeerInfo> = peers
+                .iter()
+                .map(|p| {
+                    let lq = lora.link_quality(p);
+                    TransportPeerInfo {
+                        node_id: hex::encode(p.as_bytes()),
+                        rssi: lq.and_then(|q| q.rssi),
+                        throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                        latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                    }
+                })
+                .collect();
+            transports.push(TransportInfo {
+                name: "lora".to_string(),
+                registered: true,
+                peer_count: peer_infos.len(),
+                mtu: lora.mtu(),
+                outbox_depth: lora.outbox_len(),
+                peers: peer_infos,
+            });
+        } else {
+            transports.push(TransportInfo {
+                name: "lora".to_string(),
+                registered: false,
+                peer_count: 0,
+                peers: Vec::new(),
+                mtu: 0,
+                outbox_depth: 0,
+            });
+        }
+    }
+
+    // BT Classic transport
+    {
+        let guard = state.node.bt_classic_transport.read().await;
+        if let Some(ref bt) = *guard {
+            let peers = bt.connected_peers();
+            let peer_infos: Vec<TransportPeerInfo> = peers
+                .iter()
+                .map(|p| {
+                    let lq = bt.link_quality(p);
+                    TransportPeerInfo {
+                        node_id: hex::encode(p.as_bytes()),
+                        rssi: lq.and_then(|q| q.rssi),
+                        throughput_bps: lq.map(|q| q.throughput_bps).unwrap_or(0),
+                        latency_ms: lq.map(|q| q.latency_ms).unwrap_or(0),
+                    }
+                })
+                .collect();
+            transports.push(TransportInfo {
+                name: "bt_classic".to_string(),
+                registered: true,
+                peer_count: peer_infos.len(),
+                mtu: bt.mtu(),
+                outbox_depth: bt.outbox_len(),
+                peers: peer_infos,
+            });
+        } else {
+            transports.push(TransportInfo {
+                name: "bt_classic".to_string(),
+                registered: false,
+                peer_count: 0,
+                peers: Vec::new(),
+                mtu: 0,
+                outbox_depth: 0,
+            });
+        }
+    }
+
     Json(TransportStatusResponse { transports })
 }
 

@@ -104,6 +104,13 @@ pub struct Node {
     /// Handle to Wi-Fi Direct transport for platform FFI callbacks.
     pub wifi_transport:
         Arc<RwLock<Option<Arc<mycelium_core::transport::wifi_direct::WifiDirectTransport>>>>,
+    /// Handle to LoRa transport for platform FFI callbacks.
+    #[allow(dead_code)]
+    pub lora_transport: Arc<RwLock<Option<Arc<mycelium_core::transport::lora::LoraTransport>>>>,
+    /// Handle to BT Classic transport for platform FFI callbacks.
+    #[allow(dead_code)]
+    pub bt_classic_transport:
+        Arc<RwLock<Option<Arc<mycelium_core::transport::bt_classic::BtClassicTransport>>>>,
     /// Broadcast channel for node events (consumed by API server / WebSocket clients).
     pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
     /// Dedup set for channel messages (prevents re-processing flooded messages).
@@ -180,6 +187,8 @@ impl Node {
             cancel: CancellationToken::new(),
             ble_transport: Arc::new(RwLock::new(None)),
             wifi_transport: Arc::new(RwLock::new(None)),
+            lora_transport: Arc::new(RwLock::new(None)),
+            bt_classic_transport: Arc::new(RwLock::new(None)),
             event_tx,
             seen_channel_messages: Arc::new(RwLock::new(HashSet::new())),
             local_group_hash,

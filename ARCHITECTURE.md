@@ -146,7 +146,7 @@ mycelium/
 │   │   │   └── network.rs              # /v1/network/* (diagnostics)
 │   │   └── tests/api_test.rs           # Integration tests (11 tests)
 │   └── mycelium-ffi/                   # C FFI bindings
-│       ├── src/lib.rs                  # 48 extern "C" functions (~1500 lines)
+│       ├── src/lib.rs                  # 65 extern "C" functions (~2000 lines)
 │       └── include/mycelium.h          # C header
 └── flutter/                            # Flutter mobile app (47 Dart files)
     ├── pubspec.yaml                    # Dependencies
@@ -634,7 +634,7 @@ Long-range, low-bandwidth transport for rural/emergency scenarios:
 - **MTU:** Varies by SF — 222 bytes (SF7-8), 115 bytes (SF9), 51 bytes (SF10-12)
 - **Adaptive Data Rate (ADR):** Per-peer SF negotiation. Starts at configured SF, lowers after 10 consecutive successes, raises after 2 consecutive failures. Discovery beacons always use SF12 for max range. Disabled via `adaptive_data_rate: false`.
 - **Presets:** `LoraConfig::eu_868()` (868 MHz, 1% duty), `LoraConfig::us_915()` (915 MHz, no duty limit)
-- **Status:** Rust transport complete with ADR. Platform bridges (BLE GATT to LoRa module, USB serial) not yet implemented.
+- **Status:** Rust transport complete with ADR. GATT UUIDs defined. FFI functions implemented. Platform bridges (Kotlin LoRa GATT client, USB serial) not yet implemented.
 
 ### BT Classic SPP Transport (`transport/bt_classic.rs`)
 
@@ -1056,7 +1056,7 @@ Connect to `/v1/ws`. JSON-framed messages:
 
 ## 11. mycelium-ffi
 
-**Purpose:** C FFI bridge between Rust and mobile platforms. Exposes 49+ `extern "C"` functions.
+**Purpose:** C FFI bridge between Rust and mobile platforms. Exposes 65+ `extern "C"` functions.
 
 ### Architecture
 
@@ -1094,10 +1094,12 @@ thread_local! {
 | Groups | `create_group`, `add_group_member`, `remove_group_member`, `group_member_count`, `get_group_members`, `send_group_message` | Group management |
 | Trust | `add_vouch`, `trust_score`, `verify_session`, `safety_number` | Web of Trust |
 | Network | `network_status`, `update_battery` | Status and battery |
-| Transport | `register_ble_transport`, `register_wifi_direct_transport` | Register transports |
+| Transport | `register_ble_transport`, `register_wifi_direct_transport`, `register_lora_transport`, `register_lora_transport_configured`, `register_bt_classic_transport` | Register transports |
 | BLE Events | `ble_on_peer_discovered`, `ble_on_peer_lost`, `ble_on_data_received` | Platform → Rust |
 | Wi-Fi Events | `wifi_on_peer_connected`, `wifi_on_peer_disconnected`, `wifi_on_data_received` | Platform → Rust |
-| Outbox | `ble_dequeue_send`, `wifi_dequeue_send` | Rust → Platform polling |
+| LoRa Events | `lora_on_peer_discovered`, `lora_on_peer_lost`, `lora_on_data_received`, `lora_report_tx_success`, `lora_report_tx_failure` | Platform → Rust (incl. ADR) |
+| BT Classic Events | `bt_classic_on_peer_connected`, `bt_classic_on_peer_disconnected`, `bt_classic_on_data_received` | Platform → Rust |
+| Outbox | `ble_dequeue_send`, `wifi_dequeue_send`, `lora_dequeue_send`, `bt_classic_dequeue_send` | Rust → Platform polling |
 | Callbacks | `ble_set_send_callback`, `wifi_set_send_callback` | Rust → Platform direct |
 
 ### Memory Management
@@ -1112,7 +1114,7 @@ Defines:
 - `MyceliumNode` opaque struct
 - FFI structs: `MessageInfo`, `ConversationInfo`, `ConversationSummary`, `NetworkStatus`, `ContactInfo`
 - Callback types: `MessageCallback`, `TransportSendCallback`
-- All 48 function declarations with C-compatible signatures
+- All 65 function declarations with C-compatible signatures
 
 ---
 
@@ -1216,6 +1218,18 @@ Service UUID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ├─ Data TX    (7892) Write      — Central writes data to peripheral
 ├─ Data RX    (7893) Notify     — Peripheral notifies central with data
 └─ Identity   (7894) Write      — Client writes own node ID to server
+```
+
+### LoRa BLE GATT Bridge
+
+External LoRa modules (e.g. ESP32+SX1276) connect to the phone via BLE:
+
+```
+LoRa Service UUID: a1b2c3d4-e5f6-7890-abcd-ef12345678a0
+├─ Data TX    (78a1) Write      — Phone writes outgoing mesh packets
+├─ Data RX    (78a2) Notify     — LoRa module notifies phone of received packets
+├─ Config     (78a3) Read/Write — Radio config: frequency, SF, BW, TX power
+└─ Status     (78a4) Read/Notify — Radio status: RSSI, SNR, duty cycle, error count
 ```
 
 ### Dual-Role Architecture

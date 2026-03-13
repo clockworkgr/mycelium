@@ -17,6 +17,28 @@ use mycelium_protocol::types::{LinkQuality, NodeId};
 
 use super::{Transport, TransportError, TransportEvent, TransportType};
 
+// --- LoRa BLE GATT Bridge UUIDs ---
+//
+// When connecting to an external LoRa module (e.g. ESP32+SX1276) over BLE,
+// the phone acts as a GATT client and the LoRa module exposes this service.
+//
+// Service UUID: a1b2c3d4-e5f6-7890-abcd-ef12345678a0
+// ├─ Data TX    (78a1) Write      — Phone writes outgoing mesh packets
+// ├─ Data RX    (78a2) Notify     — LoRa module notifies phone of received packets
+// ├─ Config     (78a3) Read/Write — Radio config: frequency, SF, BW, TX power
+// └─ Status     (78a4) Read/Notify — Radio status: RSSI, SNR, duty cycle, error count
+
+/// LoRa GATT service UUID.
+pub const LORA_SERVICE_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef12345678a0";
+/// Phone → LoRa module: write outgoing mesh packets.
+pub const LORA_DATA_TX_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef12345678a1";
+/// LoRa module → phone: notify with received mesh packets.
+pub const LORA_DATA_RX_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef12345678a2";
+/// Radio configuration (frequency, SF, BW, TX power) — read/write.
+pub const LORA_CONFIG_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef12345678a3";
+/// Radio status (RSSI, SNR, duty cycle, error count) — read/notify.
+pub const LORA_STATUS_UUID: &str = "a1b2c3d4-e5f6-7890-abcd-ef12345678a4";
+
 /// LoRa radio configuration.
 #[derive(Debug, Clone)]
 pub struct LoraConfig {
