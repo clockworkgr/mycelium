@@ -20,14 +20,15 @@
 10. [mycelium-api](#10-mycelium-api)
 11. [mycelium-ffi](#11-mycelium-ffi)
 12. [mycelium-meshtastic](#12-mycelium-meshtastic)
-13. [Flutter App](#13-flutter-app)
-14. [Android BLE Stack](#14-android-ble-stack)
-15. [Build System](#15-build-system)
-16. [Wire Format Reference](#16-wire-format-reference)
-17. [Cryptographic Architecture](#17-cryptographic-architecture)
-18. [Routing Architecture](#18-routing-architecture)
-19. [Test Coverage](#19-test-coverage)
-20. [Spec Compliance Matrix](#20-spec-compliance-matrix)
+13. [mycelium-reticulum](#13-mycelium-reticulum)
+14. [Flutter App](#14-flutter-app)
+15. [Android BLE Stack](#15-android-ble-stack)
+16. [Build System](#16-build-system)
+17. [Wire Format Reference](#17-wire-format-reference)
+18. [Cryptographic Architecture](#18-cryptographic-architecture)
+19. [Routing Architecture](#19-routing-architecture)
+20. [Test Coverage](#20-test-coverage)
+21. [Spec Compliance Matrix](#21-spec-compliance-matrix)
 
 ---
 
@@ -35,7 +36,7 @@
 
 Mycelium is a mobile mesh messaging application that operates without internet or cellular infrastructure. It creates ad-hoc mesh networks using Bluetooth Low Energy on standard smartphones, with end-to-end encryption, delay-tolerant networking, and a Web of Trust identity system.
 
-**Architecture:** Rust core library (8 crates) compiled to a shared library (`libmycelium_ffi.so`) via C FFI, consumed by a Flutter/Dart frontend (47 Dart files, 14 screens) with Kotlin platform code for Android BLE and Wi-Fi Direct. A local REST + WebSocket API server (47 endpoints) enables the Flutter app and future clients to communicate with the node daemon.
+**Architecture:** Rust core library (9 crates) compiled to a shared library (`libmycelium_ffi.so`) via C FFI, consumed by a Flutter/Dart frontend (47 Dart files, 14 screens) with Kotlin platform code for Android BLE and Wi-Fi Direct. A local REST + WebSocket API server (47 endpoints) enables the Flutter app and future clients to communicate with the node daemon.
 
 ```
 ┌───────────────────────────────────────────────────────────────┐
@@ -149,8 +150,10 @@ mycelium/
 │   ├── mycelium-ffi/                   # C FFI bindings
 │   │   ├── src/lib.rs                  # 65 extern "C" functions (~2000 lines)
 │   │   └── include/mycelium.h          # C header
-│   └── mycelium-meshtastic/            # Meshtastic protocol adapter
-│       └── src/lib.rs                  # MeshtasticTransport, NodeIdBridge, ChannelKey (12 tests)
+│   ├── mycelium-meshtastic/            # Meshtastic protocol adapter
+│   │   └── src/lib.rs                  # MeshtasticTransport, NodeIdBridge, ChannelKey (12 tests)
+│   └── mycelium-reticulum/             # Reticulum protocol adapter
+│       └── src/lib.rs                  # ReticulumTransport, AddressBridge, HDLC framing (19 tests)
 └── flutter/                            # Flutter mobile app (47 Dart files)
     ├── pubspec.yaml                    # Dependencies
     ├── ffigen.yaml                     # FFI codegen config
@@ -242,6 +245,9 @@ mycelium-ffi       mycelium-api   (axum, tower-http, hex)
 
 mycelium-meshtastic  (depends on protocol + core; sha2, aes-gcm, rand)
 (Meshtastic protocol adapter plugin)
+
+mycelium-reticulum   (depends on protocol + core; sha2, rand)
+(Reticulum protocol adapter plugin)
 ```
 
 All crates share workspace-level dependency versions. Key version constraints:
@@ -1161,7 +1167,47 @@ Defines:
 
 ---
 
-## 13. Flutter App
+## 13. mycelium-reticulum
+
+**Purpose:** Protocol adapter bridging Reticulum mesh network nodes into the Mycelium network. Supports the Reticulum wire format (HEADER_1/HEADER_2 packets), announce-based peer discovery, HDLC serial framing, and address translation.
+
+**Dependencies:** `mycelium-protocol`, `mycelium-core`, `sha2`, `rand`, `tokio`, `async-trait`, `tracing`
+
+### Key Types
+
+| Type | Description |
+|------|-------------|
+| `ReticulumPacket` | Wire format: `[1B flags][1B hops][16/32B addresses][1B context][data]` |
+| `HeaderFlags` | Bitfield: header_type, context_flag, propagation_type, destination_type, packet_type |
+| `AddressBridge` | Bidirectional mapping: Reticulum 16-byte dest hashes ↔ Mycelium 32-byte NodeIds via `SHA-256("reticulum:" \|\| dest_hash)` |
+| `AnnounceData` | Parsed announce: 64B public key, 10B name hash, 10B random hash, 64B signature, optional app data |
+| `HdlcFraming` | HDLC serial framing: flag `0x7E`, escape `0x7D`, XOR mask `0x20` |
+| `ReticulumTransport` | Implements `Transport` + `TransportPlugin` traits; MTU 465 (Reticulum MDU), outbox pattern |
+| `ReticulumConfig` | Interface type (tcp/udp/serial), host address, app name |
+
+### Protocol Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `RETICULUM_MTU` | 500 | Physical layer maximum |
+| `RETICULUM_MDU` | 465 | Maximum data unit |
+| `MAX_HOPS` | 128 | Maximum hop count |
+| `ADDRESS_LENGTH` | 16 | Destination hash size (bytes) |
+
+### Tests (19 tests)
+
+- Header flags encode/decode roundtrip (2 tests)
+- HEADER_1 and HEADER_2 packet roundtrip (3 tests)
+- Address bridge determinism, uniqueness, reverse lookup (3 tests)
+- HDLC framing roundtrip, no-escape case, invalid framing (3 tests)
+- Announce parsing with/without app data, too-short error (3 tests)
+- Transport lifecycle, send with outbox, MDU enforcement (3 tests)
+- Plugin interface configuration (1 test)
+- Raw data parsing (1 test)
+
+---
+
+## 14. Flutter App
 
 **Purpose:** Android mobile UI with 47 Dart files and 14 screens. Uses Flutter with Riverpod for state management, GoRouter for navigation, REST API client for data operations, and WebSocket for real-time events.
 
@@ -1249,7 +1295,7 @@ shared_preferences: ^2.3.3          # Persistent settings
 
 ---
 
-## 14. Android BLE Stack
+## 15. Android BLE Stack
 
 **Purpose:** Full dual-role BLE implementation (GATT server + client) in Kotlin. Handles peer discovery, data exchange, fragmentation, and identity mapping.
 
@@ -1345,7 +1391,7 @@ private val writeQueue = ConcurrentLinkedQueue<WriteOperation>()
 
 ---
 
-## 15. Build System
+## 16. Build System
 
 ### Workspace Build
 
@@ -1389,7 +1435,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 16. Wire Format Reference
+## 17. Wire Format Reference
 
 ### Envelope Layout (106-byte header)
 
@@ -1427,7 +1473,7 @@ Reads `crates/mycelium-ffi/include/mycelium.h`, generates `lib/src/ffi/mycelium_
 
 ---
 
-## 17. Cryptographic Architecture
+## 18. Cryptographic Architecture
 
 ### Key Hierarchy
 
@@ -1470,7 +1516,7 @@ Group Messaging (Sender Keys):
 
 ---
 
-## 18. Routing Architecture
+## 19. Routing Architecture
 
 ### Decision Flow
 
@@ -1513,7 +1559,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 19. Test Coverage
+## 20. Test Coverage
 
 ### By Crate
 
@@ -1527,7 +1573,8 @@ BLE scan finds device with Mycelium service UUID
 | mycelium-api | 1 test file | 11 | REST endpoints, JSON responses, error handling, contact CRUD, 404s |
 | mycelium-ffi | — | 0 | No unit tests (integration via Flutter) |
 | mycelium-meshtastic | 1 module | 12 | Packet roundtrip (3), node ID bridge (3), channel keys (2), transport lifecycle (1), send (1), plugin (1), serial (1) |
-| **Total** | | **235** | |
+| mycelium-reticulum | 1 module | 19 | Header flags (2), packet roundtrip (3), address bridge (3), HDLC framing (3), announce parsing (3), transport lifecycle (3), plugin (1), raw data (1) |
+| **Total** | | **254** | |
 
 ### Integration Test Highlights
 
@@ -1539,7 +1586,7 @@ BLE scan finds device with Mycelium service UUID
 
 ---
 
-## 20. Spec Compliance Matrix
+## 21. Spec Compliance Matrix
 
 | Spec Section | Feature | Status | Notes |
 |-------------|---------|--------|-------|

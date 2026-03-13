@@ -910,6 +910,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycelium-reticulum"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "mycelium-core",
+ "mycelium-protocol",
+ "rand 0.8.5",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mycelium-storage"
 version = "0.1.0"
 dependencies = [

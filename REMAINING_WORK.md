@@ -328,9 +328,9 @@
 
 ### 16.3 Reticulum adapter
 
-- [ ] **16.3.1** Add `mycelium-reticulum` crate implementing `TransportPlugin`
-- [ ] **16.3.2** Implement Reticulum announce/path request protocol
-- [ ] **16.3.3** Bridge Reticulum addresses ↔ Mycelium NodeIds
+- [x] **16.3.1** Add `mycelium-reticulum` crate implementing `TransportPlugin`
+- [x] **16.3.2** Implement Reticulum announce/path request protocol
+- [x] **16.3.3** Bridge Reticulum addresses ↔ Mycelium NodeIds
 - [ ] **16.3.4** Test with Reticulum network (via TCP/UDP interface)
 
 ---
@@ -360,16 +360,18 @@ Not broken down — will be planned when v0.1 ships.
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
 | 14 | 12 | 11 | 1 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
 | 15 | 14 | 14 | 0 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
-| 16 | 13 | 8 | 5 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **178** | **172** | **6** | **97% complete** |
+| 16 | 13 | 11 | 2 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
+| **Total** | **178** | **175** | **3** | **98% complete** |
 
 ### Remaining Work Breakdown
 
 **OpenWRT (1 task):**
 - Test on actual router hardware (1 task: 14.1.4)
 
-**Protocol Adapters (5 tasks):**
+**Protocol Adapters (2 tasks):**
 - Meshtastic hardware test (1 task: 16.2.5) — requires T-Beam/T-Echo device
-- Reticulum adapter crate (4 tasks: 16.3.1-16.3.4)
+- Reticulum network test (1 task: 16.3.4) — requires Reticulum network
 
-**Remaining Rust tasks (0):** All Rust-side transport work complete (LoRa FFI, BT Classic FFI, GATT UUIDs, Meshtastic adapter).
+**Remaining Rust tasks (0):** All Rust-side work complete (LoRa FFI, BT Classic FFI, GATT UUIDs, Meshtastic adapter, Reticulum adapter).
+
+**All 3 remaining tasks require physical hardware/network that is unavailable in this environment.**
