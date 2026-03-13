@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod lora_frame;
 pub mod types;
 pub mod wire;
 

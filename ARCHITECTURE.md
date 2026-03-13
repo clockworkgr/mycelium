@@ -77,6 +77,7 @@ mycelium/
 │   │   ├── src/lib.rs                  # Module exports
 │   │   ├── src/types.rs                # NodeId, MessageId, LamportClock, etc.
 │   │   ├── src/codec.rs                # Envelope serialize/deserialize
+│   │   ├── src/lora_frame.rs           # Compact LoRa frame (27-byte header)
 │   │   ├── src/wire.rs                 # Payload type codecs
 │   │   └── schemas/                    # Cap'n Proto schemas (documentation only)
 │   ├── mycelium-crypto/                # Cryptographic primitives
@@ -359,6 +360,28 @@ Offset  Size  Field              Endianness
 ```
 
 Methods: `serialize() -> Vec<u8>`, `deserialize(&[u8]) -> Result<Self, CodecError>`, `forward()` (decrement TTL, increment hop_count).
+
+### Compact LoRa Frame (`lora_frame.rs`)
+
+A 27-byte header for LoRa's constrained MTU (51-222 bytes). Reduces overhead from 106 to 27 bytes by truncating NodeIds to 8 bytes, MessageId to 4 bytes, and compacting clocks/flags:
+
+```
+Offset  Size  Field              Type
+  0       8   source_short       bytes (truncated NodeId)
+  8       8   dest_short         bytes (truncated NodeId)
+ 16       4   message_id_short   bytes (truncated MsgId)
+ 20       1   ttl                u8
+ 21       1   hop_count          u8
+ 22       1   flags              u8 (truncated)
+ 23       2   lamport_clock      u16 LE (wrapping)
+ 25       1   payload_length     u8
+ 26       1   sf_hint            u8 (ADR spreading factor)
+ 27       *   payload            bytes
+```
+
+At SF10-12 (51B MTU), leaves 24 bytes for payload. At SF7 (222B MTU), leaves 195 bytes.
+
+Methods: `from_envelope()` / `to_envelope()` for conversion (requires NodeId resolver for truncated IDs), `serialize()` / `deserialize()`, `forward()`.
 
 ### Payload Types (`wire.rs`)
 
@@ -1439,7 +1462,7 @@ BLE scan finds device with Mycelium service UUID
 
 | Crate | Test Files | Tests | Coverage Areas |
 |-------|------------|-------|----------------|
-| mycelium-protocol | 3 modules | 29 | Type display, lamport ops, envelope roundtrips, all 12 payload roundtrips, channel/emergency types |
+| mycelium-protocol | 4 modules | 39 | Type display, lamport ops, envelope roundtrips, all 12 payload roundtrips, channel/emergency types |
 | mycelium-crypto | 7 modules | 43 | Identity (8), X3DH (9), ratchet (5), sessions (2), WoT (12), groups (4), discovery (3) |
 | mycelium-core | 11 modules | 64 | AODV (9), DTN (5), DHT (16), LoRa (7), BT Classic (2), internet (3), Wi-Fi Direct (5), mock (2), plugin (3) |
 | mycelium-storage | 3 modules | 9 | Messages (2), vouches (2), channels (5) |
@@ -1495,7 +1518,7 @@ BLE scan finds device with Mycelium service UUID
 | §15 Onboarding | Seed phrase groups | **Implemented** | Group discovery key (HKDF), beacon matching, 4 onboarding screens, QR scanning |
 | §16 Battery Management | Adaptive power | **Implemented** | 5 power modes, platform battery injection via FFI, beacon battery field |
 | §17 UI | Core screens | **Implemented** | 14 screens: Chat, Contacts, Groups, Channels, Settings, Debug, Onboarding (4), QR, Verify |
-| §18 Docker Testbed | CI/CD testing | **Not started** | Unit/integration tests only (199 tests) |
+| §18 Docker Testbed | CI/CD testing | **Not started** | Unit/integration tests only (209 tests) |
 
 ### Deviations from Spec
 
