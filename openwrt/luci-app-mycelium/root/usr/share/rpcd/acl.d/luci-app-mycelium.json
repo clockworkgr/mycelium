@@ -1,0 +1,17 @@
+{
+	"luci-app-mycelium": {
+		"description": "Grant access to Mycelium Mesh configuration",
+		"read": {
+			"uci": [ "mycelium" ],
+			"file": {
+				"/etc/config/mycelium": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "mycelium" ],
+			"file": {
+				"/etc/config/mycelium": [ "write" ]
+			}
+		}
+	}
+}

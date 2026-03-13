@@ -1,0 +1,29 @@
+{
+	"admin/services/mycelium": {
+		"title": "Mycelium Mesh",
+		"order": 60,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": [ "luci-app-mycelium" ],
+			"uci": { "mycelium": true }
+		}
+	},
+	"admin/services/mycelium/status": {
+		"title": "Status",
+		"order": 10,
+		"action": {
+			"type": "template",
+			"path": "mycelium/status"
+		}
+	},
+	"admin/services/mycelium/config": {
+		"title": "Configuration",
+		"order": 20,
+		"action": {
+			"type": "cbi",
+			"path": "mycelium/config"
+		}
+	}
+}

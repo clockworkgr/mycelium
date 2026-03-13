@@ -1,0 +1,139 @@
+<%+header%>
+
+<h2><%:Mycelium Mesh Status%></h2>
+
+<div class="cbi-map">
+  <fieldset class="cbi-section" id="node-info">
+    <legend><%:Node Information%></legend>
+    <table class="table">
+      <tr class="tr"><td class="td"><%:Status%></td><td class="td" id="daemon-status">-</td></tr>
+      <tr class="tr"><td class="td"><%:Node ID%></td><td class="td" id="node-id">-</td></tr>
+      <tr class="tr"><td class="td"><%:Display Name%></td><td class="td" id="display-name">-</td></tr>
+      <tr class="tr"><td class="td"><%:Node Type%></td><td class="td" id="node-type">-</td></tr>
+      <tr class="tr"><td class="td"><%:Sessions%></td><td class="td" id="session-count">-</td></tr>
+      <tr class="tr"><td class="td"><%:Prekeys Remaining%></td><td class="td" id="prekey-count">-</td></tr>
+    </table>
+  </fieldset>
+
+  <fieldset class="cbi-section" id="network-info">
+    <legend><%:Network%></legend>
+    <table class="table">
+      <tr class="tr"><td class="td"><%:Neighbor Count%></td><td class="td" id="neighbor-count">-</td></tr>
+      <tr class="tr"><td class="td"><%:DTN Queue%></td><td class="td" id="dtn-queue">-</td></tr>
+      <tr class="tr"><td class="td"><%:DTN Storage Used%></td><td class="td" id="dtn-storage">-</td></tr>
+    </table>
+  </fieldset>
+
+  <fieldset class="cbi-section" id="peers-section">
+    <legend><%:Connected Peers%></legend>
+    <table class="table" id="peers-table">
+      <tr class="tr">
+        <th class="th"><%:Node ID%></th>
+        <th class="th"><%:Transport%></th>
+        <th class="th"><%:RSSI%></th>
+        <th class="th"><%:Throughput%></th>
+        <th class="th"><%:Latency%></th>
+      </tr>
+    </table>
+    <p id="no-peers" style="display:none; color:#888;"><%:No peers connected.%></p>
+  </fieldset>
+
+  <fieldset class="cbi-section" id="transports-section">
+    <legend><%:Transports%></legend>
+    <table class="table" id="transports-table">
+      <tr class="tr">
+        <th class="th"><%:Name%></th>
+        <th class="th"><%:Registered%></th>
+        <th class="th"><%:Peers%></th>
+        <th class="th"><%:MTU%></th>
+        <th class="th"><%:Outbox%></th>
+      </tr>
+    </table>
+  </fieldset>
+</div>
+
+<script>
+(function() {
+    function formatBytes(bps) {
+        if (bps >= 1000000) return (bps / 1000000).toFixed(1) + ' Mbps';
+        if (bps >= 1000) return (bps / 1000).toFixed(0) + ' kbps';
+        return bps + ' bps';
+    }
+
+    function updateStatus() {
+        XHR.get('<%=luci.dispatcher.build_url("admin/services/mycelium/api_status")%>', null, function(x, data) {
+            if (!data) return;
+
+            // Daemon status
+            var el = document.getElementById('daemon-status');
+            if (data.running) {
+                el.innerHTML = '<span style="color:green;">&#9679;</span> Running';
+            } else {
+                el.innerHTML = '<span style="color:red;">&#9679;</span> Stopped';
+            }
+
+            // Node info
+            var s = data.status || {};
+            document.getElementById('node-id').textContent = s.node_id || '-';
+            document.getElementById('display-name').textContent = s.display_name || '-';
+            document.getElementById('node-type').textContent = s.node_type || '-';
+            document.getElementById('session-count').textContent = (s.session_count != null) ? s.session_count : '-';
+            document.getElementById('prekey-count').textContent = (s.prekey_remaining != null) ? s.prekey_remaining : '-';
+
+            // Network
+            document.getElementById('neighbor-count').textContent = (s.neighbor_count != null) ? s.neighbor_count : '-';
+
+            // DTN
+            var d = data.dtn || {};
+            document.getElementById('dtn-queue').textContent = (d.queue_size != null) ? d.queue_size + ' bundles' : '-';
+            document.getElementById('dtn-storage').textContent = (d.storage_used_mb != null) ? d.storage_used_mb + ' MB' : '-';
+
+            // Peers
+            var peers = (data.peers && data.peers.peers) || [];
+            var tbody = document.getElementById('peers-table');
+            // Remove old rows (keep header)
+            while (tbody.rows.length > 1) tbody.deleteRow(1);
+
+            if (peers.length === 0) {
+                document.getElementById('no-peers').style.display = '';
+            } else {
+                document.getElementById('no-peers').style.display = 'none';
+                peers.forEach(function(p) {
+                    var row = tbody.insertRow(-1);
+                    row.className = 'tr';
+                    row.insertCell(-1).textContent = (p.node_id || '').substring(0, 16) + '...';
+                    row.insertCell(-1).textContent = p.transport || '-';
+                    row.insertCell(-1).textContent = (p.rssi != null) ? p.rssi + ' dBm' : '-';
+                    row.insertCell(-1).textContent = formatBytes(p.throughput_bps || 0);
+                    row.insertCell(-1).textContent = (p.latency_ms || 0) + ' ms';
+                    Array.from(row.cells).forEach(function(c) { c.className = 'td'; });
+                });
+            }
+
+            // Transports
+            var transports = (data.transports && data.transports.transports) || [];
+            var ttbody = document.getElementById('transports-table');
+            while (ttbody.rows.length > 1) ttbody.deleteRow(1);
+            transports.forEach(function(t) {
+                var row = ttbody.insertRow(-1);
+                row.className = 'tr';
+                row.insertCell(-1).textContent = t.name || '-';
+                var regCell = row.insertCell(-1);
+                regCell.innerHTML = t.registered
+                    ? '<span style="color:green;">&#10003;</span>'
+                    : '<span style="color:gray;">&#10007;</span>';
+                row.insertCell(-1).textContent = t.peer_count || 0;
+                row.insertCell(-1).textContent = t.mtu || '-';
+                row.insertCell(-1).textContent = t.outbox_depth || 0;
+                Array.from(row.cells).forEach(function(c) { c.className = 'td'; });
+            });
+        });
+    }
+
+    // Poll every 5 seconds
+    updateStatus();
+    setInterval(updateStatus, 5000);
+})();
+</script>
+
+<%+footer%>
