@@ -36,6 +36,8 @@ class BleManager {
   Timer? _outboxTimer;
   StreamSubscription? _eventSubscription;
   bool _running = false;
+  int _pollCount = 0;
+  int _sendCount = 0;
 
   // Lazily resolved dequeue_send function
   _DequeueSendDart? _dequeueSend;
@@ -192,11 +194,22 @@ class BleManager {
 
   /// Poll the Rust outbox and forward packets to Kotlin BLE.
   void _pollOutbox() {
-    if (!_running || _dequeueSend == null) return;
+    if (!_running || _dequeueSend == null) {
+      if (_pollCount == 0) {
+        debugPrint('BleManager: _pollOutbox skipped: running=$_running dequeueSend=${_dequeueSend != null}');
+      }
+      return;
+    }
     final peerBuf = _peerBuf;
     final dataBuf = _dataBuf;
     final lenBuf = _lenBuf;
     if (peerBuf == null || dataBuf == null || lenBuf == null) return;
+
+    _pollCount++;
+    // Log heartbeat every 10 seconds (200 ticks at 50ms)
+    if (_pollCount % 200 == 0) {
+      debugPrint('BleManager: outbox poll heartbeat #$_pollCount (sent=$_sendCount)');
+    }
 
     // Drain all queued packets in one poll cycle
     while (true) {
@@ -210,15 +223,18 @@ class BleManager {
 
       if (result != 1) break;
 
+      _sendCount++;
       final peerId = Uint8List.fromList(peerBuf.asTypedList(32));
       final dataLen = lenBuf.value;
       final data = Uint8List.fromList(dataBuf.asTypedList(dataLen));
+
+      debugPrint('BleManager: outbox dequeued $dataLen bytes for peer ${peerId.sublist(0, 4)}');
 
       _methodChannel.invokeMethod('sendData', {
         'peerId': peerId.toList(),
         'data': data.toList(),
       }).catchError((e) {
-        debugPrint('BleManager: sendData failed: $e');
+        debugPrint('BleManager: sendData platform call failed: $e');
       });
     }
   }

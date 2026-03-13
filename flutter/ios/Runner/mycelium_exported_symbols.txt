@@ -60,3 +60,5 @@ _mycelium_register_internet_transport
 _mycelium_register_internet_transport_configured
 _mycelium_internet_connect_to
 _mycelium_internet_peer_count
+_mycelium_api_check
+_mycelium_api_handle_status

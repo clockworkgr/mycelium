@@ -707,6 +707,11 @@ impl Node {
                 cache.contains_key(&destination)
             };
 
+            info!(
+                "send_message: no session with {}, has_prekey={}",
+                destination, has_prekey
+            );
+
             if has_prekey {
                 // Initiate session from cached prekey bundle
                 let bundle = {
@@ -724,6 +729,10 @@ impl Node {
                 )
                 .await?;
             } else {
+                info!(
+                    "send_message: queuing msg and sending prekey request to {}",
+                    destination
+                );
                 // Queue message and send prekey request
                 {
                     let mut pm = self.pending_messages.write().await;
@@ -876,12 +885,29 @@ impl Node {
             r.route_message(&envelope.destination)
         };
 
+        info!(
+            "route_and_send: msg={} dest={} decision={:?}",
+            message_id, envelope.destination, decision
+        );
+
         let serialized = envelope.serialize();
 
         match decision {
             RoutingDecision::SendRealtime { next_hop } => {
-                self.transport_manager.send(&next_hop, &serialized).await?;
-                let _ = self.db.update_message_status(&message_id, "sent");
+                match self.transport_manager.send(&next_hop, &serialized).await {
+                    Ok(()) => {
+                        info!(
+                            "route_and_send: sent {} bytes via transport to {}",
+                            serialized.len(),
+                            next_hop
+                        );
+                        let _ = self.db.update_message_status(&message_id, "sent");
+                    }
+                    Err(e) => {
+                        info!("route_and_send: transport send failed: {}", e);
+                        return Err(e.into());
+                    }
+                }
             }
             RoutingDecision::DiscoveryPending => {
                 let destination = envelope.destination;
