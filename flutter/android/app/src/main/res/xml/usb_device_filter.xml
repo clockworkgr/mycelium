@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- USB device filter for auto-detection of LoRa/serial modules.
+     Covers common ESP32 boards, FTDI adapters, and CH340/CP210x chips
+     used with LoRa modules (e.g. Heltec, TTGO, LilyGO). -->
+<resources>
+    <!-- Silicon Labs CP210x (common on ESP32 LoRa boards) -->
+    <usb-device vendor-id="4292" product-id="60000" />
+    <!-- FTDI FT232R/FT2232 (common USB-serial adapters) -->
+    <usb-device vendor-id="1027" product-id="24577" />
+    <!-- WCH CH340/CH341 (budget ESP32 boards) -->
+    <usb-device vendor-id="6790" product-id="29987" />
+    <!-- Espressif ESP32 native USB (USB-JTAG-Serial) -->
+    <usb-device vendor-id="12346" product-id="32768" />
+    <!-- Espressif ESP32-S2/S3 native USB CDC -->
+    <usb-device vendor-id="12346" product-id="2" />
+    <!-- Prolific PL2303 (legacy serial adapters) -->
+    <usb-device vendor-id="1659" product-id="8963" />
+    <!-- QinHeng CH9102 (newer CH340 variant) -->
+    <usb-device vendor-id="6790" product-id="21795" />
+</resources>

@@ -295,10 +295,10 @@
 
 ### 15.3 USB Serial connection
 
-- [ ] **15.3.1** Add USB OTG permission to AndroidManifest
-- [ ] **15.3.2** Add Kotlin USB CDC ACM serial handler
-- [ ] **15.3.3** Bridge USB serial data to LoraTransport via FFI
-- [ ] **15.3.4** Auto-detect supported USB VID/PIDs (common ESP32/LoRa boards)
+- [x] **15.3.1** Add USB OTG permission to AndroidManifest
+- [x] **15.3.2** Add Kotlin USB CDC ACM serial handler
+- [x] **15.3.3** Bridge USB serial data to LoraTransport via FFI
+- [x] **15.3.4** Auto-detect supported USB VID/PIDs (common ESP32/LoRa boards)
 
 ### 15.4 Bluetooth Classic SPP transport — PARTIAL (Rust complete)
 
@@ -359,14 +359,13 @@ Not broken down — will be planned when v0.1 ships.
 | 12 | 14 | 14 | 0 | Onboarding + seed phrase (crypto, beacon, Flutter screens, FFI) |
 | 13 | 15 | 15 | 0 | Battery + anti-spam wiring (Android bridge, trust→rate limiter, debug) |
 | 14 | 12 | 11 | 1 | OpenWRT supernode (cross-compile, config, beacon, prekey cache, LuCI) |
-| 15 | 14 | 11 | 3 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
+| 15 | 14 | 13 | 1 | External radio hardware (LoRa, BLE GATT, USB serial, BT Classic) |
 | 16 | 10 | 4 | 6 | Protocol adapter plugins (API, Meshtastic, Reticulum) |
-| **Total** | **146** | **138** | **8** | **95% complete** |
+| **Total** | **146** | **142** | **4** | **97% complete** |
 
 ### Remaining Work Breakdown
 
-**Platform Integration (5 tasks):**
-- USB serial bridge (4 tasks: 15.3.1-15.3.4)
+**Platform Integration (1 task):**
 - BT Classic Kotlin service (1 task: 15.4.2)
 
 **OpenWRT (1 task):**
