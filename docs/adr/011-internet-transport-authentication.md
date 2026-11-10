@@ -118,9 +118,12 @@ The NodeId is **derived** from the `identity_key` in the `Hello` and never
 carried, so §14.3's binding cannot be violated by construction. The
 `listen_port` is signed because it becomes the peer's dialable address in the
 DHT; unsigned, a man in the middle could redirect every future dial for that
-node. An inbound peer's dialable address is its socket IP with that signed
-port, not the socket's ephemeral source port, which was never usable for
-dialling back.
+node. An **inbound** peer's dialable address is its socket IP with that
+signed port, because the socket's source port is ephemeral and was never
+usable for dialling back. An **outbound** connection keeps the address it
+dialled, which has just been proved to work: substituting the signed port there
+would break any peer behind a port forward, turning a working `public:443` into
+an unreachable `public:9736`.
 
 The inbound and outbound paths run the *same* `establish` function; the
 previous code had two copies of this logic, which is how they came to differ.
@@ -166,6 +169,12 @@ install a fresh token instead, which silently orphaned any connection made by
 `connect_to` before it — a supported case — so a later `stop()` never reached
 those sockets or their permits.
 
+The replacement token is published only **after** the drain, and dials are
+refused while a `stop()` is in progress. Publishing it first left a window in
+which a concurrent dial attached to the new token, survived the cancellation,
+had its map entry cleared by the shutdown, and then held its socket and permit
+for good.
+
 ### Connection slots are a semaphore
 
 `max_connections` becomes `Semaphore` permits. A permit is taken **before** the
@@ -201,7 +210,11 @@ concurrent lookups produce.
 A displaced connection closing must emit **no** `NeighborLost`. It is no longer
 the entry in the map, and reporting a loss for a peer that is still connected
 makes the routing layer drop that peer and its routes while the replacement is
-live. The event is therefore tied to actually removing the current entry.
+live. The event is therefore tied to actually removing the current entry, and
+is emitted **under the connection-map lock**, as `NeighborDiscovered` is. Both
+events have to be ordered with the map mutation they describe: emitted after
+unlocking, a reconnect could insert and announce itself in between, and the
+stale loss would still strip the live peer's routes.
 
 A dial made to reach a *particular* node carries that expectation, and a peer
 that proves a different identity is refused before anything is installed. The

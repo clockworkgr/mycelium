@@ -301,6 +301,12 @@ pub struct InternetTransport {
     /// Background tasks, so `stop()` can wait for the listener to close and
     /// for every connection to release its slot.
     tasks: Mutex<JoinSet<()>>,
+    /// Set for the duration of `stop()`. A dial that began before it is
+    /// cancelled through the old token; one that arrives during it is refused,
+    /// because it would otherwise attach to the replacement token, survive
+    /// cancellation, and have its map entry cleared out from under it while
+    /// its socket and permit stayed alive.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 /// A peer that has proved possession of the identity key behind its NodeId
@@ -504,6 +510,9 @@ impl Shared {
         socket_addr: SocketAddr,
         cancel: &CancellationToken,
         expected: Option<NodeId>,
+        // For an outbound connection, the address we dialled. `None` for an
+        // inbound one, where the peer's dialable address has to be derived.
+        dialled: Option<SocketAddr>,
         permit: Arc<OwnedSemaphorePermit>,
     ) -> Result<(NodeId, Arc<PeerConnection>, SealedReader, CancellationToken), TransportError>
     {
@@ -540,7 +549,14 @@ impl Shared {
         }
 
         let peer_id = channel.peer.node_id;
-        let dialable_addr = SocketAddr::new(socket_addr.ip(), channel.peer.listen_port);
+        // An outbound connection already proves a working endpoint, so keep
+        // it. Substituting the signed listen port would break a peer behind a
+        // port forward: `public:443 -> internal:9736` would be recorded as
+        // `public:9736`, which nothing can reach. The substitution exists for
+        // *inbound* connections, whose source port is ephemeral and was never
+        // dialable.
+        let dialable_addr =
+            dialled.unwrap_or_else(|| SocketAddr::new(socket_addr.ip(), channel.peer.listen_port));
         let conn_cancel = cancel.child_token();
         let (outbox, outbox_rx) = mpsc::channel(OUTBOX_CAPACITY);
         let conn = Arc::new(PeerConnection {
@@ -579,9 +595,13 @@ impl Shared {
         // connection is in the map, the caller must reach `read_loop` without
         // an await in between. A cancellation in that gap would leave a peer
         // installed with nothing reading from it and its slot released.
+        // The lock is held across the insert *and* the event, so discovery
+        // and loss are totally ordered with respect to the map. Emitting
+        // either after unlocking lets a reconnect's loss arrive after the
+        // replacement's discovery and strip the live peer's routes.
         let displaced = {
             let mut conns = self.connections.write().await;
-            match conns.get(&peer_id) {
+            let displaced = match conns.get(&peer_id) {
                 Some(existing) => {
                     // Two connections to one peer exist whenever both ends
                     // dial at once, or two lookups dial the same peer. Both
@@ -609,7 +629,12 @@ impl Shared {
                     conns.insert(peer_id, conn.clone());
                     None
                 }
-            }
+            };
+            let _ = self.event_tx.send(TransportEvent::NeighborDiscovered {
+                peer: peer_id,
+                transport: TransportType::InternetTunnel,
+            });
+            displaced
         };
         if let Some(displaced) = displaced {
             debug!(
@@ -618,11 +643,6 @@ impl Shared {
             );
             displaced.cancel();
         }
-
-        let _ = self.event_tx.send(TransportEvent::NeighborDiscovered {
-            peer: peer_id,
-            transport: TransportType::InternetTunnel,
-        });
 
         info!(
             "Internet: peer {} authenticated on {} (listens on {})",
@@ -734,28 +754,30 @@ impl Shared {
         // Takes the writer task down with us, so its permit share is released
         // and the socket closes instead of lingering.
         cancel.cancel();
+        // The DHT contact is deliberately kept: its address is what lets this
+        // peer be dialled again. Pruning contacts that have gone for good
+        // needs bucket liveness checks (ROADMAP T-32).
         let was_current = {
             // Only remove the entry if it is still ours: a reconnect that
-            // replaced it must not be torn down by this task's exit.
+            // replaced it must not be torn down by this task's exit. The event
+            // goes out under the same lock, so it cannot overtake the
+            // discovery of a connection that replaced us.
             let mut conns = self.connections.write().await;
             if conns
                 .get(&peer_id)
                 .is_some_and(|existing| Arc::ptr_eq(existing, &conn))
             {
                 conns.remove(&peer_id);
+                let _ = self.event_tx.send(TransportEvent::NeighborLost {
+                    peer: peer_id,
+                    transport: TransportType::InternetTunnel,
+                });
                 true
             } else {
                 false
             }
         };
-        // The DHT contact is deliberately kept: its address is what lets this
-        // peer be dialled again. Pruning contacts that have gone for good
-        // needs bucket liveness checks (ROADMAP T-32).
         if was_current {
-            let _ = self.event_tx.send(TransportEvent::NeighborLost {
-                peer: peer_id,
-                transport: TransportType::InternetTunnel,
-            });
             info!("Internet: peer {} disconnected", peer_id);
         } else {
             // A displaced connection must stay silent. Reporting a loss here
@@ -804,6 +826,7 @@ impl InternetTransport {
             started: RwLock::new(false),
             lifetime: std::sync::Mutex::new(CancellationToken::new()),
             tasks: Mutex::new(JoinSet::new()),
+            stopping: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -844,6 +867,9 @@ impl InternetTransport {
         addr: SocketAddr,
         expected: Option<NodeId>,
     ) -> Result<NodeId, TransportError> {
+        if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(TransportError::Other("transport is stopping".to_string()));
+        }
         let permit = Arc::new(self.shared.slots.clone().try_acquire_owned().map_err(|_| {
             TransportError::Other(format!(
                 "connection limit of {} reached",
@@ -874,7 +900,7 @@ impl InternetTransport {
 
         let (peer_id, conn, reader, conn_cancel) = self
             .shared
-            .establish(stream, addr, &cancel, expected, permit.clone())
+            .establish(stream, addr, &cancel, expected, Some(addr), permit.clone())
             .await?;
         tokio::spawn(
             self.shared
@@ -1012,7 +1038,14 @@ impl Transport for InternetTransport {
                                 let permit = Arc::new(permit);
                                 tokio::spawn(async move {
                                     match shared
-                                        .establish(stream, addr, &cancel, None, permit.clone())
+                                        .establish(
+                                            stream,
+                                            addr,
+                                            &cancel,
+                                            None,
+                                            None,
+                                            permit.clone(),
+                                        )
                                         .await
                                     {
                                         Ok((peer_id, conn, reader, conn_cancel)) => {
@@ -1067,7 +1100,7 @@ impl Transport for InternetTransport {
                 let permit = Arc::new(permit);
                 match connected {
                     Ok(stream) => match shared
-                        .establish(stream, addr, &cancel, None, permit.clone())
+                        .establish(stream, addr, &cancel, None, Some(addr), permit.clone())
                         .await
                     {
                         Ok((peer_id, conn, reader, conn_cancel)) => {
@@ -1118,15 +1151,12 @@ impl Transport for InternetTransport {
     /// failed to bind, and a stalled handshake kept its slot.
     async fn stop(&self) -> Result<(), TransportError> {
         let mut started = self.started.write().await;
-        // Swap in a fresh token before cancelling the old one: everything
-        // currently alive is a child or clone of the old token, including
-        // connections made before `start()`, and a later `start()` needs an
-        // uncancelled parent.
-        let previous = match self.lifetime.lock() {
-            Ok(mut guard) => std::mem::replace(&mut *guard, CancellationToken::new()),
-            Err(_) => CancellationToken::new(),
-        };
-        previous.cancel();
+        // Refuse dials for the duration, then cancel. The fresh token is not
+        // published until the drain is over, so nothing can attach to it and
+        // escape the shutdown.
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.lifetime_token().cancel();
         {
             // The listener lives in the accept task, so a restart cannot bind
             // until that task has dropped it. Bounded: a task that ignores
@@ -1156,6 +1186,13 @@ impl Transport for InternetTransport {
             warn!("Internet: a connection did not release its slot within the stop timeout");
         }
         self.shared.connections.write().await.clear();
+        // Only now is a usable token available again, so the next start() or
+        // dial gets one nothing in this shutdown was attached to.
+        if let Ok(mut guard) = self.lifetime.lock() {
+            *guard = CancellationToken::new();
+        }
+        self.stopping
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         *started = false;
         info!("Internet transport stopped");
         Ok(())
@@ -1806,6 +1843,115 @@ mod tests {
             "stop() must reclaim the slot even while a write is blocked"
         );
         drop(socket);
+    }
+
+    #[tokio::test]
+    async fn test_an_outbound_contact_keeps_the_address_that_worked() {
+        // A peer behind a port forward signs the port it listens on inside its
+        // own network, not the one we reached it on. Substituting it would
+        // turn a working `public:443` into an unreachable `public:9736`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reachable_port = listener.local_addr().unwrap().port();
+        let server = Identity::generate();
+        let server_id = server.node_id();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            // Claims a port it is not reachable on from here.
+            let _ = handshake(&server, 9999, &mut reader, &mut writer).await;
+            sleep(Duration::from_secs(5)).await;
+        });
+
+        let (_, client) = transport(free_port().await);
+        let addr: SocketAddr = format!("127.0.0.1:{}", reachable_port).parse().unwrap();
+        assert_eq!(client.connect_to(addr).await.unwrap(), server_id);
+
+        let contact = client
+            .dht()
+            .all_peers()
+            .await
+            .into_iter()
+            .find(|p| p.node_id == server_id)
+            .expect("the peer should be a DHT contact");
+        assert_eq!(
+            contact.addr, addr,
+            "an outbound contact must keep the endpoint that actually worked"
+        );
+
+        client.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_inbound_contact_uses_the_signed_listen_port() {
+        // The mirror of the test above: an inbound socket's source port is
+        // ephemeral, so the signed listen port is the only dialable one.
+        let port = free_port().await;
+        let (_, a) = transport(port);
+        a.start().await.unwrap();
+
+        let peer = Identity::generate();
+        let _socket = raw_client(port, &peer, true, false).await;
+        assert!(wait_for_peer(&a, &peer.node_id()).await);
+
+        let contact = a
+            .dht()
+            .all_peers()
+            .await
+            .into_iter()
+            .find(|p| p.node_id == peer.node_id())
+            .expect("the peer should be a DHT contact");
+        // `raw_client` signs listen_port 7000.
+        assert_eq!(contact.addr.port(), 7000);
+
+        a.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_dial_during_shutdown_is_refused() {
+        // A dial that attached to the token `stop()` used to publish *before*
+        // draining survived cancellation, had its map entry cleared, and kept
+        // its socket and permit for good. The gate is what closes that window;
+        // publishing the replacement token only after the drain is the second
+        // half, and is not separately observable because `start()` serialises
+        // against `stop()` on the `started` lock.
+        //
+        // Driven by setting the flag directly, because the real window — the
+        // inside of `stop()`'s drain — is too narrow to land in reliably, and
+        // a test that only sometimes exercises the bug is worse than none.
+        let port = free_port().await;
+        let (server_identity, server) = transport(port);
+        server.start().await.unwrap();
+
+        let (_, client) = transport(free_port().await);
+        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+        client
+            .stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = client
+            .connect_to(addr)
+            .await
+            .expect_err("a dial during shutdown must be refused");
+        assert!(err.to_string().contains("stopping"), "{}", err);
+        assert_eq!(
+            client.available_slots(),
+            64,
+            "a refused dial must not have taken a permit"
+        );
+
+        // Control: the same dial succeeds once the shutdown is over, so the
+        // refusal above is the gate and not something unrelated.
+        client
+            .stopping
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            client.connect_to(addr).await.unwrap(),
+            server_identity.node_id()
+        );
+
+        client.stop().await.unwrap();
+        assert_eq!(client.available_slots(), 64);
+        server.stop().await.unwrap();
     }
 
     #[tokio::test]

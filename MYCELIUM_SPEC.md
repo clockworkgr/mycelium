@@ -817,8 +817,10 @@ ephemeral key, or offers one yielding an all-zero shared secret, is refused.
 The peer's NodeId is **derived** from the `identity_key` in its `Hello` and
 never carried on the wire, so the §14.3 binding holds by construction. The
 `listen_port` is signed because it becomes the peer's dialable address in the
-DHT — an inbound peer's address is its socket IP with that signed port, since
-the socket's source port is ephemeral. A handshake that does not complete
+DHT. An *inbound* peer's address is its socket IP with that signed port, since
+the socket's source port is ephemeral; an *outbound* connection keeps the
+address it dialled, which has just been proved to work — substituting the
+signed port would break a peer behind a port forward. A handshake that does not complete
 closes the socket and installs nothing: no connection, no DHT contact, no
 `NeighborDiscovered`, so no route. The whole exchange is bounded by a 10 s
 timeout; duplicates and self-connections are refused; the transport is
@@ -857,10 +859,15 @@ the slot returns only once both tasks are gone. When two connections to one peer
 both ends dialling at once, or two lookups dialling the same peer — both ends
 keep the one with the **lower channel transcript**: identical at both ends of a
 connection, different between connections, and needing no extra exchange.
+Dials are refused while a `stop()` is draining, and the replacement
+cancellation token is published only afterwards, so no connection can attach to
+it and outlive the shutdown.
 Neither local arrival order nor "the lower NodeId dialled" works, the first
 because the two ends can disagree and the second because it cannot separate two
 connections opened by the same node. A displaced connection closing emits no
-`NeighborLost`, or the routing layer would drop a peer that is still connected.
+`NeighborLost`, or the routing layer would drop a peer that is still connected;
+both that event and `NeighborDiscovered` are emitted under the connection-map
+lock, so neither can overtake the mutation it describes.
 A dial made for a particular peer refuses a different proven identity before
 anything is installed.
 
