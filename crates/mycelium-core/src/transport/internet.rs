@@ -65,8 +65,8 @@ const OUTBOX_CAPACITY: usize = 128;
 /// considered dead. Bounds a peer that stops reading.
 const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait for a bootstrap TCP connect.
-const BOOTSTRAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for a TCP connect, dialled or bootstrap.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Configuration for the Internet transport.
 #[derive(Debug, Clone)]
@@ -120,13 +120,23 @@ impl SealedWriter {
 
 /// Owns the sealed write half for one connection.
 ///
-/// Every frame is sealed and written here, in one task that nothing cancels
-/// mid-frame. Senders only queue, so a cancelled send can lose a message but
-/// can never corrupt the channel.
+/// Every frame is sealed and written here, in one task that no *caller* can
+/// cancel mid-frame. Senders only queue, so a cancelled send can lose a
+/// message but can never corrupt the channel.
+///
+/// The write itself is inside the cancellation select, because a peer that
+/// stops reading would otherwise keep a live socket for the write timeout
+/// after `stop()` returned. Abandoning a half-written frame is safe here and
+/// only here: the task immediately cancels the connection and closes the
+/// socket, so nothing further is ever sealed for that channel.
+///
+/// Holds a share of the connection's permit, so the slot comes back only once
+/// both this task and the read loop are gone.
 async fn writer_task(
     mut writer: SealedWriter,
     mut outbox: mpsc::Receiver<InternetWireMessage>,
     cancel: CancellationToken,
+    _permit: Arc<OwnedSemaphorePermit>,
 ) {
     loop {
         let msg = tokio::select! {
@@ -136,7 +146,11 @@ async fn writer_task(
                 None => break,
             },
         };
-        match tokio::time::timeout(FRAME_WRITE_TIMEOUT, writer.send(&msg)).await {
+        let written = tokio::select! {
+            _ = cancel.cancelled() => break,
+            result = tokio::time::timeout(FRAME_WRITE_TIMEOUT, writer.send(&msg)) => result,
+        };
+        match written {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
                 debug!("Internet: write failed, closing the channel: {}", e);
@@ -148,8 +162,12 @@ async fn writer_task(
             }
         }
     }
-    // Close the write half so the peer sees EOF and both ends tear down,
-    // rather than leaving a half-written frame it would try to parse.
+    // A connection we can no longer write to is useless, and leaving its entry
+    // in place would block a reconnect while the peer keeps its own direction
+    // open. Cancelling tears the read loop down with us.
+    cancel.cancel();
+    // Close the write half so the peer sees EOF rather than a half-written
+    // frame it would try to parse.
     writer.shutdown().await;
 }
 
@@ -179,6 +197,9 @@ struct PeerConnection {
     /// useless for dialling back.
     dialable_addr: SocketAddr,
     connected_at: Instant,
+    /// Cancels just this connection, without stopping the transport. A child
+    /// of the transport's token, so `stop()` still reaches it.
+    cancel: CancellationToken,
     /// Queue into the connection's writer task.
     outbox: mpsc::Sender<InternetWireMessage>,
     /// In-flight DHT requests on *this* connection, awaiting their replies.
@@ -256,6 +277,9 @@ struct Shared {
     connections: RwLock<HashMap<NodeId, Arc<PeerConnection>>>,
     /// One permit per allowed connection; held for the connection's lifetime.
     slots: Arc<Semaphore>,
+    /// The permit count the semaphore was actually built with, so `stop()`
+    /// drains exactly as many as exist.
+    connection_limit: usize,
 }
 
 /// Internet transport using TCP connections and Kademlia DHT for discovery.
@@ -318,6 +342,41 @@ async fn write_framed<W: AsyncWrite + Unpin>(
         .write_all(&frame)
         .await
         .map_err(|e| TransportError::SendFailed(e.to_string()))
+}
+
+/// Which end opened a connection. Decides a simultaneous-dial tie the same
+/// way at both ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// We dialled the peer.
+    Outbound,
+    /// The peer dialled us.
+    Inbound,
+}
+
+impl Direction {
+    /// The node that opened this connection.
+    fn initiator(self, local: &NodeId, peer: &NodeId) -> NodeId {
+        match self {
+            Direction::Outbound => *local,
+            Direction::Inbound => *peer,
+        }
+    }
+
+    /// Whether this connection beats one already installed for the peer.
+    ///
+    /// "The lower NodeId's connection wins" is computed identically at both
+    /// ends from values both ends know, which is the whole point: a rule that
+    /// depended on local timing would have the two nodes keep different
+    /// connections and lose both.
+    fn initiator_wins(self, local: &NodeId, peer: &NodeId) -> bool {
+        let initiator = self.initiator(local, peer);
+        let responder = match self {
+            Direction::Outbound => *peer,
+            Direction::Inbound => *local,
+        };
+        initiator.as_bytes() < responder.as_bytes()
+    }
 }
 
 /// The result of a completed handshake: who the peer is, and the channel.
@@ -465,7 +524,11 @@ impl Shared {
         stream: TcpStream,
         socket_addr: SocketAddr,
         cancel: &CancellationToken,
-    ) -> Result<(NodeId, Arc<PeerConnection>, SealedReader), TransportError> {
+        direction: Direction,
+        expected: Option<NodeId>,
+        permit: Arc<OwnedSemaphorePermit>,
+    ) -> Result<(NodeId, Arc<PeerConnection>, SealedReader, CancellationToken), TransportError>
+    {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let channel = tokio::select! {
             _ = cancel.cancelled() => {
@@ -483,17 +546,30 @@ impl Shared {
                 "peer proved our own identity".to_string(),
             ));
         }
+        // Checked before anything is installed: a dial made to reach a
+        // particular node, from a referral that turned out to be stale or
+        // dishonest, must not leave an unrelated peer holding a slot.
+        if let Some(expected) = expected {
+            if channel.peer.node_id != expected {
+                return Err(TransportError::Other(format!(
+                    "{} answered at {}, expected {}",
+                    channel.peer.node_id, socket_addr, expected
+                )));
+            }
+        }
         if cancel.is_cancelled() {
             return Err(TransportError::Other("transport stopped".to_string()));
         }
 
         let peer_id = channel.peer.node_id;
         let dialable_addr = SocketAddr::new(socket_addr.ip(), channel.peer.listen_port);
+        let conn_cancel = cancel.child_token();
         let (outbox, outbox_rx) = mpsc::channel(OUTBOX_CAPACITY);
         let conn = Arc::new(PeerConnection {
             socket_addr,
             dialable_addr,
             connected_at: Instant::now(),
+            cancel: conn_cancel.clone(),
             outbox,
             pending: std::sync::Mutex::new(HashMap::new()),
         });
@@ -507,7 +583,8 @@ impl Shared {
                 cipher: channel.send,
             },
             outbox_rx,
-            cancel.clone(),
+            conn_cancel.clone(),
+            permit,
         ));
 
         self.dht
@@ -523,19 +600,39 @@ impl Shared {
         // connection is in the map, the caller must reach `read_loop` without
         // an await in between. A cancellation in that gap would leave a peer
         // installed with nothing reading from it and its slot released.
-
-        {
-            // A second connection claiming an already-connected peer is
-            // refused: accepting it would overwrite the live entry, and its
-            // later teardown would evict the real peer.
+        let displaced = {
             let mut conns = self.connections.write().await;
-            if conns.contains_key(&peer_id) {
-                return Err(TransportError::Other(format!(
-                    "{} is already connected",
-                    peer_id
-                )));
+            match conns.get(&peer_id) {
+                Some(existing) => {
+                    // Two nodes that dial each other at the same time each end
+                    // up with two connections, and must agree on which to
+                    // keep: if they choose differently, each closes the one
+                    // the other kept and both are lost. The rule is the same
+                    // on both sides — the connection opened by the lower
+                    // NodeId wins — and depends only on values both ends have.
+                    if !direction.initiator_wins(&self.local_id, &peer_id) {
+                        return Err(TransportError::Other(format!(
+                            "{} is already connected",
+                            peer_id
+                        )));
+                    }
+                    let displaced = existing.cancel.clone();
+                    conns.insert(peer_id, conn.clone());
+                    Some(displaced)
+                }
+                None => {
+                    conns.insert(peer_id, conn.clone());
+                    None
+                }
             }
-            conns.insert(peer_id, conn.clone());
+        };
+        if let Some(displaced) = displaced {
+            debug!(
+                "Internet: replacing the connection to {} with the one {} opened",
+                peer_id,
+                direction.initiator(&self.local_id, &peer_id)
+            );
+            displaced.cancel();
         }
 
         let _ = self.event_tx.send(TransportEvent::NeighborDiscovered {
@@ -548,7 +645,7 @@ impl Shared {
             peer_id, socket_addr, dialable_addr
         );
 
-        Ok((peer_id, conn, sealed_reader))
+        Ok((peer_id, conn, sealed_reader, conn_cancel))
     }
 
     /// Offer our own signed address record to one peer.
@@ -595,7 +692,7 @@ impl Shared {
         conn: Arc<PeerConnection>,
         mut reader: SealedReader,
         cancel: CancellationToken,
-        _permit: OwnedSemaphorePermit,
+        _permit: Arc<OwnedSemaphorePermit>,
     ) {
         loop {
             tokio::select! {
@@ -650,6 +747,9 @@ impl Shared {
             }
         }
 
+        // Takes the writer task down with us, so its permit share is released
+        // and the socket closes instead of lingering.
+        cancel.cancel();
         {
             // Only remove the entry if it is still ours: a reconnect that
             // replaced it must not be torn down by this task's exit.
@@ -684,9 +784,13 @@ impl InternetTransport {
             ..DhtConfig::default()
         };
         let dht = Arc::new(DhtEngine::new(identity.clone(), dht_config));
-        // Clamped to what `stop()`'s drain can ask for in one `acquire_many`,
-        // so the semaphore and the drain can never disagree about the total.
-        let permits = config.max_connections.clamp(1, u32::MAX as usize);
+        // Clamped to what a single `acquire_many` can ask for *and* to what
+        // the semaphore accepts — `Semaphore::MAX_PERMITS` is below `u32::MAX`
+        // on 32-bit targets, where a larger value would panic here. The same
+        // effective value is what `stop()` drains.
+        let permits = config
+            .max_connections
+            .clamp(1, Semaphore::MAX_PERMITS.min(u32::MAX as usize));
 
         Self {
             shared: Arc::new(Shared {
@@ -697,6 +801,7 @@ impl InternetTransport {
                 event_tx,
                 connections: RwLock::new(HashMap::new()),
                 slots: Arc::new(Semaphore::new(permits)),
+                connection_limit: permits,
             }),
             config,
             started: RwLock::new(false),
@@ -731,23 +836,59 @@ impl InternetTransport {
 
     /// Connect to a peer at the given address and authenticate it.
     pub async fn connect_to(&self, addr: SocketAddr) -> Result<NodeId, TransportError> {
-        let permit = self.shared.slots.clone().try_acquire_owned().map_err(|_| {
+        self.connect_expecting(addr, None).await
+    }
+
+    /// Dial `addr`, refusing the connection unless the peer proves it is
+    /// `expected` (when given).
+    pub async fn connect_expecting(
+        &self,
+        addr: SocketAddr,
+        expected: Option<NodeId>,
+    ) -> Result<NodeId, TransportError> {
+        let permit = Arc::new(self.shared.slots.clone().try_acquire_owned().map_err(|_| {
             TransportError::Other(format!(
                 "connection limit of {} reached",
-                self.config.max_connections
+                self.shared.connection_limit
             ))
-        })?;
+        })?);
 
-        let stream = TcpStream::connect(addr)
-            .await
-            .map_err(|e| TransportError::Other(format!("connect to {}: {}", addr, e)))?;
-
+        // Captured *before* the dial: a connect that outlives a stop() must
+        // not pick up the token of a later start() and install itself on a
+        // restarted transport.
         let cancel = self.current_cancel();
-        let (peer_id, conn, reader) = self.shared.establish(stream, addr, &cancel).await?;
+        let stream = tokio::select! {
+            _ = cancel.cancelled() => {
+                return Err(TransportError::Other("transport stopped".to_string()));
+            }
+            result = tokio::time::timeout(DIAL_TIMEOUT, TcpStream::connect(addr)) => {
+                match result {
+                    Ok(Ok(stream)) => stream,
+                    Ok(Err(e)) => {
+                        return Err(TransportError::Other(format!("connect to {}: {}", addr, e)))
+                    }
+                    Err(_) => {
+                        return Err(TransportError::Other(format!("connect to {} timed out", addr)))
+                    }
+                }
+            }
+        };
+
+        let (peer_id, conn, reader, conn_cancel) = self
+            .shared
+            .establish(
+                stream,
+                addr,
+                &cancel,
+                Direction::Outbound,
+                expected,
+                permit.clone(),
+            )
+            .await?;
         tokio::spawn(
             self.shared
                 .clone()
-                .read_loop(peer_id, conn, reader, cancel, permit),
+                .read_loop(peer_id, conn, reader, conn_cancel, permit),
         );
         Ok(peer_id)
     }
@@ -779,23 +920,19 @@ impl DhtRpc for InternetTransport {
         };
         let conn = match existing {
             Some(conn) => conn,
-            None => match self.connect_to(peer.addr).await {
-                Ok(id) if id == peer.node_id => {
-                    let conns = self.shared.connections.read().await;
-                    conns.get(&peer.node_id).cloned()?
-                }
-                Ok(other) => {
-                    debug!(
-                        "Internet: {} answered at {}, expected {}",
-                        other, peer.addr, peer.node_id
-                    );
-                    return None;
-                }
-                Err(e) => {
+            None => {
+                // The dial names the peer it is for, so a stale referral that
+                // leads to a different node is refused before it is installed.
+                if let Err(e) = self.connect_expecting(peer.addr, Some(peer.node_id)).await {
                     debug!("Internet: cannot reach {}: {}", peer.node_id, e);
-                    return None;
                 }
-            },
+                // Re-read the map either way: a concurrent lookup may have
+                // dialled the same peer and won the race, in which case our
+                // own dial was refused as a duplicate and the connection is
+                // perfectly usable.
+                let conns = self.shared.connections.read().await;
+                conns.get(&peer.node_id).cloned()?
+            }
         };
 
         let request_id = request.request_id;
@@ -884,11 +1021,24 @@ impl Transport for InternetTransport {
                                 // lock `stop()` holds, and a connection task
                                 // can itself dial out. `stop()` waits for
                                 // these by waiting for their permits instead.
+                                let permit = Arc::new(permit);
                                 tokio::spawn(async move {
-                                    match shared.establish(stream, addr, &cancel).await {
-                                        Ok((peer_id, conn, reader)) => {
+                                    match shared
+                                        .establish(
+                                            stream,
+                                            addr,
+                                            &cancel,
+                                            Direction::Inbound,
+                                            None,
+                                            permit.clone(),
+                                        )
+                                        .await
+                                    {
+                                        Ok((peer_id, conn, reader, conn_cancel)) => {
                                             shared
-                                                .read_loop(peer_id, conn, reader, cancel, permit)
+                                                .read_loop(
+                                                    peer_id, conn, reader, conn_cancel, permit,
+                                                )
                                                 .await;
                                         }
                                         Err(e) => {
@@ -923,7 +1073,7 @@ impl Transport for InternetTransport {
                 let connected = tokio::select! {
                     _ = cancel.cancelled() => return,
                     result = tokio::time::timeout(
-                        BOOTSTRAP_CONNECT_TIMEOUT,
+                        DIAL_TIMEOUT,
                         TcpStream::connect(addr),
                     ) => match result {
                         Ok(result) => result,
@@ -933,11 +1083,28 @@ impl Transport for InternetTransport {
                         }
                     },
                 };
+                let permit = Arc::new(permit);
                 match connected {
-                    Ok(stream) => match shared.establish(stream, addr, &cancel).await {
-                        Ok((peer_id, conn, reader)) => {
+                    Ok(stream) => match shared
+                        .establish(
+                            stream,
+                            addr,
+                            &cancel,
+                            Direction::Outbound,
+                            None,
+                            permit.clone(),
+                        )
+                        .await
+                    {
+                        Ok((peer_id, conn, reader, conn_cancel)) => {
                             info!("Internet: bootstrapped from {} ({})", addr, peer_id);
-                            tokio::spawn(shared.read_loop(peer_id, conn, reader, cancel, permit));
+                            tokio::spawn(shared.read_loop(
+                                peer_id,
+                                conn,
+                                reader,
+                                conn_cancel,
+                                permit,
+                            ));
                         }
                         Err(e) => {
                             warn!("Internet: bootstrap handshake with {} failed: {}", addr, e)
@@ -1001,7 +1168,7 @@ impl Transport for InternetTransport {
         // are detached (one can dial out, so joining them from here would
         // deadlock), and their permits are the observable proof that they are
         // gone — including handshakes that had stalled.
-        let permits = self.config.max_connections.clamp(1, u32::MAX as usize) as u32;
+        let permits = self.shared.connection_limit as u32;
         if tokio::time::timeout(STOP_DRAIN_TIMEOUT, self.shared.slots.acquire_many(permits))
             .await
             .is_err()
@@ -1394,6 +1561,7 @@ mod tests {
             socket_addr: "127.0.0.1:1".parse().unwrap(),
             dialable_addr: "127.0.0.1:1".parse().unwrap(),
             connected_at: Instant::now(),
+            cancel: CancellationToken::new(),
             outbox,
             pending: std::sync::Mutex::new(HashMap::new()),
         };
@@ -1466,6 +1634,96 @@ mod tests {
 
         a.stop().await.unwrap();
         b.stop().await.unwrap();
+    }
+
+    #[test]
+    fn test_both_ends_pick_the_same_connection_in_a_simultaneous_dial() {
+        let low = NodeId::from_bytes([0x01; 32]);
+        let high = NodeId::from_bytes([0xFE; 32]);
+
+        // The low-id node dialled out; the high-id node received that dial.
+        // Both must reach the same verdict about which connection to keep, or
+        // each closes the one the other kept and both are lost.
+        assert!(
+            Direction::Outbound.initiator_wins(&low, &high),
+            "the low id's outbound connection wins at its own end"
+        );
+        assert!(
+            Direction::Inbound.initiator_wins(&high, &low),
+            "and the same connection wins at the high id's end"
+        );
+
+        // The mirror-image connection must lose at both ends.
+        assert!(!Direction::Outbound.initiator_wins(&high, &low));
+        assert!(!Direction::Inbound.initiator_wins(&low, &high));
+    }
+
+    #[tokio::test]
+    async fn test_a_dial_for_the_wrong_peer_installs_nothing() {
+        let port = free_port().await;
+        let (server_identity, server) = transport(port);
+        server.start().await.unwrap();
+
+        let (_, client) = transport(free_port().await);
+        let mut client_events = client.events();
+        let wrong = Identity::generate().node_id();
+        let err = client
+            .connect_expecting(format!("127.0.0.1:{}", port).parse().unwrap(), Some(wrong))
+            .await
+            .expect_err("a dial naming the wrong peer must fail");
+        assert!(err.to_string().contains("expected"), "{}", err);
+
+        assert!(
+            !client
+                .connected_peers()
+                .contains(&server_identity.node_id()),
+            "a stale referral must not leave an unrelated peer holding a slot"
+        );
+        assert_eq!(client.available_slots(), 64);
+        assert!(
+            matches!(
+                client_events.try_recv(),
+                Err(broadcast::error::TryRecvError::Empty)
+            ),
+            "and must emit no discovery event"
+        );
+
+        server.stop().await.unwrap();
+        client.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stop_releases_the_slot_of_a_peer_that_stopped_reading() {
+        // A peer that completes the handshake and then never reads keeps the
+        // writer blocked. The write sits inside the cancellation select, so
+        // stop() must still get the slot back.
+        let port = free_port().await;
+        let a = InternetTransport::new(
+            Arc::new(Identity::generate()),
+            InternetConfig {
+                listen_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+                bootstrap_nodes: Vec::new(),
+                max_connections: 2,
+            },
+        );
+        a.start().await.unwrap();
+
+        let peer = Identity::generate();
+        let socket = raw_client(port, &peer, true, false).await;
+        assert!(wait_for_peer(&a, &peer.node_id()).await);
+
+        // Queue more than the socket and outbox can absorb without being read.
+        for _ in 0..OUTBOX_CAPACITY + 8 {
+            let _ = a.send(&peer.node_id(), &vec![0u8; a.mtu()]).await;
+        }
+
+        a.stop().await.unwrap();
+        assert_eq!(
+            a.available_slots(),
+            2,
+            "stop() must reclaim the slot even while a write is blocked"
+        );
+        drop(socket);
     }
 
     #[tokio::test]

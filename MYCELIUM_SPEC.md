@@ -849,6 +849,17 @@ failed send rather than a wait, and a write that fails or stalls shuts the
 write half down so both ends tear the connection down. `send()` returning `Ok`
 means the frame is queued, not that it is on the wire.
 
+Each connection also has its own cancellation token, a child of the
+transport's, and the read loop and writer task share the connection's permit.
+Either task cancels the token on the way out, so a connection that can no
+longer be written to is torn down rather than left blocking a reconnect, and
+the slot returns only once both tasks are gone. Two nodes that dial each other
+simultaneously keep the connection opened by the **lower NodeId** — a rule both
+ends compute from values both already have, because a rule based on local
+arrival order would have them keep different connections and lose both. A dial
+made for a particular peer refuses a different proven identity before anything
+is installed.
+
 **DHT records are signed.** A record is a node's claim about its own address —
 `public_key(32) ‖ addr ‖ published_at(8) ‖ signature(64)`, signed over
 `b"mycelium-dht-record-v1:" ‖ public_key ‖ addr ‖ published_at` and keyed under

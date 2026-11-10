@@ -145,6 +145,20 @@ This also keeps the read loop's own work inside its cancellation select: it
 queues DHT replies instead of writing them, so a peer that stops reading
 cannot hold its connection slot past `stop()`.
 
+The write itself *is* inside the writer task's own cancellation select, which
+looks like a contradiction and is not: abandoning a half-written frame is safe
+exactly there, because the task then cancels the connection and closes the
+socket, so nothing more is ever sealed for that channel. Without it, a peer
+that stopped reading kept a live socket for the full write timeout after
+`stop()` had returned — and the slot had already come back, so the dead socket
+escaped `max_connections` altogether.
+
+Each connection therefore has its **own cancellation token**, a child of the
+transport's. Either task cancels it on the way out, so a failed writer takes
+the read loop with it rather than leaving an entry that can never be written to
+and blocks a reconnect, and the permit is shared between both tasks so the slot
+returns only when both are gone.
+
 ### Connection slots are a semaphore
 
 `max_connections` becomes `Semaphore` permits. A permit is taken **before** the
@@ -154,6 +168,29 @@ socket is dropped immediately; the peer sees EOF rather than a hello.
 
 Taking the permit before the handshake rather than after is the point: an
 attacker who opens sockets and stalls is exactly the case the limit exists for.
+The permit count is clamped to what a single `acquire_many` can request *and*
+to `Semaphore::MAX_PERMITS`, which is below `u32::MAX` on the 32-bit Android
+targets — a larger configured value used to panic at construction — and the
+same effective value is what `stop()` drains.
+
+A dial is cancellable and timed out, and captures the cancellation token
+*before* connecting. Both matter: an unreachable host would otherwise hold a
+permit for the OS connect timeout and outlive `stop()`, and a dial that
+completed after a restart would read the *new* token and install itself on the
+restarted transport.
+
+Two nodes that dial each other at the same moment each end up with two
+connections and have to agree on which to keep. If they choose differently,
+each closes the one the other kept and both are lost. The rule is therefore
+computed identically at both ends from values both already have — **the
+connection opened by the lower NodeId wins** — and the loser's per-connection
+token is cancelled. A rule based on local arrival order would not do.
+
+A dial made to reach a *particular* node carries that expectation, and a peer
+that proves a different identity is refused before anything is installed. The
+identity is legitimate, but the connection is not the one that was asked for,
+and a stale or dishonest DHT referral should not leave an unrelated peer
+holding a slot.
 
 `stop()` cancels, waits for the accept task to drop the listener, and then
 waits for every permit to come back. Connection tasks are deliberately *not*
@@ -247,7 +284,9 @@ target's id. One exception is deliberate: when `store_record` says the answer
 is no newer than what we hold, the lookup returns the **cached** record rather
 than nothing, because that is what a second lookup racing the first looks like
 and reporting "not found" there would make concurrent resolution fail at
-random.
+random. For the same reason, a lookup whose own dial was refused as a duplicate
+re-reads the connection map before giving up: another lookup may have dialled
+the same peer and won, and that connection is perfectly usable.
 
 ## Consequences
 
