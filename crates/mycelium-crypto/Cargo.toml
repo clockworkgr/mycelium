@@ -14,6 +14,7 @@ aes-gcm = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { workspace = true }
 mycelium-protocol = { workspace = true }
 
 [dev-dependencies]

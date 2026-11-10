@@ -1,5 +1,6 @@
 pub mod discovery;
 pub mod double_ratchet;
+pub mod emergency;
 pub mod group;
 pub mod identity;
 pub mod session;

@@ -9,11 +9,11 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-10 against the working tree:
+Verified on 2026-11-10 against the working tree, after the T-06/07/10/11 work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **280 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **307 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -42,8 +42,13 @@ acceptance criteria written so that "done" is not a judgement call. Priorities:
 
 ## P0 — Correctness and security
 
-These nine tasks are the gate on v0.1. Each one is a defect in a feature that
-is already shipped and claimed to work.
+These are the gate on v0.1. Each one is a defect in a feature that is already
+shipped and claimed to work.
+
+**Landed 2026-11-10:** T-06 (signed-prekey retention + session rejection,
+ADR-009), T-07 (ratchet/chain durability + zeroization), T-10 (discovery
+timeout on its own sweep, one attempt per destination), T-11 (origin-aware DTN
+eviction, persisted origin + spray history). Five tasks remain below.
 
 ### T-01 · FFI robustness
 
@@ -116,41 +121,6 @@ currently has no key to verify against.
 - An unverifiable or insufficient co-signer set is dropped and logged.
 - Test: forged co-signer list rejected; correctly signed set accepted.
 
-### T-06 · Prekey rotation and X3DH failure signalling
-
-**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §5.2
-
-Two coupled problems. When a node rotates its signed prekey, every bundle other
-nodes have cached becomes undecryptable. And when X3DH fails, the responder
-silently drops the `SessionInit` — the initiator never learns to re-request, so
-the conversation is permanently stuck from the user's point of view.
-
-**Acceptance:**
-- Previous signed prekeys are retained for at least the bundle-cache lifetime,
-  and a `SessionInit` against a recently rotated SPK still succeeds.
-- X3DH failure sends a rejection that makes the initiator discard its cached
-  bundle and re-request.
-- Test: rotate the SPK, then establish a session from a stale cached bundle.
-- Test: a session against a genuinely invalid bundle produces a rejection and a
-  successful retry.
-
-### T-07 · Ratchet state persistence and key hygiene
-
-**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §5.3
-
-Ratchet state is persisted *after* the message is handed to the transport. If
-the process dies in between, the next send reuses a chain position — and
-AES-GCM nonce reuse under the same key is a catastrophic failure, not a
-degradation. Separately, no key material is zeroized on drop, so secrets linger
-in freed memory.
-
-**Acceptance:**
-- The ratchet state is committed to storage before the ciphertext is handed to
-  any transport.
-- Key material types implement `Zeroize`/`ZeroizeOnDrop`.
-- Test: simulate a crash between encrypt and send (persist, reload, send again)
-  and assert no chain position is reused.
-
 ### T-08 · Identity key at rest
 
 **Area:** `mycelium-daemon`, `mycelium-ffi`, platform · **Spec:** §5.7, §14.5, §22
@@ -181,8 +151,11 @@ Three problems in one transport:
    then route that node's traffic to the impostor.
 2. `max_connections` is configured but not enforced; an attacker opens
    connections until the node runs out of descriptors.
-3. Frames are JSON with byte arrays as number lists, so a payload hits the
-   1 MiB frame cap at roughly a tenth of the advertised 65 KB MTU.
+3. Frames are JSON with byte arrays as decimal number lists. Measured
+   expansion is 5.0x, and both `mtu()` and the receiver's `MAX_WIRE_MESSAGE`
+   are 1 MiB, so a send at the advertised MTU is rejected and the real ceiling
+   is about 210 KB. (The previous text here said "a tenth of the advertised
+   65 KB MTU"; both figures were wrong — `mtu()` returns 1 MiB.)
 
 The DHT underneath has matching gaps: no iterative lookup with termination and
 timeouts, no TTL or cap on stored records, no record signatures.
@@ -192,47 +165,9 @@ timeouts, no TTL or cap on stored records, no record signatures.
   unverified peer is refused and no route is installed for it.
 - `max_connections` is enforced, with the limit covered by a test.
 - Framing is binary (length-prefixed), and a payload up to the advertised MTU
-  round-trips.
+  round-trips. `mtu()` and `MAX_WIRE_MESSAGE` must agree after the change.
 - DHT lookups terminate deterministically; stored records carry a TTL, a total
   cap and a signature.
-
-### T-10 · AODV discovery timeout
-
-**Area:** `mycelium-node` · **Spec:** §7.3
-
-The spec requires DTN fallback after a 5 s route-discovery timeout. The check
-actually runs on the 30 s maintenance tick, so a message to an unreachable peer
-waits up to 30 s before entering DTN — and a pending destination can emit more
-than one RREQ per retry, multiplying flood traffic.
-
-**Acceptance:**
-- The pending-route timeout is evaluated on its own timer at the configured
-  interval (default 5 s).
-- At most one RREQ per destination per retry interval.
-- Test: assert the DTN transition happens within the configured timeout, not on
-  the maintenance tick.
-
-### T-11 · DTN eviction and spray persistence
-
-**Area:** `mycelium-core`, `mycelium-storage` · **Spec:** §7.2
-
-Eviction treats the local user's own outgoing bundles the same as relay
-traffic, so carrying mail for strangers can silently delete the user's own
-unsent messages. And `sprayed_to` is in-memory only, so after a restart the
-node re-sprays copies to peers that already hold them, wasting its copy budget
-and airtime.
-
-Related: protocol adapters share a single `TransportType`, so per-transport
-accounting and the manager's priority ordering cannot distinguish them.
-
-**Acceptance:**
-- Locally originated bundles are never evicted to make room for relay traffic;
-  relay traffic is evicted first regardless of age.
-- `sprayed_to` is persisted and reloaded with the bundle.
-- Adapters get distinct `TransportType` variants.
-- Test: fill storage with relay bundles and assert a local bundle survives.
-- Test: restart with a partially sprayed bundle and assert no peer is
-  re-sprayed.
 
 ---
 
@@ -292,6 +227,10 @@ otherwise.
   procd, survives reboot, LuCI pages render, a phone reaches the mesh through
   it.
 - **Meshtastic / Reticulum hardware** — gated behind T-16/T-17; listed there.
+- **Previously claimed complete, with no evidence** — 3-phone multi-hop,
+  transport failover on real radios, and BLE/Wi-Fi reconnection walk-tests. The
+  old task list marked these done; the only evidence in the repository is
+  mock-transport integration tests.
 
 **Acceptance:** a short test report per target recording hardware, firmware
 version and observed behaviour, and the corresponding spec markers updated.
@@ -348,17 +287,24 @@ dropped or retried — not the seamless handoff the design calls for.
 in-flight messages; a test degrades one mock transport mid-conversation and
 asserts no loss and no reordering beyond what Lamport ordering already permits.
 
-### T-12 · Adopt the compact LoRa frame
+### T-12 · Use the compact LoRa frame for beacons
 
 **Area:** `mycelium-core`, `mycelium-protocol` · **Spec:** §4.3
 
 The 27-byte compact frame is implemented and tested but unused: the LoRa
 transport fragments full 106-byte-header envelopes. At SF12's 51-byte MTU that
-is roughly a 4× overhead penalty on the most constrained link in the system.
+is roughly a 4x overhead penalty on the most constrained link in the system.
 
-**Acceptance:** LoRa sends compact frames with a NodeId resolver for truncated
-identifiers; measured payload efficiency at SF12 improves; a round-trip test
-covers truncation collisions.
+**Scoped to beacons only.** ADR-008's rejected alternative #1 turned the
+compact frame down for general traffic: truncated NodeIds collide, a truncated
+message id would make receipts reference the wrong message, and every relay
+would need an id resolver. None of that applies to beacons, which are never
+forwarded (`ttl = 1`) and carry no message id. Widening it beyond beacons
+requires superseding ADR-008.
+
+**Acceptance:** LoRa beacons go out as compact frames and are reassembled by a
+peer; measured beacon airtime at SF12 drops; general traffic still uses full
+envelopes.
 
 ### T-13 · Instantiate transport plugins from config
 

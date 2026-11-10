@@ -38,7 +38,12 @@ fn static_priority(t: TransportType) -> u8 {
         TransportType::BtClassic => 4,
         TransportType::InternetTunnel => 3,
         TransportType::Ble => 2,
+        // Foreign-protocol bridges rank with the radio they ride on: both are
+        // low-bandwidth LoRa-class links, and a message that can go over a
+        // native transport should.
+        TransportType::Reticulum => 2,
         TransportType::Lora => 1,
+        TransportType::Meshtastic => 1,
         TransportType::Mock => 0,
     }
 }

@@ -25,7 +25,7 @@ Then, as needed:
 3. [`CONTRIBUTING.md`](CONTRIBUTING.md) — build setup, test commands, project
    structure, commit conventions.
 4. [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-001 …
-   ADR-008). Append-only; never rewrite one.
+   ADR-009). Append-only; never rewrite one.
 5. [`docs/plugin-api.md`](docs/plugin-api.md) — transport plugin development
    guide (external audience).
 
@@ -64,7 +64,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 280 tests).
+- `cargo test` runs the whole workspace (currently 307 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -255,7 +255,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-10: 280 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-10: 307 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -264,10 +264,11 @@ clean, `flutter analyze` clean.
 - Everything in the v0.1 scope is implemented. What remains is hardening of
   shipped features, validation against real hardware, and v0.2 adapter work.
 - **See [`ROADMAP.md`](ROADMAP.md) for the authoritative list of open work** —
-  21 tasks, `T-01` … `T-21`, prioritised P0/P1/P2. Do not re-derive it from the
-  code; update it as tasks land.
+  prioritised P0/P1/P2. T-06, T-07, T-10 and T-11 landed on 2026-11-10. Do not
+  re-derive the list from the code; update it as tasks land.
 
 The highest-priority open items (all P0, all defects in shipped features): FFI
 panic guards (`T-01`), group-discovery proof of possession (`T-04`), emergency
-co-signer signatures (`T-05`), ratchet persist-before-send (`T-07`), identity
-key at rest (`T-08`), internet-transport peer authentication (`T-09`).
+co-signer signatures (`T-05`, wire format and verification landed; collecting
+co-signatures is not built), identity key at rest (`T-08`), internet-transport
+peer authentication (`T-09`).

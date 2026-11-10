@@ -31,9 +31,23 @@ pub struct PrekeyState {
     /// consumed by an incoming `SessionInit`. Kept so the responder can still
     /// complete X3DH, but never re-issued to another initiator.
     issued_one_time_prekeys: Vec<(u32, X25519Secret)>,
+    /// Signed prekeys this node has rotated away from, newest first.
+    ///
+    /// A bundle other nodes cached before a rotation still names the old
+    /// `signed_prekey_id`. Without the matching secret the responder derives a
+    /// different shared secret, the AEAD tag fails, and the conversation is
+    /// permanently stuck (ROADMAP T-06). Retained for at least the
+    /// bundle-cache lifetime.
+    previous_signed_prekeys: Vec<(u32, X25519Secret)>,
     next_otp_id: u32,
     next_spk_id: u32,
 }
+
+/// How many rotated signed prekeys to keep.
+///
+/// Rotation is roughly weekly and cached bundles expire after 7 days, so two
+/// covers the window with a margin.
+pub const MAX_RETAINED_SIGNED_PREKEYS: usize = 2;
 
 impl PrekeyState {
     pub fn new(identity: Identity) -> Self {
@@ -44,6 +58,7 @@ impl PrekeyState {
             signed_prekey_id: 1,
             one_time_prekeys: Vec::new(),
             issued_one_time_prekeys: Vec::new(),
+            previous_signed_prekeys: Vec::new(),
             next_otp_id: 1,
             next_spk_id: 2,
         }
@@ -58,11 +73,34 @@ impl PrekeyState {
         }
     }
 
-    /// Rotate the signed prekey.
+    /// Rotate the signed prekey, retaining the outgoing one.
+    ///
+    /// The previous secret is kept so a peer initiating from a bundle it
+    /// cached before the rotation can still complete X3DH.
     pub fn rotate_signed_prekey(&mut self) {
-        self.signed_prekey_secret = X25519Secret::random_from_rng(rand::rngs::OsRng);
+        let retiring = std::mem::replace(
+            &mut self.signed_prekey_secret,
+            X25519Secret::random_from_rng(rand::rngs::OsRng),
+        );
+        self.previous_signed_prekeys
+            .insert(0, (self.signed_prekey_id, retiring));
+        self.previous_signed_prekeys
+            .truncate(MAX_RETAINED_SIGNED_PREKEYS);
+
         self.signed_prekey_id = self.next_spk_id;
         self.next_spk_id += 1;
+    }
+
+    /// The secret for a given signed-prekey id: the current one, or a retained
+    /// one if the initiator used a bundle from before a rotation.
+    pub fn signed_prekey_secret_for(&self, id: u32) -> Option<&X25519Secret> {
+        if id == self.signed_prekey_id {
+            return Some(&self.signed_prekey_secret);
+        }
+        self.previous_signed_prekeys
+            .iter()
+            .find(|(pid, _)| *pid == id)
+            .map(|(_, secret)| secret)
     }
 
     /// Build a prekey bundle without reserving the one-time prekey.
@@ -135,13 +173,21 @@ impl PrekeyState {
 
     /// Serialize the prekey state (excluding identity) to bytes for persistence.
     ///
+    /// The buffer contains the signed prekey secret, every one-time prekey and
+    /// every retained rotated secret in the clear. Callers must wipe it once
+    /// written; `Node` does so via `Zeroizing`.
+    ///
     /// Format: signed_prekey_secret(32) + signed_prekey_id(4) + next_otp_id(4)
     ///       + next_spk_id(4) + num_otps(4) + [otp_id(4) + otp_secret(32)]*
     pub fn to_bytes(&self) -> Vec<u8> {
         // Issued-but-unconsumed OTPs are persisted alongside the unissued pool;
         // after a restart they become issuable again, which is harmless.
         let num_otps = self.one_time_prekeys.len() + self.issued_one_time_prekeys.len();
-        let mut buf = Vec::with_capacity(48 + num_otps * 36);
+        // Capacity must cover the retained signed prekeys too. A realloc here
+        // would copy the secrets already written and free the old allocation
+        // without wiping it.
+        let mut buf =
+            Vec::with_capacity(48 + num_otps * 36 + 4 + self.previous_signed_prekeys.len() * 36);
 
         buf.extend_from_slice(&self.signed_prekey_secret.to_bytes());
         buf.extend_from_slice(&self.signed_prekey_id.to_le_bytes());
@@ -154,6 +200,15 @@ impl PrekeyState {
             .iter()
             .chain(self.one_time_prekeys.iter())
         {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&secret.to_bytes());
+        }
+
+        // Retained signed prekeys, appended after the one-time pool. A blob
+        // written before this field existed simply ends here, and `from_bytes`
+        // reads that as "none retained" — so no version byte is needed.
+        buf.extend_from_slice(&(self.previous_signed_prekeys.len() as u32).to_le_bytes());
+        for (id, secret) in &self.previous_signed_prekeys {
             buf.extend_from_slice(&id.to_le_bytes());
             buf.extend_from_slice(&secret.to_bytes());
         }
@@ -204,12 +259,34 @@ impl PrekeyState {
             one_time_prekeys.push((id, secret));
         }
 
+        // Retained signed prekeys are optional: a blob written before the
+        // field existed ends after the one-time pool.
+        let mut previous_signed_prekeys = Vec::new();
+        if data.len() - offset >= 4 {
+            let num_retained =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+            // Overflow-safe on 32-bit targets.
+            if (data.len() - offset) / 36 < num_retained {
+                return None;
+            }
+            for _ in 0..num_retained {
+                let id = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                offset += 4;
+                let mut secret_bytes = [0u8; 32];
+                secret_bytes.copy_from_slice(&data[offset..offset + 32]);
+                offset += 32;
+                previous_signed_prekeys.push((id, X25519Secret::from(secret_bytes)));
+            }
+        }
+
         Some(Self {
             identity,
             signed_prekey_secret,
             signed_prekey_id,
             one_time_prekeys,
             issued_one_time_prekeys: Vec::new(),
+            previous_signed_prekeys,
             next_otp_id,
             next_spk_id,
         })
@@ -275,7 +352,10 @@ pub fn x3dh_initiate(
     let dh2 = ephemeral_secret.diffie_hellman(&their_identity_x25519);
     let dh3 = ephemeral_secret.diffie_hellman(&their_signed_prekey);
 
-    let mut dh_concat = Vec::with_capacity(128);
+    // Zeroizing at the allocation, not a wipe before the happy-path
+    // return: `?` on a missing one-time prekey would otherwise leave raw
+    // DH output in freed heap memory.
+    let mut dh_concat = zeroize::Zeroizing::new(Vec::with_capacity(128));
     dh_concat.extend_from_slice(dh1.as_bytes());
     dh_concat.extend_from_slice(dh2.as_bytes());
     dh_concat.extend_from_slice(dh3.as_bytes());
@@ -305,24 +385,33 @@ pub fn x3dh_respond(
     our_state: &mut PrekeyState,
     their_identity_key: &[u8; 32],
     their_ephemeral_key: &[u8; 32],
+    used_signed_prekey_id: u32,
     used_otp_id: Option<u32>,
 ) -> Result<X3dhResponseResult, X3dhError> {
     let their_identity_x25519 = ed25519_public_to_x25519(their_identity_key)?;
     let their_ephemeral = X25519Public::from(*their_ephemeral_key);
 
+    // The initiator built its half of the exchange against a specific signed
+    // prekey. Use that one — current or retained — rather than whichever is
+    // current now, or a rotation since the bundle was cached silently derives
+    // a different secret and only shows up as an AEAD failure (ROADMAP T-06).
+    let signed_prekey_secret = our_state
+        .signed_prekey_secret_for(used_signed_prekey_id)
+        .ok_or(X3dhError::SignedPrekeyNotFound)?
+        .clone();
+
     // Convert our Ed25519 identity to X25519
     let our_identity_x25519 = ed25519_to_x25519_secret(our_state.identity.signing_key());
 
     // DH operations (mirror of initiate)
-    let dh1 = our_state
-        .signed_prekey_secret
-        .diffie_hellman(&their_identity_x25519);
+    let dh1 = signed_prekey_secret.diffie_hellman(&their_identity_x25519);
     let dh2 = our_identity_x25519.diffie_hellman(&their_ephemeral);
-    let dh3 = our_state
-        .signed_prekey_secret
-        .diffie_hellman(&their_ephemeral);
+    let dh3 = signed_prekey_secret.diffie_hellman(&their_ephemeral);
 
-    let mut dh_concat = Vec::with_capacity(128);
+    // Zeroizing at the allocation, not a wipe before the happy-path
+    // return: `?` on a missing one-time prekey would otherwise leave raw
+    // DH output in freed heap memory.
+    let mut dh_concat = zeroize::Zeroizing::new(Vec::with_capacity(128));
     dh_concat.extend_from_slice(dh1.as_bytes());
     dh_concat.extend_from_slice(dh2.as_bytes());
     dh_concat.extend_from_slice(dh3.as_bytes());
@@ -392,6 +481,10 @@ pub enum X3dhError {
     InvalidSignature,
     #[error("one-time prekey not found")]
     OneTimePrekeyNotFound,
+    /// The initiator used a signed prekey we no longer hold: its bundle is
+    /// older than `MAX_RETAINED_SIGNED_PREKEYS` rotations.
+    #[error("signed prekey not found (stale bundle)")]
+    SignedPrekeyNotFound,
 }
 
 #[cfg(test)]
@@ -400,12 +493,114 @@ mod tests {
 
     /// A non-decompressible Ed25519 encoding (y = 2 has no valid x) must be
     /// rejected, not panic, on the responder side.
+    /// A bundle cached before a signed-prekey rotation must still work.
+    ///
+    /// The responder used to run X3DH with whatever signed prekey was current,
+    /// ignoring the `signed_prekey_id` the initiator told it on the wire. After
+    /// a rotation that silently derived a different shared secret, so the AEAD
+    /// tag failed and the conversation was stuck forever (ROADMAP T-06).
+    #[test]
+    fn test_respond_with_retained_signed_prekey_after_rotation() {
+        let mut bob_state = PrekeyState::new(Identity::generate());
+        bob_state.generate_one_time_prekeys(2);
+
+        // Alice caches a bundle, then Bob rotates.
+        let cached = bob_state.issue_bundle();
+        let cached_spk_id = cached.signed_prekey_id;
+        bob_state.rotate_signed_prekey();
+        assert_ne!(
+            bob_state.signed_prekey_id, cached_spk_id,
+            "precondition: the rotation must change the id"
+        );
+
+        let alice = Identity::generate();
+        let init = x3dh_initiate(&alice, &cached).unwrap();
+        let respond = x3dh_respond(
+            &mut bob_state,
+            &alice.public_key_bytes(),
+            &init.ephemeral_public,
+            cached.signed_prekey_id,
+            cached.one_time_prekey_id,
+        )
+        .expect("a bundle from before the rotation must still complete X3DH");
+
+        assert_eq!(
+            init.shared_secret, respond.shared_secret,
+            "both sides must derive the same secret across a rotation"
+        );
+    }
+
+    /// A bundle older than the retention window fails loudly, rather than
+    /// deriving a secret that silently disagrees.
+    #[test]
+    fn test_respond_rejects_signed_prekey_beyond_retention() {
+        let mut bob_state = PrekeyState::new(Identity::generate());
+        let cached = bob_state.bundle();
+
+        for _ in 0..=MAX_RETAINED_SIGNED_PREKEYS {
+            bob_state.rotate_signed_prekey();
+        }
+
+        let alice = Identity::generate();
+        let init = x3dh_initiate(&alice, &cached).unwrap();
+        let result = x3dh_respond(
+            &mut bob_state,
+            &alice.public_key_bytes(),
+            &init.ephemeral_public,
+            cached.signed_prekey_id,
+            cached.one_time_prekey_id,
+        );
+
+        assert!(
+            matches!(result, Err(X3dhError::SignedPrekeyNotFound)),
+            "a bundle older than the retention window must fail loudly"
+        );
+    }
+
+    /// Retained signed prekeys must survive a persistence round trip, or a
+    /// restart re-opens the window this task closed.
+    #[test]
+    fn test_retained_signed_prekeys_survive_roundtrip() {
+        let identity = Identity::generate();
+        let identity_bytes = identity.to_bytes();
+        let mut state = PrekeyState::new(identity);
+        let cached = state.bundle();
+        state.rotate_signed_prekey();
+
+        let restored = PrekeyState::from_bytes_with_identity(
+            &state.to_bytes(),
+            Identity::from_bytes(&identity_bytes).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            restored
+                .signed_prekey_secret_for(cached.signed_prekey_id)
+                .is_some(),
+            "the retained signed prekey must be restored"
+        );
+
+        // And it still completes X3DH after the round trip.
+        let mut restored = restored;
+        let alice = Identity::generate();
+        let init = x3dh_initiate(&alice, &cached).unwrap();
+        let respond = x3dh_respond(
+            &mut restored,
+            &alice.public_key_bytes(),
+            &init.ephemeral_public,
+            cached.signed_prekey_id,
+            cached.one_time_prekey_id,
+        )
+        .unwrap();
+        assert_eq!(init.shared_secret, respond.shared_secret);
+    }
+
     #[test]
     fn test_x3dh_respond_rejects_invalid_identity_key() {
         let mut bob_state = PrekeyState::new(Identity::generate());
         let mut bad_key = [0u8; 32];
         bad_key[0] = 0x02;
-        let result = x3dh_respond(&mut bob_state, &bad_key, &[7u8; 32], None);
+        let spk_id = bob_state.signed_prekey_id;
+        let result = x3dh_respond(&mut bob_state, &bad_key, &[7u8; 32], spk_id, None);
         assert!(matches!(result, Err(X3dhError::InvalidIdentityKey)));
     }
 
@@ -429,6 +624,7 @@ mod tests {
             &mut bob_state,
             &alice.public_key_bytes(),
             &a.ephemeral_public,
+            b1.signed_prekey_id,
             b1.one_time_prekey_id,
         )
         .unwrap();
@@ -436,6 +632,7 @@ mod tests {
             &mut bob_state,
             &carol.public_key_bytes(),
             &c.ephemeral_public,
+            b2.signed_prekey_id,
             b2.one_time_prekey_id,
         )
         .unwrap();
@@ -473,6 +670,7 @@ mod tests {
             &mut bob_state,
             &alice.public_key_bytes(),
             &init_result.ephemeral_public,
+            bundle.signed_prekey_id,
             bundle.one_time_prekey_id,
         )
         .unwrap();
@@ -498,6 +696,7 @@ mod tests {
             &mut bob_state,
             &alice.public_key_bytes(),
             &init_result.ephemeral_public,
+            bundle.signed_prekey_id,
             None,
         )
         .unwrap();

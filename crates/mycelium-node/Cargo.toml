@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 mycelium-core = { workspace = true }
 mycelium-crypto = { workspace = true }
+zeroize = { workspace = true }
 mycelium-protocol = { workspace = true }
 mycelium-storage = { workspace = true }
 tokio = { workspace = true }

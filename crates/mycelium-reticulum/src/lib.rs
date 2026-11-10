@@ -480,7 +480,7 @@ impl ReticulumTransport {
                 peers.push(peer_id);
                 let _ = self.tx.send(TransportEvent::NeighborDiscovered {
                     peer: peer_id,
-                    transport: TransportType::InternetTunnel,
+                    transport: TransportType::Reticulum,
                 });
             }
         }
@@ -501,7 +501,7 @@ impl ReticulumTransport {
                 peers.push(peer_id);
                 let _ = self.tx.send(TransportEvent::NeighborDiscovered {
                     peer: peer_id,
-                    transport: TransportType::InternetTunnel,
+                    transport: TransportType::Reticulum,
                 });
             }
         }
@@ -515,7 +515,7 @@ impl ReticulumTransport {
             let _ = self.tx.send(TransportEvent::DataReceived {
                 peer: peer_id,
                 data: packet.data.clone(),
-                transport: TransportType::InternetTunnel,
+                transport: TransportType::Reticulum,
             });
         }
     }
@@ -537,7 +537,9 @@ impl ReticulumTransport {
 #[async_trait::async_trait]
 impl Transport for ReticulumTransport {
     fn transport_type(&self) -> TransportType {
-        TransportType::InternetTunnel // Reticulum typically runs over IP
+        // A Reticulum bridge. Distinct from InternetTunnel, which is
+        // Mycelium's own TCP overlay.
+        TransportType::Reticulum
     }
 
     async fn start(&self) -> Result<(), TransportError> {
@@ -851,7 +853,7 @@ mod tests {
     #[tokio::test]
     async fn test_reticulum_transport_lifecycle() {
         let transport = ReticulumTransport::new(ReticulumConfig::default());
-        assert_eq!(transport.transport_type(), TransportType::InternetTunnel);
+        assert_eq!(transport.transport_type(), TransportType::Reticulum);
         assert_eq!(transport.mtu(), RETICULUM_MDU);
 
         transport.start().await.unwrap();

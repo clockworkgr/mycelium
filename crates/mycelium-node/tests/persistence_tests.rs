@@ -23,6 +23,8 @@ fn test_dtn_bundle_db_roundtrip() {
         copies_remaining: 4,
         expires_at: 9999999999,
         size: 17,
+        is_local: false,
+        sprayed_to: Vec::new(),
     };
 
     db.store_dtn_bundle(&record).unwrap();
@@ -47,6 +49,8 @@ fn test_dtn_bundle_update_copies() {
         copies_remaining: 8,
         expires_at: 9999999999,
         size: 4,
+        is_local: false,
+        sprayed_to: Vec::new(),
     };
 
     db.store_dtn_bundle(&record).unwrap();
@@ -69,6 +73,8 @@ fn test_dtn_bundle_expire() {
             copies_remaining: 1,
             expires_at: if i < 3 { 100 } else { 9999999999 }, // 3 expired, 2 valid
             size: 1,
+            is_local: false,
+            sprayed_to: Vec::new(),
         };
         db.store_dtn_bundle(&record).unwrap();
     }
@@ -94,6 +100,8 @@ fn test_dtn_storage_used() {
             copies_remaining: 1,
             expires_at: 9999999999,
             size: (i + 1) * 100,
+            is_local: false,
+            sprayed_to: Vec::new(),
         };
         db.store_dtn_bundle(&record).unwrap();
     }

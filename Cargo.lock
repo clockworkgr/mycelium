@@ -846,6 +846,7 @@ dependencies = [
  "sha2",
  "thiserror",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
@@ -915,6 +916,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

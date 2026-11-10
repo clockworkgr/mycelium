@@ -5,8 +5,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
-use mycelium_core::dtn::spray_and_wait::{DtnAction, DtnBundle, DtnConfig, DtnEngine};
+use mycelium_core::dtn::spray_and_wait::{DtnAction, DtnBundle, DtnConfig, DtnEngine, DtnError};
 use mycelium_core::routing::aodv::{
     AodvAction, AodvMessage, AodvRouter, RouteError, RouteReply, RouteRequest,
 };
@@ -18,7 +19,7 @@ use mycelium_crypto::group::{GroupError, SenderKey, SenderKeyGroup};
 use mycelium_crypto::identity::{node_id_from_public_key, Identity};
 use mycelium_crypto::session::{SessionError, SessionManager};
 use mycelium_crypto::wot::TrustGraph;
-use mycelium_crypto::x3dh::{PrekeyBundle, PrekeyState};
+use mycelium_crypto::x3dh::{PrekeyBundle, PrekeyState, X3dhError};
 use mycelium_protocol::codec::{CodecError, Envelope};
 use mycelium_protocol::types::{
     ContentType, LamportClock, MessageFlags, MessageId, NodeId, NodeType, ProtocolVersion,
@@ -71,20 +72,52 @@ struct PendingMessage {
     message_id: MessageId,
 }
 
-/// A pending route discovery with queued envelope.
+/// An envelope waiting for a route to its destination.
 struct PendingRoute {
     envelope_bytes: Vec<u8>,
     message_id: MessageId,
+}
+
+/// One in-flight route discovery, with every envelope waiting on it.
+///
+/// The deadline and retry count belong to the destination, not to each
+/// envelope: all of them are waiting for the same route, so they share one
+/// attempt. Keeping them per envelope meant staggered sends produced
+/// staggered retries and an RREQ flood per message (ROADMAP T-10).
+struct PendingDiscovery {
+    envelopes: Vec<PendingRoute>,
     started_at: Instant,
     retries: u8,
+}
+
+impl PendingDiscovery {
+    fn new() -> Self {
+        Self {
+            envelopes: Vec::new(),
+            started_at: Instant::now(),
+            retries: 0,
+        }
+    }
 }
 
 /// Maximum number of AODV discovery retries before DTN fallback.
 const MAX_DISCOVERY_RETRIES: u8 = 1;
 
+/// How often the pending-route queue is checked against
+/// `RoutingCoordinator::discovery_timeout()`. Must be well below that timeout
+/// or the fallback is late; see ROADMAP T-10.
+const DISCOVERY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Two peers that initiate a session with each other within this window are
 /// treated as a simultaneous initiation (see `handle_session_init`).
 const SIMULTANEOUS_INIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Maintenance ticks between signed-prekey rotations: weekly, at the 30 s tick.
+///
+/// Coupled to `MAX_RETAINED_SIGNED_PREKEYS` and to the 7-day prekey-bundle
+/// cache lifetime: `MAX_RETAINED_SIGNED_PREKEYS * 7 days >= 7 days`, so a peer
+/// initiating from any unexpired cached bundle finds the secret it needs.
+const SPK_ROTATION_TICKS: u32 = 7 * 24 * 3600 / 30;
 
 /// The main Mycelium node, tying together all subsystems.
 pub struct Node {
@@ -103,7 +136,7 @@ pub struct Node {
     lamport_clock: Arc<RwLock<LamportClock>>,
     pub prekey_cache: Arc<RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>>,
     pending_messages: Arc<RwLock<HashMap<NodeId, Vec<PendingMessage>>>>,
-    pending_routes: Arc<RwLock<HashMap<NodeId, Vec<PendingRoute>>>>,
+    pending_routes: Arc<RwLock<HashMap<NodeId, PendingDiscovery>>>,
     cancel: CancellationToken,
     /// Handle to BLE transport for platform FFI callbacks.
     pub ble_transport: Arc<RwLock<Option<Arc<mycelium_core::transport::ble::BleTransport>>>>,
@@ -143,7 +176,7 @@ struct SendCtx<'a> {
     session_manager: &'a RwLock<SessionManager>,
     prekey_cache: &'a RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>,
     pending_messages: &'a RwLock<HashMap<NodeId, Vec<PendingMessage>>>,
-    pending_routes: &'a RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
+    pending_routes: &'a RwLock<HashMap<NodeId, PendingDiscovery>>,
     lamport_clock: &'a RwLock<LamportClock>,
     groups: &'a RwLock<HashMap<[u8; 32], SenderKeyGroup>>,
     key_sent_to: &'a RwLock<HashMap<[u8; 32], HashSet<NodeId>>>,
@@ -236,6 +269,7 @@ impl Node {
             let mut prekey_state = self.prekey_state.write().await;
             match self.db.load_prekey_state_blob() {
                 Ok(blob) => {
+                    let blob = zeroize::Zeroizing::new(blob);
                     let identity = identity_clone_for_prekeys(&self.identity);
                     if let Some(restored) = PrekeyState::from_bytes_with_identity(&blob, identity) {
                         info!(
@@ -247,13 +281,17 @@ impl Node {
                     } else {
                         debug!("Failed to deserialize prekey state, generating fresh");
                         prekey_state.generate_one_time_prekeys(100);
-                        let _ = self.db.save_prekey_state_blob(&prekey_state.to_bytes());
+                        let _ = self.db.save_prekey_state_blob(&zeroize::Zeroizing::new(
+                            prekey_state.to_bytes(),
+                        ));
                     }
                 }
                 Err(_) => {
                     // No saved state; generate fresh prekeys and persist
                     prekey_state.generate_one_time_prekeys(100);
-                    let _ = self.db.save_prekey_state_blob(&prekey_state.to_bytes());
+                    let _ = self
+                        .db
+                        .save_prekey_state_blob(&zeroize::Zeroizing::new(prekey_state.to_bytes()));
                     info!("Generated fresh prekey state with 100 one-time prekeys");
                 }
             }
@@ -264,7 +302,10 @@ impl Node {
             let mut sm = self.session_manager.write().await;
             if let Ok(records) = self.db.list_sessions() {
                 for record in records {
-                    match SessionManager::deserialize_session(&record.session_data) {
+                    // The blob holds the root key and both chain keys; wipe
+                    // our copy once the session is rebuilt from it.
+                    let session_data = zeroize::Zeroizing::new(record.session_data);
+                    match SessionManager::deserialize_session(&session_data) {
                         Ok(session) => {
                             info!("Restored session with {}", session.peer_id);
                             sm.restore_session(session);
@@ -310,6 +351,8 @@ impl Node {
             let mut groups = self.groups.write().await;
             if let Ok(blobs) = self.db.list_group_blobs() {
                 for blob in blobs {
+                    // Holds our sender chain key and every member's.
+                    let blob = zeroize::Zeroizing::new(blob);
                     if let Some(group) = SenderKeyGroup::from_bytes(&blob) {
                         let gid = group.group_id;
                         groups.insert(gid, group);
@@ -319,6 +362,14 @@ impl Node {
                     info!("Restored {} group states", groups.len());
                 }
             }
+        }
+
+        // Reconstruct the origin flag for rows written before migration v3,
+        // which defaults everything to relay traffic (Codex P2, ROADMAP T-11).
+        match self.db.backfill_dtn_local_origin(&self.node_id) {
+            Ok(n) if n > 0 => info!("Marked {} restored DTN bundles as locally originated", n),
+            Ok(_) => {}
+            Err(e) => warn!("Could not backfill DTN bundle origin: {}", e),
         }
 
         // Load persisted DTN bundles from database
@@ -337,6 +388,7 @@ impl Node {
                         continue;
                     }
                     let remaining_secs = record.expires_at - now_epoch;
+                    let sprayed_to = record.sprayed_to.clone();
                     let bundle = DtnBundle {
                         message_id: record.message_id,
                         destination: record.destination,
@@ -346,8 +398,12 @@ impl Node {
                         expires_at: Instant::now() + Duration::from_secs(remaining_secs),
                         created_at: Instant::now(), // approximate
                         size: record.size,
+                        is_local: record.is_local,
                     };
-                    let _ = routing.dtn_mut().store_relay(bundle);
+                    // `store_restored`, not `store_relay`: a restart must not
+                    // turn the user's own bundles into relay traffic, nor
+                    // forget which peers already hold a copy (ROADMAP T-11).
+                    let _ = routing.dtn_mut().store_restored(bundle, sprayed_to);
                     loaded += 1;
                 }
                 if loaded > 0 {
@@ -432,14 +488,11 @@ impl Node {
 
         // Maintenance timer
         let routing_m = self.routing.clone();
-        let pending_routes_m = self.pending_routes.clone();
         let prekey_state_m = self.prekey_state.clone();
         let prekey_cache_m = self.prekey_cache.clone();
         let rate_limiter_m = self.rate_limiter.clone();
-        let transport_m = self.transport_manager.clone();
         let cancel_m = self.cancel.clone();
         let db_m = self.db.clone();
-        let node_id_m = self.node_id;
         let mut spk_rotation_counter: u32 = 0;
 
         tokio::spawn(async move {
@@ -448,69 +501,11 @@ impl Node {
                 tokio::select! {
                     _ = cancel_m.cancelled() => break,
                     _ = interval.tick() => {
-                        // Run routing maintenance
-                        let mut r = routing_m.write().await;
-                        r.maintenance();
-
-                        // Check for timed-out route discoveries
-                        let disc_timeout = r.discovery_timeout();
-                        let mut pr = pending_routes_m.write().await;
-                        let mut timed_out: Vec<(NodeId, Vec<PendingRoute>)> = Vec::new();
-                        pr.retain(|dest, routes| {
-                            let (expired, remaining): (Vec<_>, Vec<_>) = routes
-                                .drain(..)
-                                .partition(|r| r.started_at.elapsed() > disc_timeout);
-                            if !expired.is_empty() {
-                                timed_out.push((*dest, expired));
-                            }
-                            *routes = remaining;
-                            !routes.is_empty()
-                        });
-
-                        // Handle timed-out discoveries: retry or fall back to DTN
-                        for (dest, expired_routes) in timed_out {
-                            for mut route in expired_routes {
-                                if route.retries < MAX_DISCOVERY_RETRIES {
-                                    // Retry: re-initiate AODV discovery
-                                    route.retries += 1;
-                                    route.started_at = Instant::now();
-                                    debug!(
-                                        "Retrying AODV discovery for {} (attempt {})",
-                                        dest, route.retries + 1
-                                    );
-                                    let rreq = r.initiate_discovery(dest);
-                                    // Re-queue the route
-                                    pr.entry(dest).or_default().push(route);
-                                    // Broadcast the retry RREQ
-                                    drop(pr);
-                                    drop(r);
-                                    Self::broadcast_aodv_static(
-                                        &rreq,
-                                        node_id_m,
-                                        &transport_m,
-                                    ).await;
-                                    // Re-acquire locks for next iteration
-                                    r = routing_m.write().await;
-                                    pr = pending_routes_m.write().await;
-                                } else {
-                                    debug!("Route discovery for {} exhausted retries, falling back to DTN", dest);
-                                    if r.fallback_to_dtn(
-                                        route.message_id,
-                                        dest,
-                                        node_id_m,
-                                        route.envelope_bytes,
-                                    ).is_ok() {
-                                        if let Some(bundle) = r.dtn().get_bundle(&route.message_id) {
-                                            persist_dtn_bundle(&db_m, bundle);
-                                        }
-                                    }
-                                    let _ = db_m.update_message_status(
-                                        &route.message_id,
-                                        "dtn_pending",
-                                    );
-                                }
-                            }
-                        }
+                        // Route expiry, DTN expiry and RREQ dedup pruning.
+                        // The route-discovery timeout is swept by its own
+                        // task below, not here: this interval is 30 s and
+                        // the timeout is 5 s.
+                        routing_m.write().await.maintenance();
 
                         // Expire old DTN bundles
                         let now_secs = SystemTime::now()
@@ -526,16 +521,23 @@ impl Node {
                             if current_count < 20 {
                                 let to_generate = 100 - current_count;
                                 ps.generate_one_time_prekeys(to_generate);
-                                let _ = db_m.save_prekey_state_blob(&ps.to_bytes());
+                                let _ = db_m.save_prekey_state_blob(&zeroize::Zeroizing::new(ps.to_bytes()));
                                 debug!("Replenished {} one-time prekeys (had {})", to_generate, current_count);
                             }
 
-                            // Signed prekey rotation: every ~24h (2880 ticks at 30s interval)
+                            // Signed prekey rotation: weekly, as specified
+                            // (MYCELIUM_SPEC.md 5.2). This interval and
+                            // `MAX_RETAINED_SIGNED_PREKEYS` are coupled: the
+                            // retained keys must span the bundle-cache
+                            // lifetime below (7 days), or a peer initiating
+                            // from a still-valid cached bundle fails. It used
+                            // to rotate every 24 h, which two retained keys
+                            // cannot cover (ADR-009).
                             spk_rotation_counter += 1;
-                            if spk_rotation_counter >= 2880 {
+                            if spk_rotation_counter >= SPK_ROTATION_TICKS {
                                 spk_rotation_counter = 0;
                                 ps.rotate_signed_prekey();
-                                let _ = db_m.save_prekey_state_blob(&ps.to_bytes());
+                                let _ = db_m.save_prekey_state_blob(&zeroize::Zeroizing::new(ps.to_bytes()));
                                 debug!("Rotated signed prekey, new id={}", ps.signed_prekey_id);
                             }
                         }
@@ -561,6 +563,184 @@ impl Node {
                             let expired = before - cache.len();
                             if expired > 0 {
                                 debug!("Expired {} stale prekey bundles from cache", expired);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Route-discovery timeout sweep.
+        //
+        // This has its own ticker because it must fire on the scale of
+        // `RoutingCoordinator::discovery_timeout()` (5 s). Folding it into the
+        // 30 s maintenance tick delayed every DTN fallback to 30-35 s for the
+        // first retry and 60-65 s to actually enter DTN, six times the
+        // specified timeout (MYCELIUM_SPEC.md 7.3).
+        let routing_d = self.routing.clone();
+        let pending_routes_d = self.pending_routes.clone();
+        let transport_d = self.transport_manager.clone();
+        let cancel_d = self.cancel.clone();
+        let db_d = self.db.clone();
+        let node_id_d = self.node_id;
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(DISCOVERY_SWEEP_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = cancel_d.cancelled() => break,
+                    _ = interval.tick() => {
+                        let disc_timeout = routing_d.read().await.discovery_timeout();
+
+                        // Partition the queue without holding any other lock.
+                        // `retry` is a set of destinations, not of envelopes:
+                        // every envelope waiting on the same destination is
+                        // waiting on the same single route, so one RREQ serves
+                        // all of them. Collecting per envelope broadcast one
+                        // RREQ per queued message per retry.
+                        let mut retry: Vec<NodeId> = Vec::new();
+                        let mut to_dtn: Vec<(NodeId, PendingRoute)> = Vec::new();
+                        {
+                            let mut pr = pending_routes_d.write().await;
+                            pr.retain(|dest, discovery| {
+                                if discovery.started_at.elapsed() <= disc_timeout {
+                                    return true;
+                                }
+                                if discovery.retries < MAX_DISCOVERY_RETRIES {
+                                    // One more attempt for this destination,
+                                    // covering every envelope queued on it.
+                                    discovery.retries += 1;
+                                    discovery.started_at = Instant::now();
+                                    retry.push(*dest);
+                                    return true;
+                                }
+                                // Attempts exhausted: everything waiting on
+                                // this destination goes to store-and-carry.
+                                for route in discovery.envelopes.drain(..) {
+                                    to_dtn.push((*dest, route));
+                                }
+                                false
+                            });
+                        }
+
+                        // One RREQ per destination per sweep.
+                        for dest in retry {
+                            let rreq = {
+                                let mut r = routing_d.write().await;
+                                r.initiate_discovery(dest)
+                            };
+                            debug!("Retrying AODV discovery for {}", dest);
+                            Self::broadcast_aodv_static(&rreq, node_id_d, &transport_d).await;
+                        }
+
+                        // Retries exhausted: store and carry instead.
+                        for (dest, route) in to_dtn {
+                            debug!(
+                                "Route discovery for {} exhausted retries, falling back to DTN",
+                                dest
+                            );
+                            // A route may have arrived while this envelope was
+                            // between the queue and here, in which case its
+                            // flush found nothing. Decide and commit under a
+                            // single routing write lock: checking under a read
+                            // lock and inserting under a write lock leaves the
+                            // same gap for NeighborDiscovered to slot into.
+                            enum Disposition {
+                                Send(NodeId),
+                                Stored,
+                                Refused(DtnError),
+                            }
+
+                            let envelope_bytes = route.envelope_bytes;
+                            let disposition = {
+                                let mut r = routing_d.write().await;
+                                match r.route_message(&dest) {
+                                    RoutingDecision::SendRealtime { next_hop } => {
+                                        Disposition::Send(next_hop)
+                                    }
+                                    _ => match r.fallback_to_dtn(
+                                        route.message_id,
+                                        dest,
+                                        node_id_d,
+                                        envelope_bytes.clone(),
+                                    ) {
+                                        Ok(()) => {
+                                            if let Some(bundle) =
+                                                r.dtn().get_bundle(&route.message_id)
+                                            {
+                                                persist_dtn_bundle(&db_d, bundle);
+                                            }
+                                            Disposition::Stored
+                                        }
+                                        Err(e) => Disposition::Refused(e),
+                                    },
+                                }
+                            };
+
+                            match disposition {
+                                Disposition::Send(next_hop) => {
+                                    debug!(
+                                        "Route to {} appeared during the sweep; sending {} directly",
+                                        dest, route.message_id
+                                    );
+                                    if transport_d
+                                        .send(&next_hop, &envelope_bytes)
+                                        .await
+                                        .is_ok()
+                                    {
+                                        let _ = db_d
+                                            .update_message_status(&route.message_id, "sent");
+                                    } else {
+                                        // The route went away again. Store and
+                                        // carry rather than losing it.
+                                        let mut r = routing_d.write().await;
+                                        match r.fallback_to_dtn(
+                                            route.message_id,
+                                            dest,
+                                            node_id_d,
+                                            envelope_bytes,
+                                        ) {
+                                            Ok(()) => {
+                                                if let Some(bundle) =
+                                                    r.dtn().get_bundle(&route.message_id)
+                                                {
+                                                    persist_dtn_bundle(&db_d, bundle);
+                                                }
+                                                let _ = db_d.update_message_status(
+                                                    &route.message_id,
+                                                    "dtn_pending",
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Dropping message {} for {}: send failed and \
+                                                     the DTN store refused it: {}",
+                                                    route.message_id, dest, e
+                                                );
+                                                let _ = db_d.update_message_status(
+                                                    &route.message_id,
+                                                    "failed",
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                Disposition::Stored => {
+                                    let _ = db_d
+                                        .update_message_status(&route.message_id, "dtn_pending");
+                                }
+                                Disposition::Refused(e) => {
+                                    // The envelope has already left the pending
+                                    // queue, so it is gone. Say so rather than
+                                    // reporting it as queued for delivery
+                                    // (MYCELIUM_SPEC.md 7.2).
+                                    warn!(
+                                        "Dropping message {} for {}: DTN store refused it: {}",
+                                        route.message_id, dest, e
+                                    );
+                                    let _ =
+                                        db_d.update_message_status(&route.message_id, "failed");
+                                }
                             }
                         }
                     }
@@ -783,7 +963,7 @@ impl Node {
 
             if let Some(bundle) = bundle {
                 // Initiate session from cached prekey bundle
-                Self::initiate_session_and_send(
+                if let Err(e) = Self::initiate_session_and_send(
                     ctx,
                     destination,
                     &bundle,
@@ -793,7 +973,16 @@ impl Node {
                     clock_val,
                     timestamp,
                 )
-                .await?;
+                .await
+                {
+                    // The row was inserted as "pending" above and nothing will
+                    // retry it, so leaving it pending would show the user a
+                    // message that is in fact never going anywhere.
+                    if store {
+                        let _ = ctx.db.update_message_status(&message_id, "failed");
+                    }
+                    return Err(e);
+                }
             } else {
                 info!(
                     "send_message: queuing msg and sending prekey request to {}",
@@ -837,8 +1026,13 @@ impl Node {
             sm.encrypt_for(&destination, plaintext, &ad)?
         };
 
-        // Persist session after ratchet state advance
-        Self::persist_session(ctx.session_manager, ctx.db, &destination).await;
+        // Persist the ratchet advance before the ciphertext can leave.
+        if let Err(e) = Self::persist_session(ctx.session_manager, ctx.db, &destination).await {
+            if store {
+                let _ = ctx.db.update_message_status(&message_id, "failed");
+            }
+            return Err(e.into());
+        }
 
         let enc_payload = EncryptedPayload {
             content_type: content_type_to_byte(content_type),
@@ -874,7 +1068,7 @@ impl Node {
         let mut group_id = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_id);
         let group = SenderKeyGroup::new(group_id);
-        self.db.save_group_blob(&group_id, &group.to_bytes())?;
+        Self::persist_group_blob(&self.db, &group_id, &group)?;
         self.groups.write().await.insert(group_id, group);
         Ok(group_id)
     }
@@ -894,7 +1088,7 @@ impl Node {
             let mut groups = self.groups.write().await;
             let group = groups.get_mut(&group_id).ok_or(NodeError::GroupNotFound)?;
             group.add_pending_member(member);
-            self.db.save_group_blob(&group_id, &group.to_bytes())?;
+            Self::persist_group_blob(&self.db, &group_id, group)?;
         }
         // Everyone must learn the new roster: forget who already has our
         // key so the refreshed distribution goes to every member.
@@ -917,7 +1111,7 @@ impl Node {
             let mut groups = self.groups.write().await;
             let group = groups.get_mut(&group_id).ok_or(NodeError::GroupNotFound)?;
             group.remove_member(&member);
-            self.db.save_group_blob(&group_id, &group.to_bytes())?;
+            Self::persist_group_blob(&self.db, &group_id, group)?;
         }
         {
             let mut sent = self.key_sent_to.write().await;
@@ -1029,7 +1223,7 @@ impl Node {
                     for m in &dist.removed {
                         group.forget_member(m);
                     }
-                    let _ = ctx.db.save_group_blob(&group_id, &group.to_bytes());
+                    let _ = Self::persist_group_blob(ctx.db, &group_id, group);
                     info!(
                         "Installed sender key from {} for group {:?} ({} members)",
                         source,
@@ -1046,7 +1240,7 @@ impl Node {
                             group.add_pending_member(*m);
                         }
                     }
-                    let _ = ctx.db.save_group_blob(&group_id, &group.to_bytes());
+                    let _ = Self::persist_group_blob(ctx.db, &group_id, &group);
                     info!(
                         "Joined group {:?} via sender key from {} ({} members)",
                         &group_id[..4],
@@ -1092,8 +1286,11 @@ impl Node {
                 content_type_to_byte(content_type),
                 &group_msg.ciphertext,
             );
-            // Persist group state after sender key advance
-            let _ = self.db.save_group_blob(&group_id, &group.to_bytes());
+            // The sender-key chain has advanced in memory. If that advance
+            // cannot be made durable we must not transmit: a restart would
+            // reload the old iteration and re-use an AES-GCM nonce under the
+            // same key. Fail the send instead — the ciphertext never left.
+            Self::persist_group_blob(&self.db, &group_id, group)?;
             (group.members.clone(), payload)
         };
 
@@ -1176,21 +1373,32 @@ impl Node {
             }
             RoutingDecision::DiscoveryPending => {
                 let destination = envelope.destination;
-                // Initiate AODV discovery
-                let rreq = {
-                    let mut r = ctx.routing.write().await;
-                    r.initiate_discovery(destination)
+                // Queue the envelope first, then decide whether this send has
+                // to start a discovery of its own. Every envelope waiting on a
+                // destination is waiting on the same route, so if one is
+                // already queued a flood is already in flight and will serve
+                // this one too. Starting one per envelope floods the mesh N
+                // times for a single unreachable peer (ROADMAP T-10).
+                let discovery_in_flight = {
+                    let mut pr = ctx.pending_routes.write().await;
+                    let in_flight = pr.contains_key(&destination);
+                    pr.entry(destination)
+                        .or_insert_with(PendingDiscovery::new)
+                        .envelopes
+                        .push(PendingRoute {
+                            envelope_bytes: serialized,
+                            message_id,
+                        });
+                    in_flight
                 };
-                // Broadcast RREQ
-                Self::broadcast_aodv_static(&rreq, ctx.local_id, ctx.transport_manager).await;
-                // Queue envelope for when route is found
-                let mut pr = ctx.pending_routes.write().await;
-                pr.entry(destination).or_default().push(PendingRoute {
-                    envelope_bytes: serialized,
-                    message_id,
-                    started_at: Instant::now(),
-                    retries: 0,
-                });
+
+                if !discovery_in_flight {
+                    let rreq = {
+                        let mut r = ctx.routing.write().await;
+                        r.initiate_discovery(destination)
+                    };
+                    Self::broadcast_aodv_static(&rreq, ctx.local_id, ctx.transport_manager).await;
+                }
             }
             RoutingDecision::EnterDtn => {
                 let mut r = ctx.routing.write().await;
@@ -1228,18 +1436,34 @@ impl Node {
             sm.initiate_session(&identity, destination, bundle)?
         };
 
-        // Persist the new session
-        Self::persist_session(ctx.session_manager, ctx.db, &destination).await;
-
-        // Encrypt the first message with the new session
+        // Note: the session is deliberately NOT persisted here. Storing it
+        // before the first message is encrypted gains nothing — if we die
+        // before encrypting we want no session at all — and a provisional row
+        // whose cleanup DELETE later failed would be reloaded on restart and
+        // used without the peer ever receiving SessionInit. One write, after
+        // the encrypt, before the ciphertext can leave.
+        //
+        // If anything below fails the session must not be left installed:
+        // `send_encrypted` would see `has_session()` and send a bare
+        // EncryptedMessage to a peer that never received the handshake.
         let ad = build_ad(ctx.local_id, destination);
         let (header, ciphertext) = {
             let mut sm = ctx.session_manager.write().await;
-            sm.encrypt_for(&destination, plaintext, &ad)?
+            match sm.encrypt_for(&destination, plaintext, &ad) {
+                Ok(r) => r,
+                Err(e) => {
+                    drop(sm);
+                    Self::discard_unsent_session(ctx, &destination).await;
+                    return Err(e.into());
+                }
+            }
         };
 
-        // Persist session after encrypt
-        Self::persist_session(ctx.session_manager, ctx.db, &destination).await;
+        // Persist the ratchet advance before the ciphertext can leave.
+        if let Err(e) = Self::persist_session(ctx.session_manager, ctx.db, &destination).await {
+            Self::discard_unsent_session(ctx, &destination).await;
+            return Err(e.into());
+        }
 
         // Build the encrypted payload part (without type byte prefix)
         let enc_payload = EncryptedPayload {
@@ -1274,7 +1498,24 @@ impl Node {
             payload: session_init.serialize(),
         };
 
-        Self::route_and_send(ctx, envelope, message_id).await
+        // Routing or the transport can still refuse this. If the SessionInit
+        // never leaves, the session must not stay installed: later sends would
+        // go out as bare EncryptedMessage to a peer that never saw the
+        // handshake (round 5 finding #7).
+        if let Err(e) = Self::route_and_send(ctx, envelope, message_id).await {
+            Self::discard_unsent_session(ctx, &destination).await;
+            return Err(e);
+        }
+
+        // On its way, but unconfirmed until the peer sends something back.
+        // Recorded so a SessionReject can report exactly which messages died
+        // with the handshake (ADR-009).
+        ctx.session_manager
+            .write()
+            .await
+            .mark_handshake_pending(destination, message_id);
+
+        Ok(())
     }
 
     /// Broadcast an AODV message to all known peers.
@@ -1364,7 +1605,7 @@ impl Node {
         lamport_clock: &RwLock<LamportClock>,
         prekey_cache: &RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>,
         pending_messages: &RwLock<HashMap<NodeId, Vec<PendingMessage>>>,
-        pending_routes: &RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
+        pending_routes: &RwLock<HashMap<NodeId, PendingDiscovery>>,
         battery: &RwLock<BatteryManager>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
         seen_channel_messages: &RwLock<HashSet<MessageId>>,
@@ -1440,16 +1681,35 @@ impl Node {
                                             bundle.message_id, target
                                         );
                                     } else {
-                                        // Sprayed to a relay — update copies_remaining
+                                        // Sprayed to a relay. The remaining
+                                        // copies and the holder list must move
+                                        // together: persisted apart, a failure
+                                        // between them leaves a restart either
+                                        // re-spraying a holder or spending a
+                                        // copy it already spent.
                                         {
                                             let r = routing.read().await;
                                             if let Some(our) =
                                                 r.dtn().get_bundle(&bundle.message_id)
                                             {
-                                                let _ = db.update_dtn_copies(
+                                                let sprayed =
+                                                    r.dtn().sprayed_to(&bundle.message_id).to_vec();
+                                                if let Err(e) = db.update_dtn_spray_state(
                                                     &bundle.message_id,
                                                     our.copies_remaining,
-                                                );
+                                                    &sprayed,
+                                                ) {
+                                                    // The copy has already gone
+                                                    // out. Losing this write
+                                                    // means a restart may spray
+                                                    // this peer again, so say so
+                                                    // rather than swallowing it.
+                                                    warn!(
+                                                        "Failed to persist spray state for {}: \
+                                                         {} (a restart may re-spray)",
+                                                        bundle.message_id, e
+                                                    );
+                                                }
                                             }
                                         }
                                         debug!(
@@ -1478,7 +1738,7 @@ impl Node {
                 // AODV route existed can now be sent directly.
                 let pending = {
                     let mut pr = pending_routes.write().await;
-                    pr.remove(peer).unwrap_or_default()
+                    pr.remove(peer).map(|d| d.envelopes).unwrap_or_default()
                 };
                 if !pending.is_empty() {
                     debug!(
@@ -1833,6 +2093,16 @@ impl Node {
                         )
                         .await;
                     }
+                    WirePayloadType::SessionReject => {
+                        Self::handle_session_reject(
+                            &envelope,
+                            body,
+                            prekey_cache,
+                            session_manager,
+                            db,
+                        )
+                        .await;
+                    }
                     WirePayloadType::DtnRelay => {
                         Self::handle_dtn_relay(
                             &envelope,
@@ -1862,6 +2132,7 @@ impl Node {
                             routing,
                             local_id,
                             local_group_hash,
+                            identity.public_key_bytes(),
                         )
                         .await;
                     }
@@ -1911,6 +2182,7 @@ impl Node {
                             local_id,
                             seen_channel_messages,
                             event_tx,
+                            db,
                         )
                         .await;
                     }
@@ -1934,7 +2206,7 @@ impl Node {
         routing: &RwLock<RoutingCoordinator>,
         transport_manager: &TransportManager,
         local_id: NodeId,
-        pending_routes: &RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
+        pending_routes: &RwLock<HashMap<NodeId, PendingDiscovery>>,
     ) {
         let (request_id, source, source_seq, destination, dest_seq, hop_count, ttl) =
             match wire::deserialize_aodv_rreq(body) {
@@ -1970,7 +2242,7 @@ impl Node {
         routing: &RwLock<RoutingCoordinator>,
         transport_manager: &TransportManager,
         local_id: NodeId,
-        pending_routes: &RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
+        pending_routes: &RwLock<HashMap<NodeId, PendingDiscovery>>,
     ) {
         let (request_id, source, destination, dest_seq, hop_count, lifetime_secs) =
             match wire::deserialize_aodv_rrep(body) {
@@ -2057,7 +2329,7 @@ impl Node {
         _routing: &RwLock<RoutingCoordinator>,
         transport_manager: &TransportManager,
         local_id: NodeId,
-        pending_routes: &RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
+        pending_routes: &RwLock<HashMap<NodeId, PendingDiscovery>>,
     ) {
         match action {
             AodvAction::BroadcastRreq(rreq) => {
@@ -2119,7 +2391,9 @@ impl Node {
                 // Flush pending route envelopes for this destination
                 let pending = {
                     let mut pr = pending_routes.write().await;
-                    pr.remove(&destination).unwrap_or_default()
+                    pr.remove(&destination)
+                        .map(|d| d.envelopes)
+                        .unwrap_or_default()
                 };
                 for route in pending {
                     debug!(
@@ -2222,7 +2496,7 @@ impl Node {
             };
 
             // Persist session after ratchet state advance
-            Self::persist_session(session_manager, db, &envelope.source).await;
+            Self::persist_session_lossy(session_manager, db, &envelope.source).await;
 
             let record = MessageRecord {
                 message_id: envelope.message_id,
@@ -2393,11 +2667,13 @@ impl Node {
                 return;
             }
             let mut ps = prekey_state.write().await;
+            let mut reject = None;
             match sm.accept_session(
                 &mut ps,
                 envelope.source,
                 &init.identity_key,
                 &init.ephemeral_public,
+                init.signed_prekey_id,
                 init.one_time_prekey_id,
             ) {
                 Ok(safety_number) => {
@@ -2408,13 +2684,19 @@ impl Node {
                 }
                 Err(e) => {
                     debug!("Failed to accept session from {}: {}", envelope.source, e);
+                    reject = Some(session_reject_reason(&e));
                 }
             }
             // Persist prekey state (a one-time prekey may have been consumed)
-            let _ = db.save_prekey_state_blob(&ps.to_bytes());
+            let _ = db.save_prekey_state_blob(&zeroize::Zeroizing::new(ps.to_bytes()));
             drop(ps);
             drop(sm);
-            Self::persist_session(session_manager, db, &envelope.source).await;
+            Self::persist_session_lossy(session_manager, db, &envelope.source).await;
+            // Sent after the locks are released: the initiator must learn its
+            // bundle is dead or it retries against it forever (T-06).
+            if let Some(reason) = reject {
+                Self::send_session_reject(ctx, envelope.source, reason).await;
+            }
             return;
         };
 
@@ -2447,6 +2729,7 @@ impl Node {
                     envelope.source,
                     &init.identity_key,
                     &init.ephemeral_public,
+                    init.signed_prekey_id,
                     init.one_time_prekey_id,
                     &ratchet_header,
                     &enc.ciphertext,
@@ -2459,6 +2742,7 @@ impl Node {
                     envelope.source,
                     &init.identity_key,
                     &init.ephemeral_public,
+                    init.signed_prekey_id,
                     init.one_time_prekey_id,
                     &ratchet_header,
                     &enc.ciphertext,
@@ -2467,7 +2751,7 @@ impl Node {
             };
             // Persist prekey state (a one-time prekey may have been consumed
             // even when the session was rejected)
-            let _ = db.save_prekey_state_blob(&ps.to_bytes());
+            let _ = db.save_prekey_state_blob(&zeroize::Zeroizing::new(ps.to_bytes()));
             match result {
                 Ok((safety_number, plaintext)) if keep_ours => {
                     let _ = safety_number;
@@ -2489,6 +2773,10 @@ impl Node {
                         "Rejected SessionInit from {}: {} (existing session untouched)",
                         envelope.source, e
                     );
+                    let reason = session_reject_reason(&e);
+                    drop(ps);
+                    drop(sm);
+                    Self::send_session_reject(ctx, envelope.source, reason).await;
                     return;
                 }
             }
@@ -2496,7 +2784,18 @@ impl Node {
 
         // Persist the accepted session (unchanged when we kept ours)
         if !keep_ours {
-            Self::persist_session(session_manager, db, &envelope.source).await;
+            Self::persist_session_lossy(session_manager, db, &envelope.source).await;
+        }
+
+        // Reaching here means `build_accepted_session` verified that
+        // `init.identity_key` hashes to the envelope source, so the key is
+        // proven and worth recording for co-signature verification
+        // (ROADMAP T-05).
+        if let Err(e) = db.set_contact_identity_key(&envelope.source, &init.identity_key) {
+            debug!(
+                "Could not record identity key for {}: {}",
+                envelope.source, e
+            );
         }
 
         let record = MessageRecord {
@@ -2537,7 +2836,7 @@ impl Node {
         let bundle = {
             let mut ps = prekey_state.write().await;
             let b = ps.issue_bundle();
-            let _ = db.save_prekey_state_blob(&ps.to_bytes());
+            let _ = db.save_prekey_state_blob(&zeroize::Zeroizing::new(ps.to_bytes()));
             b
         };
 
@@ -2628,6 +2927,13 @@ impl Node {
             let mut cache = prekey_cache.write().await;
             cache.insert(peer_id, (bundle.clone(), Instant::now()));
         }
+
+        // The binding check above proves this key hashes to `peer_id`, so it
+        // is safe to record. Emergency co-signature verification needs it
+        // (ROADMAP T-05).
+        if let Err(e) = db.set_contact_identity_key(&peer_id, &bundle.identity_key) {
+            debug!("Could not record identity key for {}: {}", peer_id, e);
+        }
         // Persist to DB (store body without type byte for consistent deserialization)
         let cache_payload = PrekeyBundlePayload {
             identity_key: bundle.identity_key,
@@ -2670,8 +2976,11 @@ impl Node {
             }
         };
 
-        // Persist the new session
-        Self::persist_session(session_manager, db, &peer_id).await;
+        // Deliberately not persisted here, matching
+        // `initiate_session_and_send`: a provisional write would leave a
+        // session on disk whose SessionInit never reached the peer if we die
+        // or fail before transmitting. The loop below persists each ratchet
+        // advance before its ciphertext leaves.
 
         // Send first pending message as SessionInit, rest as EncryptedMessage
         let mut queue = pending.into_iter().enumerate();
@@ -2708,6 +3017,40 @@ impl Node {
                     }
                 }
             };
+
+            // The chain has advanced. Make that durable before the ciphertext
+            // leaves, or a restart re-uses this chain position (T-07). On
+            // failure requeue this message and every later one, exactly as the
+            // encrypt-failure path above does, and leave the rest for the next
+            // attempt.
+            if let Err(e) = Self::persist_session(session_manager, db, &peer_id).await {
+                warn!(
+                    "Not sending to {}: ratchet state could not be persisted: {}",
+                    peer_id, e
+                );
+                if i == 0 {
+                    // The SessionInit that would have carried this message has
+                    // not been transmitted, so the peer knows nothing of this
+                    // session. Leaving it installed would make every later
+                    // send a bare EncryptedMessage it cannot decrypt.
+                    session_manager.write().await.remove_session(&peer_id);
+                    let _ = db.delete_session(&peer_id);
+                    warn!(
+                        "Discarded unsent session with {}; the handshake will be retried",
+                        peer_id
+                    );
+                }
+                // Do not requeue: `pending_messages` is drained only by an
+                // incoming PrekeyResponse, and a later send would take the
+                // session or cached-bundle branch, so requeued messages would
+                // wait forever while the caller had been told the send was
+                // accepted. A storage fault is not retryable in memory, so
+                // report it.
+                for stranded in std::iter::once(msg).chain(queue.map(|(_, m)| m)) {
+                    let _ = db.update_message_status(&stranded.message_id, "failed");
+                }
+                return;
+            }
 
             let enc_payload = EncryptedPayload {
                 content_type: content_type_to_byte(msg.content_type),
@@ -2764,10 +3107,165 @@ impl Node {
                     let _ = db.update_message_status(&msg.message_id, "sent");
                 }
             }
+
+            // This is the common handshake path — no cached bundle, so the
+            // session was just initiated here. Record it as unconfirmed so a
+            // SessionReject can act on it and name the messages that died
+            // with it (ADR-009).
+            session_manager
+                .write()
+                .await
+                .mark_handshake_pending(peer_id, msg.message_id);
         }
 
-        // Persist session after all encrypts
-        Self::persist_session(session_manager, db, &peer_id).await;
+        // Each message above persisted its own advance before transmitting;
+        // this is a belt-and-braces write for any non-ratchet session field.
+        Self::persist_session_lossy(session_manager, db, &peer_id).await;
+    }
+
+    /// Tell an initiator its `SessionInit` could not be accepted, so it stops
+    /// retrying against a bundle that can never work (ROADMAP T-06).
+    async fn send_session_reject(
+        ctx: &SendCtx<'_>,
+        peer: NodeId,
+        reason: wire::SessionRejectReason,
+    ) {
+        let payload = wire::serialize_session_reject(reason, &ctx.identity.public_key_bytes());
+        let envelope = Envelope {
+            source: ctx.local_id,
+            destination: peer,
+            message_id: MessageId::random(),
+            ttl: 10,
+            hop_count: 0,
+            flags: MessageFlags::SYSTEM,
+            lamport_clock: 0,
+            device_timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            protocol_version: ProtocolVersion::CURRENT,
+            payload,
+        };
+        let data = envelope.serialize();
+
+        // A SessionInit can arrive over several hops, so a direct send would
+        // silently fail to reach a non-neighbour originator (round 5 finding
+        // #3). Use the AODV route when there is one, and fall back to a direct
+        // send. Deliberately no route discovery and no DTN: a reject is only
+        // worth anything promptly, and an unauthenticated control message must
+        // not be able to make us flood RREQs or consume relay storage.
+        let next_hop = {
+            let r = ctx.routing.read().await;
+            match r.route_message(&peer) {
+                RoutingDecision::SendRealtime { next_hop } => Some(next_hop),
+                _ => None,
+            }
+        };
+        let target = next_hop.unwrap_or(peer);
+        if let Err(e) = ctx.transport_manager.send(&target, &data).await {
+            debug!("Could not send SessionReject to {}: {}", peer, e);
+        }
+    }
+
+    /// A peer refused our `SessionInit`.
+    ///
+    /// Our cached prekey bundle for them can never work — typically it predates
+    /// a signed-prekey rotation — so drop it and let the next send re-request a
+    /// fresh one (ROADMAP T-06). Without this the initiator retries against the
+    /// same dead bundle forever and the conversation is silently stuck.
+    ///
+    /// A reject cannot be authenticated: by definition no confirmed session
+    /// exists yet. It is therefore treated as a hint, and deliberately
+    /// bounded:
+    ///
+    /// - the NodeId binding check applies, as on every other ingress path;
+    /// - a session older than `SIMULTANEOUS_INIT_WINDOW` is never touched, so
+    ///   a forged reject cannot tear down working traffic;
+    /// - it does nothing when no bundle is cached and nothing was just
+    ///   initiated, so it is not an amplification vector.
+    ///
+    /// The worst a forgery achieves is one discarded unconfirmed handshake and
+    /// one extra prekey request.
+    async fn handle_session_reject(
+        envelope: &Envelope,
+        body: &[u8],
+        prekey_cache: &RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>,
+        session_manager: &RwLock<SessionManager>,
+        db: &Database,
+    ) {
+        let (reason, identity_key) = match wire::deserialize_session_reject(body) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("Bad SessionReject payload: {}", e);
+                return;
+            }
+        };
+
+        // Same binding rule as PrekeyResponse and SessionInit: the claimed
+        // identity key must hash to the envelope source.
+        if node_id_from_public_key(&identity_key) != envelope.source {
+            debug!(
+                "Dropping SessionReject from {}: identity key does not match the source",
+                envelope.source
+            );
+            return;
+        }
+
+        // Act only on a handshake the peer has not confirmed.
+        //
+        // "We have a session" is not evidence the peer agrees: the initiator
+        // installs its session optimistically. Confirmation is the first thing
+        // we successfully decrypt from them, since only their ratchet could
+        // have produced it. A time window was the first attempt here and was
+        // wrong both ways — it let a forged reject kill a working session
+        // established seconds earlier, and ignored a legitimate reject that
+        // arrived late, which DTN handshakes routinely do (round 5 findings
+        // #1, #2).
+        let unconfirmed_messages = {
+            let mut sm = session_manager.write().await;
+            if !sm.handshake_unconfirmed(&envelope.source) {
+                None
+            } else {
+                sm.remove_session(&envelope.source);
+                Some(sm.take_unconfirmed_messages(&envelope.source))
+            }
+        };
+
+        let Some(dead_messages) = unconfirmed_messages else {
+            debug!(
+                "Ignoring SessionReject from {}: no unconfirmed handshake with that peer",
+                envelope.source
+            );
+            return;
+        };
+
+        let _ = db.delete_session(&envelope.source);
+
+        // Drop the bundle from memory *and* storage: a restart would otherwise
+        // reload the stale entry and undo the recovery (round 5 finding #5).
+        let dropped = prekey_cache
+            .write()
+            .await
+            .remove(&envelope.source)
+            .is_some();
+        let _ = db.remove_cached_prekey_bundle(envelope.source.as_bytes());
+
+        // The messages sent under this handshake were never delivered: the
+        // peer discarded the SessionInit, and nothing was ever decrypted from
+        // them, so no receipt can have arrived. Report them rather than
+        // leaving rows that claim "sent" (round 5 finding #6).
+        for message_id in &dead_messages {
+            let _ = db.update_message_status(message_id, "failed");
+        }
+
+        info!(
+            "Peer {} refused our SessionInit ({:?}); discarded the unconfirmed session, \
+             {} cached bundle and failed {} message(s)",
+            envelope.source,
+            reason,
+            if dropped { "the" } else { "no" },
+            dead_messages.len()
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2867,7 +3365,7 @@ impl Node {
                 };
 
                 // Persist session after ratchet state advance
-                Self::persist_session(session_manager, db, &inner_envelope.source).await;
+                Self::persist_session_lossy(session_manager, db, &inner_envelope.source).await;
 
                 let record = MessageRecord {
                     message_id: msg_id,
@@ -2934,8 +3432,14 @@ impl Node {
                 expires_at: Instant::now() + ttl,
                 created_at: Instant::now(),
                 size: relay_size,
+                is_local: false,
             };
-            if r.dtn_mut().store_relay(bundle).is_ok() {
+            // Only persist when the engine actually took a new bundle. A
+            // duplicate returns Ok without inserting, and re-persisting would
+            // overwrite the spray history of the copy we already hold with an
+            // empty list, so after a restart we would spray those peers again.
+            let already_held = r.dtn().get_bundle(&msg_id).is_some();
+            if r.dtn_mut().store_relay(bundle).is_ok() && !already_held {
                 if let Some(b) = r.dtn().get_bundle(&msg_id) {
                     persist_dtn_bundle(db, b);
                 }
@@ -3008,7 +3512,7 @@ impl Node {
             };
 
             // Persist session after ratchet state advance
-            Self::persist_session(session_manager, db, &inner_envelope.source).await;
+            Self::persist_session_lossy(session_manager, db, &inner_envelope.source).await;
 
             let record = MessageRecord {
                 message_id: bundle.message_id,
@@ -3027,24 +3531,78 @@ impl Node {
 
     // --- Session persistence ---
 
+    /// Write the peer's ratchet state to storage.
+    ///
+    /// The caller must not transmit a ciphertext whose ratchet advance this
+    /// call failed to persist: the chain has already moved forward in memory,
+    /// so a restart would reload the old position and re-use an AES-GCM nonce
+    /// under the same key. Outgoing paths therefore propagate the error and
+    /// drop the send; receive paths only log, because their state advance is
+    /// idempotent on replay and failing them would discard a decrypted
+    /// message.
     async fn persist_session(
         session_manager: &RwLock<SessionManager>,
         db: &Database,
         peer_id: &NodeId,
-    ) {
+    ) -> Result<(), StorageError> {
         let sm = session_manager.read().await;
         for (nid, session) in sm.all_sessions() {
             if nid == peer_id {
-                let data = SessionManager::serialize_session(session);
-                let record = SessionRecord {
+                // The serialized blob carries the root key and both chain
+                // keys in the clear. Wipe our copy once SQLCipher has it.
+                let mut record = SessionRecord {
                     peer_id: *nid,
-                    session_data: data,
+                    session_data: SessionManager::serialize_session(session),
                     safety_number: Some(session.safety_number.clone()),
                     is_verified: session.is_verified,
                 };
-                let _ = db.save_session(&record);
+                let saved = db.save_session(&record);
+                record.session_data.zeroize();
+                saved?;
                 break;
             }
+        }
+        Ok(())
+    }
+
+    /// Write a group's state blob, wiping our copy once SQLCipher has it.
+    ///
+    /// The blob carries our sender chain key and every member's chain key in
+    /// the clear (ROADMAP T-07 key hygiene).
+    fn persist_group_blob(
+        db: &Database,
+        group_id: &[u8; 32],
+        group: &SenderKeyGroup,
+    ) -> Result<(), StorageError> {
+        let mut blob = zeroize::Zeroizing::new(group.to_bytes());
+        let result = db.save_group_blob(group_id, &blob);
+        blob.zeroize();
+        result
+    }
+
+    /// Drop a session that was created for an outgoing handshake we never
+    /// managed to send, from memory and from storage. Leaving it installed
+    /// would make every later send use a ratchet the peer knows nothing about.
+    async fn discard_unsent_session(ctx: &SendCtx<'_>, destination: &NodeId) {
+        ctx.session_manager
+            .write()
+            .await
+            .remove_session(destination);
+        let _ = ctx.db.delete_session(destination);
+        warn!(
+            "Discarded unsent session with {}; the handshake will be retried",
+            destination
+        );
+    }
+
+    /// `persist_session` for the receive path: log and carry on.
+    async fn persist_session_lossy(
+        session_manager: &RwLock<SessionManager>,
+        db: &Database,
+        peer_id: &NodeId,
+    ) {
+        if let Err(e) = Self::persist_session(session_manager, db, peer_id).await {
+            warn!("Failed to persist session with {}: {}", peer_id, e);
         }
     }
 
@@ -3090,7 +3648,7 @@ impl Node {
             match group.decrypt(&envelope.source, &group_msg) {
                 Ok(pt) => {
                     // Persist group state after sender key advance
-                    let _ = db.save_group_blob(&group_id, &group.to_bytes());
+                    let _ = Self::persist_group_blob(db, &group_id, group);
                     pt
                 }
                 Err(e) => {
@@ -3133,6 +3691,7 @@ impl Node {
         routing: &RwLock<RoutingCoordinator>,
         local_id: NodeId,
         local_group_hash: Option<[u8; 8]>,
+        local_identity_key: [u8; 32],
     ) {
         if envelope.source == local_id {
             return; // Ignore our own beacons
@@ -3196,7 +3755,12 @@ impl Node {
                 ContactRecord {
                     node_id: beacon.node_id,
                     display_name: beacon.display_name.clone(),
-                    public_key: beacon.node_id.as_bytes().to_vec(), // Use node_id as public key placeholder
+                    // A beacon carries no identity key, only the NodeId, so
+                    // we do not know one yet. Empty, not the NodeId: storing
+                    // the id here is what made emergency co-signature
+                    // verification impossible (ROADMAP T-05). The key is
+                    // filled in by the ingress paths that verify it.
+                    public_key: Vec::new(),
                     trust_score: 0.0,
                     is_verified: false,
                     last_seen: Some(now_secs),
@@ -3219,7 +3783,7 @@ impl Node {
                 let vouch = mycelium_storage::vouches::VouchRecord {
                     voucher_id: local_id,
                     vouchee_id: beacon.node_id,
-                    voucher_public_key: local_id.as_bytes().to_vec(),
+                    voucher_public_key: local_identity_key.to_vec(),
                     display_name: beacon.display_name.clone(),
                     signature: Vec::new(), // Auto-vouch, no cryptographic sig
                     timestamp: now_secs,
@@ -3324,6 +3888,7 @@ impl Node {
         local_id: NodeId,
         seen: &RwLock<HashSet<MessageId>>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+        db: &Database,
     ) {
         let (level, message_bytes, cosigners) = match wire::deserialize_emergency_broadcast(body) {
             Ok(v) => v,
@@ -3353,13 +3918,11 @@ impl Node {
         let sender_trust = tg.trust_score(&local_id, &envelope.source).value;
 
         // Thresholds per spec §9.5: Priority > 0.3, Urgent > 0.6, Critical
-        // needs 3+ co-signers above 0.8. Co-signers are not yet signature-
-        // verified (see ROADMAP.md T-05).
+        // needs 3+ co-signers above 0.8 whose signatures verify (ADR-010).
         let accepted = match level {
             wire::EmergencyLevel::Priority => sender_trust > 0.3,
             wire::EmergencyLevel::Urgent => sender_trust > 0.6,
             wire::EmergencyLevel::Critical => {
-                // Need 3+ cosigners each with trust > 0.8
                 if cosigners.len() < 3 {
                     debug!(
                         "Critical emergency from {} rejected: only {} cosigners (need 3+)",
@@ -3368,14 +3931,52 @@ impl Node {
                     );
                     false
                 } else {
-                    let trusted_cosigners = cosigners
-                        .iter()
-                        .filter(|cs| {
-                            let cs_id = NodeId::from_bytes(**cs);
-                            tg.trust_score(&local_id, &cs_id).value > 0.8
-                        })
-                        .count();
-                    trusted_cosigners >= 3
+                    // A co-signature counts only when it verifies against a
+                    // key we hold for that id *and* the id is trusted above
+                    // 0.8. Bare ids prove nothing: anyone can list three
+                    // trusted NodeIds they do not control.
+                    let mut seen: Vec<NodeId> = Vec::with_capacity(cosigners.len());
+                    let mut valid = 0usize;
+                    for cs in &cosigners {
+                        if seen.contains(&cs.node_id) {
+                            debug!("Duplicate emergency co-signer {}", cs.node_id);
+                            continue;
+                        }
+                        seen.push(cs.node_id);
+
+                        let key = db.get_contact_identity_key(&cs.node_id);
+                        if let Err(reason) = mycelium_crypto::emergency::verify_cosigner(
+                            cs,
+                            key,
+                            &envelope.source,
+                            level,
+                            &message_bytes,
+                        ) {
+                            debug!(
+                                "Emergency co-signature from {} not counted: {:?}",
+                                cs.node_id, reason
+                            );
+                            continue;
+                        }
+                        if tg.trust_score(&local_id, &cs.node_id).value <= 0.8 {
+                            debug!(
+                                "Emergency co-signer {} verified but not trusted above 0.8",
+                                cs.node_id
+                            );
+                            continue;
+                        }
+                        valid += 1;
+                    }
+                    if valid < 3 {
+                        debug!(
+                            "Critical emergency from {} rejected: {} of {} co-signatures valid \
+                             and trusted (need 3)",
+                            envelope.source,
+                            valid,
+                            cosigners.len()
+                        );
+                    }
+                    valid >= 3
                 }
             }
         };
@@ -3624,7 +4225,7 @@ impl Node {
     /// Count of pending route discoveries.
     pub async fn pending_routes_count(&self) -> usize {
         let pr = self.pending_routes.read().await;
-        pr.values().map(|v| v.len()).sum()
+        pr.values().map(|d| d.envelopes.len()).sum()
     }
 
     /// Destinations with pending messages (awaiting session).
@@ -3660,8 +4261,28 @@ fn persist_dtn_bundle(db: &Database, bundle: &DtnBundle) {
         copies_remaining: bundle.copies_remaining,
         expires_at: expires_epoch,
         size: bundle.size,
+        is_local: bundle.is_local,
+        // A bundle is persisted when it is first stored, before any spray.
+        // Later sprays are recorded with `update_dtn_sprayed_to`.
+        sprayed_to: Vec::new(),
     };
     let _ = db.store_dtn_bundle(&record);
+}
+
+/// Translate a session-accept failure into the reason put on the wire.
+///
+/// Deliberately coarse: the initiator only needs to know its bundle is dead,
+/// and a finer breakdown would tell an attacker which prekeys we still hold.
+fn session_reject_reason(e: &SessionError) -> wire::SessionRejectReason {
+    match e {
+        SessionError::X3dh(X3dhError::SignedPrekeyNotFound) => {
+            wire::SessionRejectReason::StaleSignedPrekey
+        }
+        SessionError::X3dh(X3dhError::OneTimePrekeyNotFound) => {
+            wire::SessionRejectReason::UnknownOneTimePrekey
+        }
+        _ => wire::SessionRejectReason::DecryptFailed,
+    }
 }
 
 /// Build associated data for Double Ratchet from source + destination NodeIds.

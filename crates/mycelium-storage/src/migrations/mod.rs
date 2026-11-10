@@ -26,6 +26,37 @@ pub fn run_all(conn: &Connection) -> Result<(), StorageError> {
     if current_version < 2 {
         migrate_v2(conn)?;
     }
+    if current_version < 3 {
+        migrate_v3(conn)?;
+    }
+
+    Ok(())
+}
+
+/// v3: record a DTN bundle's origin and spray history.
+///
+/// `is_local` distinguishes the user's own outgoing mail from traffic carried
+/// for other nodes, so eviction can protect the former (ROADMAP T-11).
+/// `sprayed_to` is the concatenation of the 32-byte NodeIds a bundle has
+/// already been handed to, so a restart does not spend copies re-spraying
+/// peers that already hold one.
+///
+/// Existing rows default to relay traffic with no spray history: that is the
+/// safe reading, since a bundle whose origin we cannot establish should not
+/// gain eviction protection.
+fn migrate_v3(conn: &Connection) -> Result<(), StorageError> {
+    // Wrapped in a transaction: `ALTER TABLE ADD COLUMN` is not idempotent, so
+    // committing the columns without the version row would make the next
+    // startup re-run this migration and fail with "duplicate column name".
+    conn.execute_batch(
+        "
+        BEGIN;
+        ALTER TABLE dtn_store ADD COLUMN is_local INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE dtn_store ADD COLUMN sprayed_to BLOB NOT NULL DEFAULT x'';
+        INSERT INTO schema_version (version) VALUES (3);
+        COMMIT;
+        ",
+    )?;
 
     Ok(())
 }

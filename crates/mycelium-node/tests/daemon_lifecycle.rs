@@ -98,17 +98,31 @@ async fn test_partition_triggers_dtn_fallback() {
         .await
         .expect("send should succeed (queued)");
 
-    // Wait for AODV discovery timeout + retry + DTN fallback
-    // Maintenance timer runs every 30s. First cycle at ~30s detects timeout (>5s),
-    // retries RREQ. Second cycle at ~60s detects retry timeout, falls back to DTN.
-    tokio::time::sleep(Duration::from_millis(65_000)).await;
-
-    // After timeout, the message should be in DTN queue with status "dtn_pending"
-    let alice_msg = alice.db.get_message(&msg_id).unwrap();
+    // The fallback must land on the scale of the discovery timeout (5 s), not
+    // the maintenance interval. With one retry that is ~11 s: expiry detected
+    // at ~5 s triggers the retry, the retry expires at ~10 s and enters DTN.
+    //
+    // This bound is the regression test for ROADMAP T-10. Before the fix the
+    // sweep lived in the 30 s maintenance tick, so the first retry happened at
+    // ~30 s and DTN at ~60 s; a 25 s bound fails on that code.
+    const FALLBACK_BOUND: Duration = Duration::from_secs(25);
+    let start = std::time::Instant::now();
+    let mut status = String::new();
+    while start.elapsed() < FALLBACK_BOUND {
+        status = alice.db.get_message(&msg_id).unwrap().status;
+        if status == "dtn_pending" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert_eq!(
-        alice_msg.status, "dtn_pending",
-        "Message should be dtn_pending after route discovery timeout, got: {}",
-        alice_msg.status
+        status,
+        "dtn_pending",
+        "message should be dtn_pending within {:?} of the send (discovery timeout is 5 s), \
+         still {:?} after {:?}",
+        FALLBACK_BOUND,
+        status,
+        start.elapsed()
     );
 
     // Verify DTN bundle is persisted
@@ -462,4 +476,118 @@ async fn test_route_invalidation_on_link_loss() {
     alice.stop().await;
     bob.stop().await;
     carol.stop().await;
+}
+
+/// Several messages queued for one unreachable destination must produce one
+/// RREQ, not one per message.
+///
+/// Every envelope waiting on a destination waits on the same route, so a
+/// single discovery serves all of them. Regression test for ROADMAP T-10:
+/// `route_and_send` used to call `initiate_discovery` for every send, and the
+/// retry sweep iterated per queued envelope, so N messages to one offline peer
+/// flooded the mesh N times on the initial attempt and N times again on every
+/// retry.
+#[tokio::test]
+async fn test_one_rreq_per_destination_not_per_message() {
+    use mycelium_core::transport::{Transport, TransportEvent};
+    use mycelium_protocol::codec::Envelope;
+    use mycelium_protocol::wire::{self, WirePayloadType};
+
+    let alice_identity = Identity::generate();
+    let bob_identity = Identity::generate();
+    let alice_id = alice_identity.node_id();
+    let bob_id = bob_identity.node_id();
+    // Carol never joins the network, so no route to her can ever be found.
+    let carol_id = Identity::generate().node_id();
+
+    let alice = make_node(alice_identity);
+    let bob = make_node(bob_identity);
+
+    let network = MockNetwork::new();
+    let alice_t = Arc::new(MockTransport::new(alice_id, network.clone()).await);
+    let bob_t = Arc::new(MockTransport::new(bob_id, network.clone()).await);
+    alice.transport_manager.add_transport(alice_t.clone()).await;
+    bob.transport_manager.add_transport(bob_t.clone()).await;
+
+    alice.start().await.unwrap();
+    bob.start().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    network
+        .add_link(alice_id, bob_id, MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Count the RREQs for Carol that reach Bob. Bob's node also consumes this
+    // stream; a broadcast channel allows both.
+    let mut events = bob_t.events();
+    let rreqs_for_carol = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = rreqs_for_carol.clone();
+    tokio::spawn(async move {
+        while let Ok(event) = events.recv().await {
+            if let TransportEvent::DataReceived { data, .. } = event {
+                let Ok(envelope) = Envelope::deserialize(&data) else {
+                    continue;
+                };
+                let Some(&type_byte) = envelope.payload.first() else {
+                    continue;
+                };
+                if WirePayloadType::from_byte(type_byte) != Some(WirePayloadType::AodvRreq) {
+                    continue;
+                }
+                if let Ok((_, _, _, dest, _, _, _)) =
+                    wire::deserialize_aodv_rreq(&envelope.payload[1..])
+                {
+                    if dest == carol_id {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    });
+
+    // Three messages to the same unreachable destination, back to back.
+    for i in 0..3 {
+        alice
+            .send_message(carol_id, format!("msg {i}").as_bytes(), ContentType::Text)
+            .await
+            .expect("send is queued, not delivered");
+    }
+
+    // Let the initial discovery go out, but stay well inside the 5 s timeout
+    // so no retry sweep has fired yet.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let after_initial = rreqs_for_carol.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after_initial, 1,
+        "three messages to one unreachable destination should emit exactly one \
+         initial RREQ, got {after_initial}"
+    );
+
+    // A message queued well after the first one must join the in-flight
+    // discovery rather than starting its own. This is the staggered case: with
+    // a per-envelope deadline it would expire ~2 s after the others and emit
+    // its own RREQ.
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    alice
+        .send_message(carol_id, b"late joiner", ContentType::Text)
+        .await
+        .expect("send is queued");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let after_late = rreqs_for_carol.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after_late, 1,
+        "a message queued later must join the in-flight discovery, got {after_late}"
+    );
+
+    // Now let exactly one retry sweep fire (timeout 5 s, sweep every 1 s).
+    tokio::time::sleep(Duration::from_millis(4_500)).await;
+    let after_retry = rreqs_for_carol.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after_retry, 2,
+        "the retry sweep should emit one more RREQ for the destination, not one \
+         per queued envelope nor one per stagger; got {after_retry} total"
+    );
+
+    alice.stop().await;
+    bob.stop().await;
 }

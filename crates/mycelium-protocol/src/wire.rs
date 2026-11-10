@@ -14,6 +14,7 @@ pub enum WirePayloadType {
     SessionInit = 0x11,
     PrekeyRequest = 0x20,
     PrekeyResponse = 0x21,
+    SessionReject = 0x22,
     AodvRreq = 0x30,
     AodvRrep = 0x31,
     AodvRerr = 0x32,
@@ -36,6 +37,7 @@ impl WirePayloadType {
             0x11 => Some(Self::SessionInit),
             0x20 => Some(Self::PrekeyRequest),
             0x21 => Some(Self::PrekeyResponse),
+            0x22 => Some(Self::SessionReject),
             0x30 => Some(Self::AodvRreq),
             0x31 => Some(Self::AodvRrep),
             0x32 => Some(Self::AodvRerr),
@@ -349,6 +351,66 @@ pub fn serialize_prekey_request(requester_identity_key: &[u8; 32]) -> Vec<u8> {
     buf.push(WirePayloadType::PrekeyRequest as u8);
     buf.extend_from_slice(requester_identity_key);
     buf
+}
+
+/// Why a `SessionInit` was refused.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRejectReason {
+    /// The signed prekey the initiator used is one we no longer hold: its
+    /// cached bundle is older than our retention window.
+    StaleSignedPrekey = 1,
+    /// The one-time prekey the initiator used is not available.
+    UnknownOneTimePrekey = 2,
+    /// X3DH completed but the enclosed first message did not authenticate.
+    DecryptFailed = 3,
+}
+
+impl SessionRejectReason {
+    pub fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(Self::StaleSignedPrekey),
+            2 => Some(Self::UnknownOneTimePrekey),
+            3 => Some(Self::DecryptFailed),
+            _ => None,
+        }
+    }
+}
+
+/// Session rejection wire format.
+/// Layout: type(1=0x22) + reason(1) + identity_key(32)
+///
+/// Sent when a `SessionInit` cannot be accepted, so the initiator discards its
+/// cached prekey bundle and re-requests instead of retrying forever against a
+/// bundle that can never work (ROADMAP T-06).
+///
+/// A reject is necessarily unauthenticated — no session exists yet — so the
+/// receiver must treat it as a hint only: drop the cached bundle and
+/// re-request, never touch an established session. The `identity_key` lets the
+/// receiver apply the same NodeId binding check as every other ingress path.
+pub fn serialize_session_reject(reason: SessionRejectReason, identity_key: &[u8; 32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(34);
+    buf.push(WirePayloadType::SessionReject as u8);
+    buf.push(reason as u8);
+    buf.extend_from_slice(identity_key);
+    buf
+}
+
+/// Deserialize a session rejection from body bytes (after the type byte).
+pub fn deserialize_session_reject(
+    data: &[u8],
+) -> Result<(SessionRejectReason, [u8; 32]), CodecError> {
+    if data.len() < 33 {
+        return Err(CodecError::BufferTooShort {
+            expected: 33,
+            actual: data.len(),
+        });
+    }
+    let reason = SessionRejectReason::from_byte(data[0])
+        .ok_or(CodecError::InvalidDiscriminant { value: data[0] })?;
+    let mut identity_key = [0u8; 32];
+    identity_key.copy_from_slice(&data[1..33]);
+    Ok((reason, identity_key))
 }
 
 /// AODV Route Request wire format.
@@ -874,21 +936,44 @@ impl EmergencyLevel {
     }
 }
 
+/// A level-3 co-signer: who approved, and their signature over the broadcast.
+///
+/// A bare NodeId proves nothing — anyone can list three trusted ids they do
+/// not control. The signature is over
+/// `mycelium_crypto::emergency::cosign_digest` and is
+/// verified against the co-signer's stored identity key (ROADMAP T-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyCosigner {
+    pub node_id: NodeId,
+    pub signature: [u8; 64],
+}
+
+/// Size of one serialized co-signer entry.
+pub const COSIGNER_ENTRY_LEN: usize = 32 + 64;
+
+/// Domain separator for the bytes a level-3 co-signer signs. The digest
+/// itself is built by `mycelium_crypto::emergency::cosign_digest`; this crate
+/// carries wire bytes and deliberately pulls in no hashing.
+pub const EMERGENCY_COSIGN_CONTEXT: &[u8] = b"mycelium-emergency-cosign-v1:";
+
 /// Serialize an emergency broadcast payload.
-/// Layout: type(1=0x90) + level(1) + msg_len(4) + message + cosigner_count(1) + cosigners(N*32)
+/// Layout: type(1=0x90) + level(1) + msg_len(4) + message + cosigner_count(1)
+///       + cosigners(N * (node_id(32) + signature(64)))
 pub fn serialize_emergency_broadcast(
     level: EmergencyLevel,
     message: &[u8],
-    cosigners: &[[u8; 32]],
+    cosigners: &[EmergencyCosigner],
 ) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + 1 + 4 + message.len() + 1 + cosigners.len() * 32);
+    let mut buf =
+        Vec::with_capacity(1 + 1 + 4 + message.len() + 1 + cosigners.len() * COSIGNER_ENTRY_LEN);
     buf.push(WirePayloadType::EmergencyBroadcast as u8);
     buf.push(level as u8);
     buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
     buf.extend_from_slice(message);
     buf.push(cosigners.len() as u8);
     for cosigner in cosigners {
-        buf.extend_from_slice(cosigner);
+        buf.extend_from_slice(cosigner.node_id.as_bytes());
+        buf.extend_from_slice(&cosigner.signature);
     }
     buf
 }
@@ -898,7 +983,7 @@ pub fn serialize_emergency_broadcast(
 #[allow(clippy::type_complexity)]
 pub fn deserialize_emergency_broadcast(
     data: &[u8],
-) -> Result<(EmergencyLevel, Vec<u8>, Vec<[u8; 32]>), CodecError> {
+) -> Result<(EmergencyLevel, Vec<u8>, Vec<EmergencyCosigner>), CodecError> {
     if data.len() < 6 {
         return Err(CodecError::BufferTooShort {
             expected: 6,
@@ -920,18 +1005,25 @@ pub fn deserialize_emergency_broadcast(
     let message = data[5..5 + msg_len].to_vec();
     let cosigner_count = data[5 + msg_len] as usize;
     let cosigners_start = 5 + msg_len + 1;
-    if data.len() < cosigners_start + cosigner_count * 32 {
+    // Overflow-safe on 32-bit targets: compare against what remains.
+    if (data.len() - cosigners_start) / COSIGNER_ENTRY_LEN < cosigner_count {
         return Err(CodecError::BufferTooShort {
-            expected: cosigners_start + cosigner_count * 32,
+            expected: cosigners_start
+                .saturating_add(cosigner_count.saturating_mul(COSIGNER_ENTRY_LEN)),
             actual: data.len(),
         });
     }
     let mut cosigners = Vec::with_capacity(cosigner_count);
     for i in 0..cosigner_count {
-        let offset = cosigners_start + i * 32;
-        let mut cosigner = [0u8; 32];
-        cosigner.copy_from_slice(&data[offset..offset + 32]);
-        cosigners.push(cosigner);
+        let offset = cosigners_start + i * COSIGNER_ENTRY_LEN;
+        let mut node_id = [0u8; 32];
+        node_id.copy_from_slice(&data[offset..offset + 32]);
+        let mut signature = [0u8; 64];
+        signature.copy_from_slice(&data[offset + 32..offset + COSIGNER_ENTRY_LEN]);
+        cosigners.push(EmergencyCosigner {
+            node_id: NodeId::from_bytes(node_id),
+            signature,
+        });
     }
     Ok((level, message, cosigners))
 }
@@ -1236,15 +1328,28 @@ mod tests {
     #[test]
     fn test_emergency_broadcast_roundtrip() {
         let message = b"Emergency: building collapse at sector 7";
-        let cosigners = vec![[0x11; 32], [0x22; 32], [0x33; 32]];
+        let cosigners: Vec<EmergencyCosigner> = (1u8..=3)
+            .map(|i| EmergencyCosigner {
+                node_id: NodeId([i * 0x11; 32]),
+                signature: [i; 64],
+            })
+            .collect();
         let bytes = serialize_emergency_broadcast(EmergencyLevel::Critical, message, &cosigners);
         assert_eq!(bytes[0], WirePayloadType::EmergencyBroadcast as u8);
         let (level, msg, cs) = deserialize_emergency_broadcast(&bytes[1..]).unwrap();
         assert_eq!(level, EmergencyLevel::Critical);
         assert_eq!(msg, message);
-        assert_eq!(cs.len(), 3);
-        assert_eq!(cs[0], [0x11; 32]);
-        assert_eq!(cs[2], [0x33; 32]);
+        assert_eq!(
+            cs, cosigners,
+            "co-signer ids and signatures must round trip"
+        );
+
+        // A truncated signature must be refused, not silently zero-padded.
+        let truncated = &bytes[1..bytes.len() - 1];
+        assert!(matches!(
+            deserialize_emergency_broadcast(truncated),
+            Err(CodecError::BufferTooShort { .. })
+        ));
     }
 
     #[test]
@@ -1274,5 +1379,37 @@ mod tests {
         assert_eq!(action, ModerationAction::BanUser);
         assert_eq!(tid, target_id);
         assert_eq!(sig, signature);
+    }
+    /// Every payload type needs a roundtrip test (CLAUDE.md testing rules).
+    #[test]
+    fn test_session_reject_roundtrip() {
+        let identity_key = [7u8; 32];
+        for reason in [
+            SessionRejectReason::StaleSignedPrekey,
+            SessionRejectReason::UnknownOneTimePrekey,
+            SessionRejectReason::DecryptFailed,
+        ] {
+            let bytes = serialize_session_reject(reason, &identity_key);
+            assert_eq!(bytes[0], WirePayloadType::SessionReject as u8);
+            assert_eq!(bytes.len(), 34);
+
+            let (got_reason, got_key) = deserialize_session_reject(&bytes[1..]).unwrap();
+            assert_eq!(got_reason, reason);
+            assert_eq!(got_key, identity_key);
+        }
+    }
+
+    #[test]
+    fn test_session_reject_rejects_short_and_unknown() {
+        assert!(matches!(
+            deserialize_session_reject(&[1u8; 32]),
+            Err(CodecError::BufferTooShort { .. })
+        ));
+        let mut body = vec![0u8; 33];
+        body[0] = 99; // not a known reason
+        assert!(matches!(
+            deserialize_session_reject(&body),
+            Err(CodecError::InvalidDiscriminant { value: 99 })
+        ));
     }
 }

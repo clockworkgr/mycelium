@@ -173,3 +173,99 @@ async fn test_group_key_distribution_and_message() {
         node.stop().await;
     }
 }
+
+/// A sender-key chain advance that cannot be persisted must abort the group send.
+///
+/// Same hazard as the pairwise ratchet (ROADMAP T-07): `SenderKeyGroup::encrypt`
+/// advances the chain key in memory, and the group AEAD derives its nonce from
+/// the iteration. If the new iteration is lost but the ciphertext went out, the
+/// next start re-encrypts a different plaintext at the same iteration, re-using
+/// a nonce under the same key.
+///
+/// Before the fix `send_group_message` discarded the error with
+/// `let _ = self.db.save_group_blob(..)` and sent to every member anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_group_send_fails_when_chain_state_cannot_be_persisted() {
+    let identities: Vec<Identity> = (0..2).map(|_| Identity::generate()).collect();
+    let ids: Vec<NodeId> = identities.iter().map(|i| i.node_id()).collect();
+    let nodes: Vec<Node> = identities.into_iter().map(make_node).collect();
+    let (alice, bob) = (&nodes[0], &nodes[1]);
+
+    let network = MockNetwork::new();
+    for (node, id) in nodes.iter().zip(&ids) {
+        let t = Arc::new(MockTransport::new(*id, network.clone()).await);
+        node.transport_manager.add_transport(t).await;
+        node.start().await.expect("start");
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    network
+        .add_link(ids[0], ids[1], MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let group_id = alice.create_group().await.expect("create group");
+    alice
+        .add_group_member(group_id, ids[1])
+        .await
+        .expect("add bob");
+
+    // Wait for the sender keys to reach each other, or the first message
+    // arrives before Bob can decrypt it.
+    let keyed = wait_until(
+        || {
+            let rt = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                rt.block_on(async {
+                    let b = bob.groups.read().await;
+                    b.get(&group_id)
+                        .map(|g| g.member_keys.contains_key(&ids[0]))
+                        .unwrap_or(false)
+                })
+            })
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+    assert!(keyed, "precondition: Bob must hold Alice's sender key");
+
+    // A normal group message first, so we know the group path works.
+    let first_id = alice
+        .send_group_message(group_id, b"hello group", ContentType::Text)
+        .await
+        .expect("first group send");
+    assert!(
+        wait_until(
+            || bob.db.get_message(&first_id).is_ok(),
+            Duration::from_secs(5),
+        )
+        .await,
+        "precondition: Bob must receive the first group message"
+    );
+
+    // Group state lives as a blob in `config`. Break only that.
+    alice
+        .db
+        .conn()
+        .execute_batch("DROP TABLE config;")
+        .expect("drop config table");
+
+    let result = alice
+        .send_group_message(group_id, b"must not be sent", ContentType::Text)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "group send must fail when the chain advance cannot be persisted, got {:?}",
+        result.as_ref().map(|id| id.to_string())
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let bob_msgs = bob
+        .db
+        .get_conversation(&ids[1], &NodeId::from_bytes(group_id), 100, 0)
+        .expect("bob group conversation");
+    assert!(
+        bob_msgs.iter().all(|m| m.plaintext != b"must not be sent"),
+        "Bob must not have received a group message whose chain state was never persisted"
+    );
+}

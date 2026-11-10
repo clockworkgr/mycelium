@@ -13,7 +13,7 @@
 This is the single normative document for Mycelium. It specifies the wire
 protocol and cryptography, and describes the architecture as built. The
 companion document is [`ROADMAP.md`](ROADMAP.md), which tracks the open work.
-Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/);
+Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/) (ADR-001 … ADR-009);
 build and contribution mechanics live in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### Status legend
@@ -260,7 +260,7 @@ who observes the radio. Content is always encrypted and opaque to relays.
 
 ### 4.2 Payload types
 
-Each payload begins with a 1-byte type discriminator. Seventeen types are
+Each payload begins with a 1-byte type discriminator. Eighteen types are
 defined.
 
 | Byte | Name | Min body | Purpose |
@@ -269,6 +269,7 @@ defined.
 | `0x11` | `SessionInit` | 69 | X3DH ephemeral + identity key + encrypted first message |
 | `0x20` | `PrekeyRequest` | 32 | Requester's identity key |
 | `0x21` | `PrekeyResponse` | 66 | Prekey bundle: SPK + signature + optional OTP |
+| `0x22` | `SessionReject` | 33 | Refusal of a `SessionInit`: reason + identity key (ADR-009) |
 | `0x30` | `AodvRreq` | 78 | Route request |
 | `0x31` | `AodvRrep` | 77 | Route reply |
 | `0x32` | `AodvRerr` | 68 | Route error |
@@ -373,9 +374,20 @@ initiators therefore never share an OTP.
 Bundles are fetched from a nearby supernode's cache (§16.2, `GET
 /v1/prekeys/{node_id}`) or over the mesh by `PrekeyRequest`/`PrekeyResponse`.
 
-**Known gap:** a signed prekey rotation invalidates bundles already cached by
-other nodes, and an X3DH failure produces no rejection message, so the
-initiator never learns to re-request. See ROADMAP T-06.
+**Rotation and retention.** A responder **must** run X3DH with the signed
+prekey the initiator names in `signed_prekey_id`, not whichever is current, and
+**must** seed the Double Ratchet's initial DH key from that same secret.
+Rotated secrets are retained — `MAX_RETAINED_SIGNED_PREKEYS = 2`, covering the
+weekly rotation against the 7-day bundle cache — so a conversation started from
+a cached bundle survives a rotation. An id outside the retention window is a
+hard error, never a silently mismatched derivation (ADR-009).
+
+**Rejection.** When a `SessionInit` cannot be accepted the responder sends
+`SessionReject` (`0x22`), and the initiator discards its cached bundle so the
+next send re-requests a fresh one. A reject is unauthenticated by construction,
+so it acts only on an unconfirmed handshake: a session older than the 60 s
+initiation window is never touched, and the message does nothing when no bundle
+is cached. See ADR-009 for the full argument.
 
 ### 5.3 Double Ratchet
 
@@ -398,9 +410,17 @@ service by any node on the path.
 Skipped message keys are retained to tolerate reordering, bounded at
 `max_skip = 1000` per jump and 2000 in total.
 
-**Known gap:** ratchet state is persisted after transmission rather than
-before, so a process death between encrypt and persist can reuse a nonce. Key
-material is not zeroized. See ROADMAP T-07.
+**State must be durable before the ciphertext leaves.** `encrypt` advances the
+sending chain in memory; if that advance is lost while the ciphertext has
+already gone out, the next start re-encrypts a different plaintext at the same
+chain position and re-uses an AES-GCM nonce under the same key. A node
+therefore **must** persist the advance before handing the ciphertext to any
+transport, and **must** fail the send if it cannot — the receive path may log
+and continue, because its advance is idempotent on replay. A session created
+for a handshake that was never transmitted must be discarded, not left
+installed. Key material (root key, chain keys, retained skipped keys, derived
+message keys, the X3DH DH concatenation and the serialized state buffer) is
+zeroized once it falls out of use.
 
 ### 5.4 Sender Key groups
 
@@ -436,7 +456,8 @@ Membership rules:
 
 Out-of-order delivery is supported by retaining skipped iterations per sender,
 bounded at `MAX_GROUP_SKIP = 1000`, and chain state is committed only after the
-AEAD tag verifies (same transactional rule as §5.3).
+AEAD tag verifies (same transactional rule as §5.3). A group send, like a
+pairwise one, must persist the advanced chain key before transmitting.
 
 Trade-off versus MLS: sender keys are O(n) to distribute and give per-epoch
 rather than per-operation forward secrecy. They are adequate for groups below
@@ -482,7 +503,7 @@ let a key derived for one purpose be substituted for another.
 | Reorder tolerance | Bounded skipped-key retention | Implemented |
 | Relay opacity | Relays store/forward ciphertext only | Implemented |
 | Key material at rest | SQLCipher for the database | **Partial** — the identity key is a plaintext file and the DB key is derived from it (ROADMAP T-08) |
-| Memory hygiene | — | **Planned** — no zeroization (ROADMAP T-07) |
+| Memory hygiene | Key material zeroized on drop and on every return path | Implemented |
 | Metadata privacy | Not a goal: routing headers are cleartext by design (§4.1) | n/a |
 
 ## 6. Identity and trust
@@ -587,13 +608,19 @@ When no route exists, the message becomes a DTN bundle.
   originator's deadline (ADR-005).
 - **Storage** — 256 MB on phones, 2 GB on supernodes; per-identity quotas of
   10 MB and 50 MB respectively.
-- **Eviction** — TTL expiry first, then oldest-first under pressure.
+- **Eviction** — TTL expiry first, then relay traffic oldest-first; local
+  bundles are never evicted (see below).
 - Storing the same message twice does not double-count storage, and per-source
   accounting entries are dropped at zero.
 
-**Known gaps:** eviction can discard the local user's own outgoing bundles to
-make room for relay traffic, and `sprayed_to` is in-memory only, so a restart
-re-sprays to peers that already hold a copy. See ROADMAP T-11.
+**Eviction is origin-aware.** A bundle records whether this node originated it.
+Only relay traffic is ever evicted, oldest-first; a locally originated bundle is
+a message the user composed and cannot re-create, so nothing displaces it — not
+even another local bundle. When only local bundles remain the store is full and
+the send fails visibly rather than silently deleting mail. The origin flag and
+the spray history are both persisted, so a restart neither reclassifies the
+user's own bundles as relay traffic nor spends copies re-spraying peers that
+already hold one.
 
 ### 7.3 Decision flow
 
@@ -607,9 +634,12 @@ Node.send_message(destination, data)
        └─ EnterDtn              DtnEngine.store_outgoing(.., copies=8, ttl=72h)
 ```
 
-**Known gap:** the discovery timeout is evaluated on the 30 s maintenance tick
-rather than the specified 5 s, so DTN fallback is late, and a pending
-destination can emit more than one RREQ per retry. See ROADMAP T-10.
+A destination gets **one** discovery attempt, shared by every envelope queued
+for it, with one retry before the fallback. A dedicated 1 s sweep evaluates the
+5 s timeout — not the 30 s maintenance tick — so a message to an unreachable
+peer enters DTN in roughly 11 s. Implementations **must not** start a discovery
+per queued envelope: all of them are waiting for the same route, and one RREQ
+per message floods the mesh N times for a single unreachable peer.
 
 ### 7.4 Geographic hash overlay
 
@@ -644,7 +674,9 @@ pub trait Transport: Send + Sync {
 ```
 
 `TransportType`: `Ble`, `WifiDirect`, `Lora`, `BtClassic`, `InternetTunnel`,
-`WifiAware`, `Mock`.
+`WifiAware`, `Meshtastic`, `Reticulum`, `Mock`. Foreign-protocol bridges carry
+their own variant rather than borrowing the one for the radio they ride on, so
+per-transport accounting and the diagnostics API can tell them apart.
 
 `TransportEvent`: `NeighborDiscovered`, `NeighborLost`, `DataReceived`,
 `LinkQualityChanged`.
@@ -685,7 +717,7 @@ than a seamless migration (ROADMAP T-03).
 | **Wi-Fi Direct** | 65 KB | ~50 Mbps | 50–200 m | **Implemented** — Android only (iOS does not expose it) |
 | **BT Classic (SPP)** | 16 KB | ~2 Mbps | 10–100 m | **Implemented, untested on hardware** — Android only |
 | **LoRa** | 2 KB message / 51–222 B frame | 0.25–37 kbps | 1–15 km | **Implemented, untested on hardware** — bridges on Android (BLE + USB) and iOS (BLE) |
-| **Internet tunnel** | 65 KB | varies | global | **Partial** — peer identity unauthenticated (ROADMAP T-09) |
+| **Internet tunnel** | 1 MiB (see §8.4) | varies | global | **Partial** — peer identity unauthenticated (ROADMAP T-09) |
 | **Plugins** | per plugin | — | — | **Partial** — API complete, adapters not wired (§18) |
 | **Wi-Fi Aware (NAN)** | — | — | — | **Planned (v0.4)** |
 | **Ultrasonic audio** | — | — | — | **Planned (future)** — last-resort bootstrap when all radios are blocked |
@@ -741,10 +773,12 @@ XOR distance, Ping/FindNode/FindValue/Store) for peer discovery. Peer-to-peer
 TCP works; the Hello handshake is bounded and timed out, duplicates and
 self-connections are refused, and the transport is restartable.
 
-**Known gaps:** the Hello is unsigned, so the peer identity is unverified;
-`max_connections` is not enforced; framing is JSON, so byte arrays hit the
-1 MiB cap far below the advertised MTU. The DHT has no iterative lookup, no
-record TTL or cap, and no record signatures. See ROADMAP T-09.
+**Known gaps:** the Hello is unsigned, so the peer identity is unverified, and
+`max_connections` is configured but never enforced. Framing is JSON, which
+encodes a byte array as a decimal list and expands payloads 5×; since both
+`mtu()` and the receiver's frame cap are 1 MiB, a send at the advertised MTU is
+rejected and the real ceiling is about 210 KB. The DHT has no iterative lookup,
+no record TTL or cap, and no record signatures. See ROADMAP T-09.
 
 **Outbox pattern.** BLE, Wi-Fi Direct, BT Classic and LoRa all follow the same
 Rust↔platform shape: `send()` pushes to a bounded `VecDeque` (512 packets;
@@ -1519,15 +1553,15 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 4 | Envelope + 17 payload types | **Implemented** | Custom binary codec |
 | 4.3 | Compact LoRa frame | **Implemented** | Defined and tested; not yet used by the transport (T-12) |
 | 5.1 | Ed25519/X25519 identity | **Implemented** | Device-bound, NodeId ↔ key binding enforced |
-| 5.2 | X3DH | **Implemented** | SPK + OTP issued once, signature verified. SPK-rotation bundle staleness open (T-06) |
-| 5.3 | Double Ratchet | **Implemented** | Transactional decrypt, bounded skips. Persist-before-send and zeroization open (T-07) |
+| 5.2 | X3DH | **Implemented** | SPK + OTP issued once, signature verified, rotated SPKs retained, stale bundles rejected and recovered (ADR-009) |
+| 5.3 | Double Ratchet | **Implemented** | Transactional decrypt, bounded skips, ratchet state durable before transmit, key material zeroized |
 | 5.4 | Group encryption | **Implemented** | Sender keys over pairwise sessions (ADR-007), not an MLS tree. No admin model |
 | 5.5 | Safety numbers | **Implemented** | 60-digit, symmetric, verify flow in the app |
 | 6.1 | Web of Trust | **Implemented** | BFS with decay, signed vouches |
 | 6.2 | Sybil resistance | **Implemented** | Trust-gated rate limits + blacklisting |
 | 6.3 | Threshold revocation | **Planned** | v0.4 |
-| 7.1 | AODV | **Implemented** | Supernode + direct-link preference, storm-free RERR. 5 s discovery timeout open (T-10) |
-| 7.2 | DTN spray-and-wait | **Implemented** | Copies/TTL on the wire (ADR-005), quotas, eviction. Own-bundle eviction + `sprayed_to` persistence open (T-11) |
+| 7.1 | AODV | **Implemented** | Supernode + direct-link preference, storm-free RERR, one shared discovery attempt per destination on a 1 s sweep |
+| 7.2 | DTN spray-and-wait | **Implemented** | Copies/TTL on the wire (ADR-005), quotas, origin-aware eviction, persisted origin + spray history |
 | 7.4 | Geographic hash overlay | **Planned** | v0.4 |
 | 8.1 | BLE | **Implemented** | Dual-role GATT, fragmentation, write queue, Android + iOS |
 | 8.1 | Wi-Fi Direct | **Implemented** | ADR-003, Android only |
@@ -1535,7 +1569,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 8.1 | LoRa | **Implemented, untested** | Fragmentation, ADR, duty cycle, broadcast beacons (ADR-008); no hardware test (T-15) |
 | 8.1 | Internet tunnel | **Partial** | TCP + DHT + FFI + UI. Unsigned Hello, JSON framing, no connection cap (T-09) |
 | 8.2 | Transport handoff | **Partial** | First-available selection; no session migration (T-03) |
-| 8.5 | Plugin API | **Implemented** | Trait, registry, config. Nothing instantiates plugins (T-13) |
+| 8.5 | Plugin API | **Implemented** | Trait, registry, config, distinct `TransportType` per adapter. Nothing instantiates plugins (T-13) |
 | 8.6 | iOS strategy | **Implemented** | Dual-role CoreBluetooth, background restoration, LoRa bridge |
 | 9.1 | Content types | **Implemented** | All seven |
 | 9.2 | Lamport ordering | **Implemented** | Tick on send, merge on receive |

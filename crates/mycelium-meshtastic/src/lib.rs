@@ -311,7 +311,7 @@ impl MeshtasticTransport {
                 peers.push(peer_id);
                 let _ = self.tx.send(TransportEvent::NeighborDiscovered {
                     peer: peer_id,
-                    transport: TransportType::Lora, // Meshtastic uses LoRa
+                    transport: TransportType::Meshtastic,
                 });
             }
         }
@@ -326,7 +326,7 @@ impl MeshtasticTransport {
             let _ = self.tx.send(TransportEvent::DataReceived {
                 peer: peer_id,
                 data: packet.payload,
-                transport: TransportType::Lora,
+                transport: TransportType::Meshtastic,
             });
         }
     }
@@ -348,7 +348,9 @@ impl MeshtasticTransport {
 #[async_trait::async_trait]
 impl Transport for MeshtasticTransport {
     fn transport_type(&self) -> TransportType {
-        TransportType::Lora // Meshtastic devices are LoRa radios
+        // A Meshtastic bridge, not a native Mycelium LoRa radio: the
+        // framing and channel crypto are the foreign protocol's.
+        TransportType::Meshtastic
     }
 
     async fn start(&self) -> Result<(), TransportError> {
@@ -602,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn test_meshtastic_transport_lifecycle() {
         let transport = MeshtasticTransport::new(MeshtasticConfig::default());
-        assert_eq!(transport.transport_type(), TransportType::Lora);
+        assert_eq!(transport.transport_type(), TransportType::Meshtastic);
         assert_eq!(transport.mtu(), 237);
 
         transport.start().await.unwrap();

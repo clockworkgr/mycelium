@@ -6,6 +6,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 
 use mycelium_protocol::types::NodeId;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum number of chain iterations a single incoming group message may
 /// skip ahead. Bounds CPU spent on a forged `iteration` (each step is a hash).
@@ -17,6 +18,10 @@ const MAX_GROUP_SKIPPED_KEYS: usize = 2000;
 /// A sender key for group messaging.
 /// Each group member generates their own sender key and distributes it
 /// to all other members via pairwise Double Ratchet sessions.
+///
+/// `chain_key` and the retained skipped message keys are wiped on drop; the
+/// fields stay plain `[u8; 32]` because the struct is serialized to a fixed
+/// byte layout for storage.
 #[derive(Debug, Clone)]
 pub struct SenderKey {
     /// Initial chain key (32 bytes).
@@ -49,24 +54,30 @@ impl SenderKey {
     ///
     /// Fails once the 32-bit chain is exhausted rather than wrapping, since a
     /// repeated iteration would reuse an AEAD nonce.
-    pub fn next_message_key(&mut self) -> Result<(u32, [u8; 32]), GroupError> {
+    pub fn next_message_key(&mut self) -> Result<(u32, Zeroizing<[u8; 32]>), GroupError> {
         let iteration = self.iteration;
         let next = iteration.checked_add(1).ok_or(GroupError::ChainExhausted)?;
         let message_key = derive_message_key(&self.chain_key, iteration);
         self.chain_key = derive_next_chain_key(&self.chain_key);
         self.iteration = next;
-        Ok((iteration, message_key))
+        Ok((iteration, Zeroizing::new(message_key)))
     }
 
     /// Derive the message key for a specific iteration (for decryption).
     ///
     /// Advances the chain if needed, retaining the keys of skipped iterations
     /// so messages that arrive later (out of order) can still be decrypted.
-    pub fn message_key_for_iteration(&mut self, target: u32) -> Result<[u8; 32], GroupError> {
+    pub fn message_key_for_iteration(
+        &mut self,
+        target: u32,
+    ) -> Result<Zeroizing<[u8; 32]>, GroupError> {
         if target < self.iteration {
+            // `remove` moves the key out of the map, past `Drop`, so wrap
+            // it to keep it wiped.
             return self
                 .skipped_keys
                 .remove(&target)
+                .map(Zeroizing::new)
                 .ok_or(GroupError::IterationAlreadyUsed);
         }
 
@@ -87,11 +98,21 @@ impl SenderKey {
             self.iteration += 1;
         }
 
-        let message_key = derive_message_key(&self.chain_key, self.iteration);
+        let message_key = Zeroizing::new(derive_message_key(&self.chain_key, self.iteration));
         self.chain_key = derive_next_chain_key(&self.chain_key);
         self.iteration = next;
 
         Ok(message_key)
+    }
+}
+
+impl Drop for SenderKey {
+    fn drop(&mut self) {
+        self.chain_key.zeroize();
+        for key in self.skipped_keys.values_mut() {
+            key.zeroize();
+        }
+        self.skipped_keys.clear();
     }
 }
 
@@ -202,6 +223,11 @@ impl SenderKeyGroup {
     ///
     /// Format: group_id(32) + our_chain_key(32) + our_iteration(4) + num_members(4)
     ///       + [node_id(32) + chain_key(32) + iteration(4)] * num_members
+    /// Serialize for storage.
+    ///
+    /// The buffer contains our chain key and every member's chain key in
+    /// the clear; the caller must wipe it once written (see
+    /// `Node::persist_group_blob`).
     pub fn to_bytes(&self) -> Vec<u8> {
         let num = self.members.len();
         let mut buf = Vec::with_capacity(72 + num * 68);
@@ -317,8 +343,8 @@ fn encrypt_group_aead(
     group_id: &[u8; 32],
 ) -> Result<Vec<u8>, GroupError> {
     let hk = Hkdf::<Sha256>::new(None, message_key);
-    let mut key_and_nonce = [0u8; 44];
-    hk.expand(b"MyceliumGroupAEAD", &mut key_and_nonce)
+    let mut key_and_nonce = zeroize::Zeroizing::new([0u8; 44]);
+    hk.expand(b"MyceliumGroupAEAD", key_and_nonce.as_mut_slice())
         .expect("HKDF failed");
 
     let cipher =
@@ -342,8 +368,8 @@ fn decrypt_group_aead(
     group_id: &[u8; 32],
 ) -> Result<Vec<u8>, GroupError> {
     let hk = Hkdf::<Sha256>::new(None, message_key);
-    let mut key_and_nonce = [0u8; 44];
-    hk.expand(b"MyceliumGroupAEAD", &mut key_and_nonce)
+    let mut key_and_nonce = zeroize::Zeroizing::new([0u8; 44]);
+    hk.expand(b"MyceliumGroupAEAD", key_and_nonce.as_mut_slice())
         .expect("HKDF failed");
 
     let cipher =

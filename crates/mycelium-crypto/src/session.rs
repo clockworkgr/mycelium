@@ -1,6 +1,6 @@
 use sha2::{Digest, Sha256};
 
-use mycelium_protocol::types::NodeId;
+use mycelium_protocol::types::{MessageId, NodeId};
 
 use crate::double_ratchet::{RatchetError, RatchetHeader, RatchetState};
 use crate::identity::{node_id_from_public_key, Identity};
@@ -24,6 +24,20 @@ pub struct SessionManager {
     /// When we last initiated a session with each peer. Used to detect the
     /// race where both peers initiate at the same time (not persisted).
     recent_initiations: HashMap<NodeId, Instant>,
+    /// Handshakes we initiated that the peer has not confirmed, with the
+    /// messages we sent under them.
+    ///
+    /// The initiator installs its session optimistically, so `has_session` is
+    /// not evidence the peer agrees. A peer is confirmed the moment we
+    /// successfully decrypt anything from it: only its own ratchet could have
+    /// produced that. Until then a `SessionReject` may legitimately tear the
+    /// session down; afterwards it may not, which is what stops a forged
+    /// reject from killing working traffic (ADR-009, ROADMAP T-06).
+    ///
+    /// In memory only. After a restart an unconfirmed handshake is treated as
+    /// confirmed, so a reject arriving across a restart is ignored and
+    /// recovery waits for the next send to fail.
+    unconfirmed_handshakes: HashMap<NodeId, Vec<MessageId>>,
 }
 
 impl SessionManager {
@@ -31,6 +45,7 @@ impl SessionManager {
         Self {
             sessions: HashMap::new(),
             recent_initiations: HashMap::new(),
+            unconfirmed_handshakes: HashMap::new(),
         }
     }
 
@@ -53,6 +68,7 @@ impl SessionManager {
         peer_id: NodeId,
         their_identity_key: &[u8; 32],
         their_ephemeral_key: &[u8; 32],
+        used_signed_prekey_id: u32,
         used_otp_id: Option<u32>,
         header: &RatchetHeader,
         ciphertext: &[u8],
@@ -63,6 +79,7 @@ impl SessionManager {
             peer_id,
             their_identity_key,
             their_ephemeral_key,
+            used_signed_prekey_id,
             used_otp_id,
         )?;
         session
@@ -119,6 +136,7 @@ impl SessionManager {
         peer_id: NodeId,
         their_identity_key: &[u8; 32],
         their_ephemeral_key: &[u8; 32],
+        used_signed_prekey_id: u32,
         used_otp_id: Option<u32>,
     ) -> Result<String, SessionError> {
         let session = Self::build_accepted_session(
@@ -126,6 +144,7 @@ impl SessionManager {
             peer_id,
             their_identity_key,
             their_ephemeral_key,
+            used_signed_prekey_id,
             used_otp_id,
         )?;
         let safety_number = session.safety_number.clone();
@@ -145,6 +164,7 @@ impl SessionManager {
         peer_id: NodeId,
         their_identity_key: &[u8; 32],
         their_ephemeral_key: &[u8; 32],
+        used_signed_prekey_id: u32,
         used_otp_id: Option<u32>,
         header: &RatchetHeader,
         ciphertext: &[u8],
@@ -155,6 +175,7 @@ impl SessionManager {
             peer_id,
             their_identity_key,
             their_ephemeral_key,
+            used_signed_prekey_id,
             used_otp_id,
         )?;
         let plaintext = session
@@ -171,23 +192,35 @@ impl SessionManager {
         peer_id: NodeId,
         their_identity_key: &[u8; 32],
         their_ephemeral_key: &[u8; 32],
+        used_signed_prekey_id: u32,
         used_otp_id: Option<u32>,
     ) -> Result<Session, SessionError> {
         if node_id_from_public_key(their_identity_key) != peer_id {
             return Err(SessionError::IdentityMismatch);
         }
 
+        // Resolve the signed prekey the initiator actually used before any DH,
+        // so a stale bundle fails loudly here instead of producing a session
+        // whose keys silently disagree.
+        let used_spk = x25519_dalek::StaticSecret::from(
+            our_state
+                .signed_prekey_secret_for(used_signed_prekey_id)
+                .ok_or(SessionError::X3dh(x3dh::X3dhError::SignedPrekeyNotFound))?
+                .to_bytes(),
+        );
+
         let x3dh_result = x3dh::x3dh_respond(
             our_state,
             their_identity_key,
             their_ephemeral_key,
+            used_signed_prekey_id,
             used_otp_id,
         )
         .map_err(SessionError::X3dh)?;
 
-        // Clone the signed prekey secret for Double Ratchet initialization
-        // (Bob uses his signed prekey as initial DH key)
-        let bob_spk = x25519_dalek::StaticSecret::from(our_state.signed_prekey_secret.to_bytes());
+        // Bob's initial Double Ratchet DH key is the same signed prekey the
+        // initiator used, not whichever is current now.
+        let bob_spk = used_spk;
 
         let ratchet = RatchetState::init_bob(x3dh_result.shared_secret, bob_spk);
 
@@ -227,10 +260,39 @@ impl SessionManager {
     ) -> Result<Vec<u8>, SessionError> {
         let session = self.sessions.get_mut(peer).ok_or(SessionError::NoSession)?;
 
-        session
+        let plaintext = session
             .ratchet
             .decrypt(header, ciphertext, ad)
-            .map_err(SessionError::Ratchet)
+            .map_err(SessionError::Ratchet)?;
+
+        // Only the peer's own ratchet could have produced something we can
+        // decrypt, so the handshake is confirmed.
+        self.unconfirmed_handshakes.remove(peer);
+        Ok(plaintext)
+    }
+
+    /// Record a message sent under a handshake the peer has not confirmed.
+    pub fn mark_handshake_pending(&mut self, peer: NodeId, message_id: MessageId) {
+        self.unconfirmed_handshakes
+            .entry(peer)
+            .or_default()
+            .push(message_id);
+    }
+
+    /// Whether we are waiting for this peer to confirm a handshake.
+    pub fn handshake_unconfirmed(&self, peer: &NodeId) -> bool {
+        self.unconfirmed_handshakes.contains_key(peer)
+    }
+
+    /// Take the messages sent under an unconfirmed handshake, clearing it.
+    pub fn take_unconfirmed_messages(&mut self, peer: &NodeId) -> Vec<MessageId> {
+        self.unconfirmed_handshakes.remove(peer).unwrap_or_default()
+    }
+
+    /// Mark a handshake confirmed without decrypting (e.g. a verified receipt
+    /// for a message we sent under it).
+    pub fn confirm_handshake(&mut self, peer: &NodeId) {
+        self.unconfirmed_handshakes.remove(peer);
     }
 
     /// Check if a session exists for a peer.
@@ -254,8 +316,17 @@ impl SessionManager {
     }
 
     /// Remove a session.
+    /// Forget a session.
+    ///
+    /// Also clears the recent-initiation marker: ADR-007's simultaneous-
+    /// initiation tie-break asks whether we initiated with this peer in the
+    /// last 60 s, and a node that keeps the marker after dropping the session
+    /// would refuse the peer's valid `SessionInit` while holding nothing of
+    /// its own — a deadlock until the window expires.
     pub fn remove_session(&mut self, peer: &NodeId) {
         self.sessions.remove(peer);
+        self.recent_initiations.remove(peer);
+        self.unconfirmed_handshakes.remove(peer);
     }
 
     /// Get an iterator over all sessions for persistence.
@@ -265,7 +336,9 @@ impl SessionManager {
 
     /// Serialize a session to bytes for DB storage.
     pub fn serialize_session(session: &Session) -> Vec<u8> {
-        let ratchet_bytes = session.ratchet.to_bytes();
+        // `to_bytes` returns the root key and both chain keys in the clear;
+        // wipe this copy once it has been folded into `buf`.
+        let ratchet_bytes = zeroize::Zeroizing::new(session.ratchet.to_bytes());
         let safety_bytes = session.safety_number.as_bytes();
 
         let mut buf = Vec::with_capacity(32 + 4 + ratchet_bytes.len() + 4 + safety_bytes.len() + 1);
@@ -417,6 +490,7 @@ mod tests {
                 alice_id.node_id(),
                 &alice_id.public_key_bytes(),
                 &init_result.ephemeral_public,
+                init_result.used_signed_prekey_id,
                 init_result.used_one_time_prekey_id,
             )
             .unwrap();
@@ -465,12 +539,14 @@ mod tests {
         assert!(!alice_sessions.has_session(&bob_node_id));
 
         let mut bob_sessions = SessionManager::new();
+        let bob_spk_id = bob_prekey_state.signed_prekey_id;
         let err = bob_sessions
             .accept_session(
                 &mut bob_prekey_state,
                 alice_id.node_id(),
                 &mallory_state.identity.public_key_bytes(),
                 &[9u8; 32],
+                bob_spk_id,
                 None,
             )
             .unwrap_err();
@@ -502,6 +578,7 @@ mod tests {
                 alice_node_id,
                 &alice_id.public_key_bytes(),
                 &init.ephemeral_public,
+                init.used_signed_prekey_id,
                 init.used_one_time_prekey_id,
                 &header,
                 &ct,
@@ -511,6 +588,7 @@ mod tests {
         assert_eq!(pt, b"m1");
 
         // Forged SessionInit with a random ephemeral: first message cannot decrypt.
+        let bob_spk_id_2 = bob_prekey_state.signed_prekey_id;
         let (header2, ct2) = alice_sessions.encrypt_for(&bob_node_id, b"m2", ad).unwrap();
         let err = bob_sessions
             .accept_session_with_first_message(
@@ -518,6 +596,7 @@ mod tests {
                 alice_node_id,
                 &alice_id.public_key_bytes(),
                 &[5u8; 32],
+                bob_spk_id_2,
                 None,
                 &header2,
                 &ct2,
@@ -570,6 +649,7 @@ mod tests {
             b_node,
             &b_id.public_key_bytes(),
             &b_init.ephemeral_public,
+            b_init.used_signed_prekey_id,
             b_init.used_one_time_prekey_id,
             &b_h,
             &b_c,
@@ -585,6 +665,7 @@ mod tests {
                 a_node,
                 &a_id.public_key_bytes(),
                 &a_init.ephemeral_public,
+                a_init.used_signed_prekey_id,
                 a_init.used_one_time_prekey_id,
                 &a_h,
                 &a_c,

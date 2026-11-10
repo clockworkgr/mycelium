@@ -20,6 +20,13 @@ pub enum TransportType {
     InternetTunnel,
     BtClassic,
     WifiAware,
+    /// Meshtastic LoRa mesh, bridged by the `mycelium-meshtastic` adapter.
+    /// Distinct from `Lora` so per-transport accounting, the manager's
+    /// priority ordering and the diagnostics API can tell a native radio from
+    /// a foreign-protocol bridge (ROADMAP T-11).
+    Meshtastic,
+    /// Reticulum network, bridged by the `mycelium-reticulum` adapter.
+    Reticulum,
     Mock,
 }
 
@@ -32,6 +39,8 @@ impl fmt::Display for TransportType {
             Self::InternetTunnel => write!(f, "Internet Tunnel"),
             Self::BtClassic => write!(f, "BT Classic"),
             Self::WifiAware => write!(f, "Wi-Fi Aware"),
+            Self::Meshtastic => write!(f, "Meshtastic"),
+            Self::Reticulum => write!(f, "Reticulum"),
             Self::Mock => write!(f, "Mock"),
         }
     }

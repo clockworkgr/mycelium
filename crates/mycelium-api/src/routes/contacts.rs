@@ -55,6 +55,9 @@ pub async fn add_contact(
         Err(_) => ContactRecord {
             node_id,
             display_name: req.display_name,
+            // A client supplies a NodeId, not an identity key. The key is
+            // recorded by the ingress paths that can verify it against the id
+            // (ROADMAP T-05); never store the NodeId here as a stand-in.
             public_key: Vec::new(),
             trust_score: 0.0,
             is_verified: false,

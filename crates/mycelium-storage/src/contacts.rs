@@ -35,6 +35,52 @@ impl Database {
     }
 
     /// Get a contact by node ID.
+    /// Record a peer's Ed25519 identity key without disturbing anything else.
+    ///
+    /// Called from the ingress paths that have already checked
+    /// `SHA-256(identity_key) == node_id`, so the stored key is the verified
+    /// one. Creates a minimal row if the contact is unknown. Needed because
+    /// verifying an emergency co-signature requires the co-signer's actual
+    /// key, and the column used to hold a placeholder (ROADMAP T-05).
+    pub fn set_contact_identity_key(
+        &self,
+        node_id: &NodeId,
+        identity_key: &[u8; 32],
+    ) -> Result<(), StorageError> {
+        let conn = self.conn();
+        let updated = conn.execute(
+            "UPDATE contacts SET public_key = ?1 WHERE node_id = ?2",
+            params![identity_key.as_slice(), node_id.as_bytes().as_slice()],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT OR IGNORE INTO contacts
+                 (node_id, display_name, public_key, trust_score, is_verified)
+                 VALUES (?1, ?2, ?3, 0.0, 0)",
+                params![
+                    node_id.as_bytes().as_slice(),
+                    node_id.to_string(),
+                    identity_key.as_slice(),
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// A peer's verified Ed25519 identity key, if we have learnt it.
+    ///
+    /// Returns `None` when the row holds no key, or holds a 32-byte value that
+    /// is just the NodeId — which is what the old placeholder wrote, and which
+    /// must never be mistaken for a real key.
+    pub fn get_contact_identity_key(&self, node_id: &NodeId) -> Option<[u8; 32]> {
+        let contact = self.get_contact(node_id).ok()?;
+        let key: [u8; 32] = contact.public_key.try_into().ok()?;
+        if &key == node_id.as_bytes() {
+            return None;
+        }
+        Some(key)
+    }
+
     pub fn get_contact(&self, node_id: &NodeId) -> Result<ContactRecord, StorageError> {
         self.conn()
             .query_row(

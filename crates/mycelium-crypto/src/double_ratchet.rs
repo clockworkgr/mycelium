@@ -3,6 +3,7 @@ use aes_gcm::Aes256Gcm;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
+use zeroize::Zeroize;
 
 use std::collections::HashMap;
 
@@ -22,6 +23,13 @@ pub struct RatchetHeader {
 const MAX_SKIPPED_KEYS_TOTAL: usize = 2000;
 
 /// The Double Ratchet state machine.
+///
+/// The raw key fields (`root_key`, both chain keys and every retained skipped
+/// message key) are wiped on drop. They are plain `[u8; 32]` rather than
+/// `Zeroizing` wrappers because the struct is serialized to a fixed byte
+/// layout for storage; `Drop` keeps the layout while still clearing the
+/// freed memory. `dh_secret` is an `x25519_dalek::StaticSecret`, which
+/// zeroizes itself.
 #[derive(Clone)]
 pub struct RatchetState {
     /// Our current DH ratchet key pair.
@@ -109,6 +117,7 @@ impl RatchetState {
         let chain_key = self.chain_key_send.ok_or(RatchetError::NoSendingChain)?;
 
         let (new_chain_key, message_key) = kdf_ck(&chain_key);
+        let message_key = zeroize::Zeroizing::new(message_key);
         self.chain_key_send = Some(new_chain_key);
 
         let header = RatchetHeader {
@@ -151,6 +160,8 @@ impl RatchetState {
         // Check if we have a skipped message key for this
         let key = (header.dh_public, header.message_number);
         if let Some(message_key) = self.skipped_keys.remove(&key) {
+            // `remove` moves the key out of the map, past the struct's `Drop`.
+            let message_key = zeroize::Zeroizing::new(message_key);
             return decrypt_aead(&message_key, ciphertext, ad, header);
         }
 
@@ -178,6 +189,7 @@ impl RatchetState {
         // Derive the message key
         let chain_key = self.chain_key_recv.ok_or(RatchetError::NoReceivingChain)?;
         let (new_chain_key, message_key) = kdf_ck(&chain_key);
+        let message_key = zeroize::Zeroizing::new(message_key);
         self.chain_key_recv = Some(new_chain_key);
         self.recv_count = header.message_number + 1;
 
@@ -227,15 +239,15 @@ impl RatchetState {
                 .ok_or(RatchetError::NoRemoteKey)?;
             let remote_dh_bytes = *remote_dh.as_bytes();
 
-            let mut ck = *chain_key;
+            let mut ck = zeroize::Zeroizing::new(*chain_key);
             while self.recv_count < until {
                 let (new_ck, mk) = kdf_ck(&ck);
                 self.skipped_keys
                     .insert((remote_dh_bytes, self.recv_count), mk);
-                ck = new_ck;
+                *ck = new_ck;
                 self.recv_count += 1;
             }
-            self.chain_key_recv = Some(ck);
+            self.chain_key_recv = Some(*ck);
         }
         Ok(())
     }
@@ -246,6 +258,11 @@ impl RatchetState {
     }
 
     /// Serialize ratchet state to bytes for persistent storage.
+    /// Serialize for storage.
+    ///
+    /// The returned buffer contains the root key and both chain keys in the
+    /// clear. Callers must wipe it once it has been written (see
+    /// `Node::persist_session`).
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
 
@@ -432,6 +449,22 @@ impl RatchetState {
     }
 }
 
+impl Drop for RatchetState {
+    fn drop(&mut self) {
+        self.root_key.zeroize();
+        if let Some(ck) = self.chain_key_send.as_mut() {
+            ck.zeroize();
+        }
+        if let Some(ck) = self.chain_key_recv.as_mut() {
+            ck.zeroize();
+        }
+        for key in self.skipped_keys.values_mut() {
+            key.zeroize();
+        }
+        self.skipped_keys.clear();
+    }
+}
+
 /// KDF for root key chain: (root_key, dh_output) -> (new_root_key, chain_key).
 fn kdf_rk(root_key: &[u8; 32], dh_output: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
     let hk = Hkdf::<Sha256>::new(Some(root_key), dh_output);
@@ -476,8 +509,8 @@ fn encrypt_aead(
 ) -> Result<Vec<u8>, RatchetError> {
     // Derive AES key and nonce from message key via HKDF
     let hk = Hkdf::<Sha256>::new(None, message_key);
-    let mut key_and_nonce = [0u8; 44]; // 32 bytes key + 12 bytes nonce
-    hk.expand(b"MyceliumAEAD", &mut key_and_nonce)
+    let mut key_and_nonce = zeroize::Zeroizing::new([0u8; 44]); // 32 key + 12 nonce
+    hk.expand(b"MyceliumAEAD", key_and_nonce.as_mut_slice())
         .expect("HKDF expansion failed");
 
     let aes_key = &key_and_nonce[..32];
@@ -511,8 +544,8 @@ fn decrypt_aead(
     header: &RatchetHeader,
 ) -> Result<Vec<u8>, RatchetError> {
     let hk = Hkdf::<Sha256>::new(None, message_key);
-    let mut key_and_nonce = [0u8; 44];
-    hk.expand(b"MyceliumAEAD", &mut key_and_nonce)
+    let mut key_and_nonce = zeroize::Zeroizing::new([0u8; 44]);
+    hk.expand(b"MyceliumAEAD", key_and_nonce.as_mut_slice())
         .expect("HKDF expansion failed");
 
     let aes_key = &key_and_nonce[..32];

@@ -30,6 +30,8 @@ pub enum CodecError {
     BufferTooShort { expected: usize, actual: usize },
     #[error("payload length mismatch: header says {header} but {actual} available")]
     PayloadLengthMismatch { header: usize, actual: usize },
+    #[error("unrecognised enum discriminant {value} in payload body")]
+    InvalidDiscriminant { value: u8 },
 }
 
 impl Envelope {
