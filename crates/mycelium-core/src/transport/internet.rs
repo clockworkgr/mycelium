@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -37,7 +37,8 @@ use super::{Transport, TransportError, TransportEvent, TransportType};
 use crate::dht::record::{DhtRecord, RECORD_TTL_SECS};
 use crate::dht::rpc::{
     deserialize_wire_message, encode_body, DhtReply, DhtRequest, DhtRequestBody,
-    InternetWireMessage, MAX_HANDSHAKE_FRAME, MAX_MESH_PAYLOAD, MAX_WIRE_MESSAGE,
+    InternetWireMessage, CONFIRM_FRAME_LEN, MAX_HANDSHAKE_FRAME, MAX_MESH_PAYLOAD,
+    MAX_WIRE_MESSAGE,
 };
 use crate::dht::{DhtConfig, DhtEngine, DhtRpc, PeerInfo, REQUEST_TIMEOUT};
 
@@ -50,10 +51,22 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// republish is lost.
 const RECORD_REPUBLISH_INTERVAL: Duration = Duration::from_secs(RECORD_TTL_SECS / 3);
 
-/// How long `stop()` waits for every connection to release its slot before
-/// giving up and logging. Connections are cancelled first, so reaching this
-/// means a task is wedged.
+/// How long `stop()` waits for its tasks, and then for every connection to
+/// release its slot, before giving up and logging. Connections are cancelled
+/// first, so reaching this means a task is wedged.
 const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Frames that may be queued for one peer before sends start failing. Same
+/// shape as the other transports' outboxes: a bounded queue, and a failed send
+/// the node's DTN layer can fall back on.
+const OUTBOX_CAPACITY: usize = 128;
+
+/// How long one frame may take to reach the socket before the channel is
+/// considered dead. Bounds a peer that stops reading.
+const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long to wait for a bootstrap TCP connect.
+const BOOTSTRAP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Configuration for the Internet transport.
 #[derive(Debug, Clone)]
@@ -84,6 +97,13 @@ struct SealedWriter {
 }
 
 impl SealedWriter {
+    /// Seal and write one frame.
+    ///
+    /// Only ever called from the connection's own writer task. Sealing
+    /// advances the frame counter, so a caller that could be cancelled between
+    /// the seal and the write would leave a truncated frame on the wire and
+    /// every later frame mis-numbered — which is why no other code may call
+    /// this directly.
     async fn send(&mut self, msg: &InternetWireMessage) -> Result<(), TransportError> {
         let body = encode_body(msg);
         let sealed = self
@@ -92,6 +112,45 @@ impl SealedWriter {
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
         write_framed(&mut self.writer, &sealed).await
     }
+
+    async fn shutdown(&mut self) {
+        let _ = self.writer.shutdown().await;
+    }
+}
+
+/// Owns the sealed write half for one connection.
+///
+/// Every frame is sealed and written here, in one task that nothing cancels
+/// mid-frame. Senders only queue, so a cancelled send can lose a message but
+/// can never corrupt the channel.
+async fn writer_task(
+    mut writer: SealedWriter,
+    mut outbox: mpsc::Receiver<InternetWireMessage>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let msg = tokio::select! {
+            _ = cancel.cancelled() => break,
+            msg = outbox.recv() => match msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
+        match tokio::time::timeout(FRAME_WRITE_TIMEOUT, writer.send(&msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                debug!("Internet: write failed, closing the channel: {}", e);
+                break;
+            }
+            Err(_) => {
+                debug!("Internet: peer stopped reading, closing the channel");
+                break;
+            }
+        }
+    }
+    // Close the write half so the peer sees EOF and both ends tear down,
+    // rather than leaving a half-written frame it would try to parse.
+    writer.shutdown().await;
 }
 
 /// The sealed read half of a channel.
@@ -120,7 +179,8 @@ struct PeerConnection {
     /// useless for dialling back.
     dialable_addr: SocketAddr,
     connected_at: Instant,
-    writer: Mutex<SealedWriter>,
+    /// Queue into the connection's writer task.
+    outbox: mpsc::Sender<InternetWireMessage>,
     /// In-flight DHT requests on *this* connection, awaiting their replies.
     ///
     /// Per connection, not global: with one shared map any authenticated peer
@@ -129,6 +189,23 @@ struct PeerConnection {
 }
 
 impl PeerConnection {
+    /// Queue a frame for transmission.
+    ///
+    /// Synchronous on purpose: there is no await to be cancelled, so a caller
+    /// that goes away cannot leave the channel half-written. A full outbox
+    /// means the peer is not draining, which the caller should treat as a
+    /// failed send.
+    fn enqueue(&self, msg: InternetWireMessage) -> Result<(), TransportError> {
+        self.outbox.try_send(msg).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => {
+                TransportError::SendFailed("peer is not draining its outbox".to_string())
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                TransportError::SendFailed("connection is closed".to_string())
+            }
+        })
+    }
+
     fn resolve_pending(&self, reply: DhtReply) {
         let waiter = self
             .pending
@@ -326,7 +403,9 @@ where
         .map_err(|e| TransportError::SendFailed(e.to_string()))?;
     write_framed(writer, &sealed).await?;
 
-    let sealed = read_framed(reader, MAX_WIRE_MESSAGE).await?;
+    // The peer has not yet proved it holds the channel key, so this frame gets
+    // its own exact cap rather than the 1 MiB data-frame cap.
+    let sealed = read_framed(reader, CONFIRM_FRAME_LEN).await?;
     let opened = keys
         .recv
         .open(&sealed)
@@ -410,20 +489,40 @@ impl Shared {
 
         let peer_id = channel.peer.node_id;
         let dialable_addr = SocketAddr::new(socket_addr.ip(), channel.peer.listen_port);
+        let (outbox, outbox_rx) = mpsc::channel(OUTBOX_CAPACITY);
         let conn = Arc::new(PeerConnection {
             socket_addr,
             dialable_addr,
             connected_at: Instant::now(),
-            writer: Mutex::new(SealedWriter {
-                writer,
-                cipher: channel.send,
-            }),
+            outbox,
             pending: std::sync::Mutex::new(HashMap::new()),
         });
         let sealed_reader = SealedReader {
             reader,
             cipher: channel.recv,
         };
+        tokio::spawn(writer_task(
+            SealedWriter {
+                writer,
+                cipher: channel.send,
+            },
+            outbox_rx,
+            cancel.clone(),
+        ));
+
+        self.dht
+            .add_peer(PeerInfo {
+                node_id: peer_id,
+                addr: dialable_addr,
+                last_seen: Instant::now(),
+            })
+            .await;
+        self.offer_self_record(&conn);
+
+        // Everything from here on is synchronous, deliberately: once the
+        // connection is in the map, the caller must reach `read_loop` without
+        // an await in between. A cancellation in that gap would leave a peer
+        // installed with nothing reading from it and its slot released.
 
         {
             // A second connection claiming an already-connected peer is
@@ -439,14 +538,6 @@ impl Shared {
             conns.insert(peer_id, conn.clone());
         }
 
-        self.dht
-            .add_peer(PeerInfo {
-                node_id: peer_id,
-                addr: dialable_addr,
-                last_seen: Instant::now(),
-            })
-            .await;
-
         let _ = self.event_tx.send(TransportEvent::NeighborDiscovered {
             peer: peer_id,
             transport: TransportType::InternetTunnel,
@@ -457,12 +548,11 @@ impl Shared {
             peer_id, socket_addr, dialable_addr
         );
 
-        self.offer_self_record(&conn).await;
         Ok((peer_id, conn, sealed_reader))
     }
 
     /// Offer our own signed address record to one peer.
-    async fn offer_self_record(&self, conn: &PeerConnection) {
+    fn offer_self_record(&self, conn: &PeerConnection) {
         if !self.has_publishable_address() {
             debug!(
                 "Internet: not publishing a DHT record for wildcard address {}",
@@ -475,8 +565,7 @@ impl Shared {
             request_id: self.dht.next_request_id(),
             body: DhtRequestBody::Store { record },
         });
-        let mut guard = conn.writer.lock().await;
-        if let Err(e) = guard.send(&msg).await {
+        if let Err(e) = conn.enqueue(msg) {
             debug!("Internet: could not publish our record: {}", e);
         }
     }
@@ -495,7 +584,7 @@ impl Shared {
             conns.values().cloned().collect()
         };
         for conn in peers {
-            self.offer_self_record(&conn).await;
+            self.offer_self_record(&conn);
         }
     }
 
@@ -534,12 +623,12 @@ impl Shared {
                                     request,
                                 )
                                 .await;
-                            let mut guard = conn.writer.lock().await;
-                            if guard
-                                .send(&InternetWireMessage::DhtReply(reply))
-                                .await
-                                .is_err()
-                            {
+                            // Queued, not written here: a write in this
+                            // branch would sit outside the cancellation
+                            // select and let a peer that stops reading hold
+                            // its connection slot past `stop()`.
+                            if let Err(e) = conn.enqueue(InternetWireMessage::DhtReply(reply)) {
+                                debug!("Internet: cannot answer {}: {}", peer_id, e);
                                 break;
                             }
                         }
@@ -595,7 +684,9 @@ impl InternetTransport {
             ..DhtConfig::default()
         };
         let dht = Arc::new(DhtEngine::new(identity.clone(), dht_config));
-        let permits = config.max_connections.clamp(1, Semaphore::MAX_PERMITS);
+        // Clamped to what `stop()`'s drain can ask for in one `acquire_many`,
+        // so the semaphore and the drain can never disagree about the total.
+        let permits = config.max_connections.clamp(1, u32::MAX as usize);
 
         Self {
             shared: Arc::new(Shared {
@@ -721,11 +812,8 @@ impl DhtRpc for InternetTransport {
             request_id,
         };
 
-        let sent = {
-            let mut guard = conn.writer.lock().await;
-            guard.send(&InternetWireMessage::Dht(request)).await.is_ok()
-        };
-        if !sent {
+        if let Err(e) = conn.enqueue(InternetWireMessage::Dht(request)) {
+            debug!("Internet: cannot query {}: {}", peer.node_id, e);
             return None;
         }
 
@@ -830,7 +918,22 @@ impl Transport for InternetTransport {
                     debug!("Internet: no slot free for bootstrap node {}", addr);
                     return;
                 };
-                match TcpStream::connect(addr).await {
+                // Cancellable and bounded: an unreachable bootstrap host
+                // would otherwise keep stop() waiting for the OS timeout.
+                let connected = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    result = tokio::time::timeout(
+                        BOOTSTRAP_CONNECT_TIMEOUT,
+                        TcpStream::connect(addr),
+                    ) => match result {
+                        Ok(result) => result,
+                        Err(_) => {
+                            warn!("Internet: bootstrap connect to {} timed out", addr);
+                            return;
+                        }
+                    },
+                };
+                match connected {
                     Ok(stream) => match shared.establish(stream, addr, &cancel).await {
                         Ok((peer_id, conn, reader)) => {
                             info!("Internet: bootstrapped from {} ({})", addr, peer_id);
@@ -879,16 +982,26 @@ impl Transport for InternetTransport {
         }
         {
             // The listener lives in the accept task, so a restart cannot bind
-            // until that task has dropped it.
+            // until that task has dropped it. Bounded: a task that ignores
+            // cancellation must not make stop() hang.
             let mut tasks = self.tasks.lock().await;
-            while tasks.join_next().await.is_some() {}
+            if tokio::time::timeout(STOP_DRAIN_TIMEOUT, async {
+                while tasks.join_next().await.is_some() {}
+            })
+            .await
+            .is_err()
+            {
+                warn!(
+                    "Internet: a background task did not stop in time; the listener \
+                     may still hold its port"
+                );
+            }
         }
         // Then wait for every connection slot to come back. Connection tasks
         // are detached (one can dial out, so joining them from here would
         // deadlock), and their permits are the observable proof that they are
         // gone — including handshakes that had stalled.
-        let permits = u32::try_from(self.config.max_connections.clamp(1, Semaphore::MAX_PERMITS))
-            .unwrap_or(u32::MAX);
+        let permits = self.config.max_connections.clamp(1, u32::MAX as usize) as u32;
         if tokio::time::timeout(STOP_DRAIN_TIMEOUT, self.shared.slots.acquire_many(permits))
             .await
             .is_err()
@@ -917,12 +1030,10 @@ impl Transport for InternetTransport {
                 .clone()
         };
 
-        let msg = InternetWireMessage::MeshData {
+        conn.enqueue(InternetWireMessage::MeshData {
             sender_id: self.shared.local_id,
             data: data.to_vec(),
-        };
-        let mut guard = conn.writer.lock().await;
-        guard.send(&msg).await
+        })
     }
 
     fn events(&self) -> broadcast::Receiver<TransportEvent> {
@@ -1271,6 +1382,90 @@ mod tests {
         );
 
         a.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_full_outbox_fails_the_send_instead_of_blocking() {
+        // `enqueue` must never await: a caller that is cancelled mid-write
+        // would advance the frame counter without the bytes reaching the
+        // socket, and every later frame would be mis-numbered.
+        let (outbox, _rx) = mpsc::channel(1);
+        let conn = PeerConnection {
+            socket_addr: "127.0.0.1:1".parse().unwrap(),
+            dialable_addr: "127.0.0.1:1".parse().unwrap(),
+            connected_at: Instant::now(),
+            outbox,
+            pending: std::sync::Mutex::new(HashMap::new()),
+        };
+        let frame = || InternetWireMessage::Confirm {
+            transcript: [0u8; 32],
+        };
+        assert!(conn.enqueue(frame()).is_ok());
+        let err = conn
+            .enqueue(frame())
+            .expect_err("a full outbox must fail the send");
+        assert!(matches!(err, TransportError::SendFailed(_)), "{:?}", err);
+        assert!(err.to_string().contains("draining"), "{}", err);
+    }
+
+    #[tokio::test]
+    async fn test_a_frame_over_its_cap_is_refused_before_allocating() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        // A length prefix claiming a megabyte, read with the confirmation cap.
+        tokio::spawn(async move {
+            let _ = client
+                .write_all(&(MAX_WIRE_MESSAGE as u32).to_le_bytes())
+                .await;
+        });
+        let err = read_framed(&mut server, CONFIRM_FRAME_LEN)
+            .await
+            .expect_err("a frame over the cap must be refused");
+        assert!(
+            err.to_string().contains(&CONFIRM_FRAME_LEN.to_string()),
+            "{}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_cancelled_request_leaves_the_channel_usable() {
+        // Sends are queued, not written, by the caller, so abandoning one
+        // mid-flight cannot desynchronise the frame counter. This checks the
+        // observable consequence: the channel still carries data afterwards.
+        let port = free_port().await;
+        let (a_identity, a) = transport(port);
+        a.start().await.unwrap();
+        let (b_identity, b) = transport(free_port().await);
+        let mut b_events = b.events();
+        b.connect_to(format!("127.0.0.1:{}", port).parse().unwrap())
+            .await
+            .unwrap();
+        assert!(wait_for_peer(&a, &b_identity.node_id()).await);
+
+        // B never answers a DHT request for an unknown key, so this request is
+        // still in flight when the timeout drops it.
+        let pending = PeerInfo {
+            node_id: b_identity.node_id(),
+            addr: format!("127.0.0.1:{}", port).parse().unwrap(),
+            last_seen: Instant::now(),
+        };
+        let request = DhtRequest {
+            request_id: 4242,
+            body: DhtRequestBody::FindNode {
+                target: Identity::generate().node_id(),
+            },
+        };
+        let _ = timeout(Duration::from_millis(1), a.request(pending, request)).await;
+
+        a.send(&b_identity.node_id(), b"still intact")
+            .await
+            .unwrap();
+        let (peer, data) = next_data_event(&mut b_events).await.expect("no data event");
+        assert_eq!(peer, a_identity.node_id());
+        assert_eq!(data, b"still intact");
+
+        a.stop().await.unwrap();
+        b.stop().await.unwrap();
     }
 
     #[tokio::test]

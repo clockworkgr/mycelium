@@ -125,6 +125,26 @@ dialling back.
 The inbound and outbound paths run the *same* `establish` function; the
 previous code had two copies of this logic, which is how they came to differ.
 
+### One writer task per connection
+
+Sealing a frame advances the direction's counter, so sealing and writing have
+to happen together or not at all. A caller cancelled between them — a DHT
+lookup hitting its deadline, for instance — would leave a truncated frame on
+the wire and every later frame mis-numbered, and the sender would not find out
+until some unrelated read failed.
+
+So each connection owns a writer task holding the sealed write half, fed by a
+bounded outbox. `enqueue` is **synchronous**: it has no await to be cancelled,
+and a full outbox is a failed send rather than a wait, which matches the
+bounded-outbox shape the other transports use (§8.4) and lets the node's DTN
+layer take over. A write that fails or outlives `FRAME_WRITE_TIMEOUT` shuts
+the write half down, so the peer sees EOF instead of trying to parse a partial
+frame, and both ends tear the connection down.
+
+This also keeps the read loop's own work inside its cancellation select: it
+queues DHT replies instead of writing them, so a peer that stops reading
+cannot hold its connection slot past `stop()`.
+
 ### Connection slots are a semaphore
 
 `max_connections` becomes `Semaphore` permits. A permit is taken **before** the
@@ -139,7 +159,9 @@ attacker who opens sockets and stalls is exactly the case the limit exists for.
 waits for every permit to come back. Connection tasks are deliberately *not*
 joined — one of them can itself dial out through `DhtRpc`, so joining them from
 `stop()` would deadlock — and their permits are the observable proof that they
-are gone, stalled handshakes included.
+are gone, stalled handshakes included. Both waits are bounded by
+`STOP_DRAIN_TIMEOUT` and log on expiry, and the bootstrap dial is cancellable
+and timed out, so a task that ignores cancellation cannot make `stop()` hang.
 
 ### Binary framing
 
@@ -157,7 +179,8 @@ little-endian throughout to match §4:
 `MAX_WIRE_MESSAGE` (1 MiB) caps the frame body as it appears on the wire —
 ciphertext, tag included. A cleartext handshake frame is capped far lower
 (`MAX_HANDSHAKE_FRAME`, 1 KiB) so a peer cannot make us allocate a megabyte
-before it has proved anything. `mtu()` is the frame cap minus the 16-byte AEAD
+before it has proved anything, and the sealed `Confirm` frame — read *before*
+the peer has proved the channel key — is capped at its exact 49-byte size. `mtu()` is the frame cap minus the 16-byte AEAD
 tag and the 37 bytes `MeshData` framing costs, so a send at the advertised MTU
 is exactly one frame the receiver accepts; `send()` refuses anything larger up
 front with `ExceedsMtu` instead of writing a frame the peer will discard.
@@ -220,7 +243,11 @@ means a referral cycle costs each peer exactly one query.
 A `FoundValue` is accepted only if its derived NodeId is the target and the
 record passes `store_record`, so a peer cannot answer a lookup with a validly
 signed record belonging to someone else, nor get such a record cached under the
-target's id.
+target's id. One exception is deliberate: when `store_record` says the answer
+is no newer than what we hold, the lookup returns the **cached** record rather
+than nothing, because that is what a second lookup racing the first looks like
+and reporting "not found" there would make concurrent resolution fail at
+random.
 
 ## Consequences
 
@@ -264,6 +291,15 @@ target's id.
   the thing that lets a peer be dialled again. Nothing prunes a contact that
   has gone for good, so a k-bucket can fill with dead entries and refuse live
   ones; that needs bucket liveness checks (ROADMAP T-32).
+- **Resolution exists but nothing calls it.** `InternetTransport::resolve`
+  will find a peer's address through the DHT, and no send path asks it to: a
+  `send` to an unconnected peer still fails with `PeerNotConnected`. Dialling
+  through the DHT is ROADMAP T-33, kept separate because it changes when the
+  transport opens connections, not how it authenticates them.
+- A cancelled send can now lose a queued frame instead of corrupting the
+  channel. That is the right trade for a transport under a protocol with its
+  own retry and DTN fallback, but it does mean `send` returning `Ok` means
+  "queued", not "written".
 
 ## Alternatives Considered
 
@@ -283,13 +319,18 @@ target's id.
    work and it leaves TCP's lack of integrity exposed on the one transport that
    crosses untrusted networks. Once a key exists, sealing frames with it is
    nearly free.
-4. **Carry the NodeId in the `Hello` alongside the key and check they match.**
+4. **A shared writer behind a mutex, with callers sealing and writing.** What
+   was implemented first. It puts a cancellation point between the seal and the
+   write, which silently corrupts the channel; and it puts an unbounded wait
+   inside the read loop's reply path. A writer task removes both by
+   construction rather than by careful call sites.
+5. **Carry the NodeId in the `Hello` alongside the key and check they match.**
    Equivalent when implemented correctly and one more field that can be got
    wrong. Deriving it is the same check with nothing to forget.
-5. **Refuse new records when the store is full.** Simpler than eviction, and it
+6. **Refuse new records when the store is full.** Simpler than eviction, and it
    hands the store to whoever fills it first. Evicting the entry closest to
    expiry keeps the table churning.
-6. **Protobuf or Cap'n Proto for framing.** The project already hand-writes its
+7. **Protobuf or Cap'n Proto for framing.** The project already hand-writes its
    binary codec for the mesh envelope (§4) because the Cap'n Proto toolchain is
    not available in this environment; a second encoding scheme for one transport
    is not worth the inconsistency.

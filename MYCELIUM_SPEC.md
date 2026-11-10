@@ -833,11 +833,21 @@ limit, the socket is closed without a hello.
 Framing is binary, little-endian, a 4-byte body length then a 1-byte tag:
 `MeshData 0x01`, `Dht 0x02`, `DhtReply 0x03`, `Hello 0x05`, `Confirm 0x06`.
 The wire frame cap is 1 MiB including the 16-byte AEAD tag; a cleartext
-handshake frame is capped at 1 KiB so an unproven peer cannot make the node
-allocate more. `mtu()` is the frame cap minus the tag and the 37 bytes
-`MeshData` framing costs, so a send at the advertised MTU is exactly one
-acceptable frame; anything larger is refused with `ExceedsMtu` rather than
-transmitted.
+handshake frame is capped at 1 KiB, and the sealed `Confirm` — read before the
+peer has proved the channel key — at its exact 49 bytes, so an unproven peer
+cannot make the node allocate more. `mtu()` is the frame cap minus the tag and
+the 37 bytes `MeshData` framing costs, so a send at the advertised MTU is
+exactly one acceptable frame; anything larger is refused with `ExceedsMtu`
+rather than transmitted.
+
+Each connection owns a **writer task** holding the sealed write half, fed by a
+bounded outbox (128 frames). Sealing advances the direction's frame counter, so
+sealing and writing must happen together: a caller cancelled between them — a
+DHT lookup hitting its deadline — would leave a truncated frame and mis-number
+every frame after it. Queuing is therefore synchronous, a full outbox is a
+failed send rather than a wait, and a write that fails or stalls shuts the
+write half down so both ends tear the connection down. `send()` returning `Ok`
+means the frame is queued, not that it is on the wire.
 
 **DHT records are signed.** A record is a node's claim about its own address —
 `public_key(32) ‖ addr ‖ published_at(8) ‖ signature(64)`, signed over
@@ -859,14 +869,19 @@ of the k closest known nodes queried, 16 rounds, or a 10 s deadline that bounds
 the requests in flight (2 s each). A visited set means a referral cycle costs
 each peer one query. A `FoundValue` counts only if its derived NodeId is the
 target and the record is acceptable, so a peer cannot answer with someone
-else's record.
+else's record. If the answer is no newer than one already held, the lookup
+returns the cached record rather than nothing — that is what a second,
+concurrent lookup looks like.
 
 **Known gaps:** a node listening on a wildcard address (the `0.0.0.0` default)
 neither stores nor publishes a record, because signing `0.0.0.0` would be valid
 and useless — external address discovery is ROADMAP T-31. Nothing prunes a DHT
 contact whose peer is gone for good, so a k-bucket can fill with dead entries
-(ROADMAP T-32). The channel gives authentication and integrity, not a forward
-secrecy claim; message confidentiality is the Double Ratchet's job (§5.3).
+(ROADMAP T-32). Resolution is available but not automatic: `resolve()` will
+find a peer's address through the DHT, and no send path calls it, so a send to
+an unconnected peer still fails (ROADMAP T-33). The channel gives
+authentication and integrity, not a forward secrecy claim; message
+confidentiality is the Double Ratchet's job (§5.3).
 
 **Outbox pattern.** BLE, Wi-Fi Direct, BT Classic and LoRa all follow the same
 Rust↔platform shape: `send()` pushes to a bounded `VecDeque` (512 packets;

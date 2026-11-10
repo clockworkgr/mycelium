@@ -14,7 +14,7 @@ work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **360 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **365 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -304,6 +304,27 @@ permanently crowd out live ones.
 - A full bucket pings its least-recently-seen contact before refusing a new
   one, and replaces it if it does not answer (standard Kademlia eviction).
 - Test: a bucket filled with unresponsive contacts admits a live one.
+
+### T-33 · Dial an unconnected peer through the DHT
+
+**Area:** `mycelium-core` · **Spec:** §8.4 · **ADR-011**
+
+`InternetTransport::resolve` performs a bounded iterative lookup and returns a
+peer's address, and nothing calls it. A `send` to a peer with no open
+connection fails with `PeerNotConnected` even when the DHT holds a current,
+signed record for it, so internet reachability still depends on an explicit
+bootstrap or an inbound connection.
+
+Kept separate from T-09 because it changes *when* the transport opens
+connections, not how it authenticates them.
+
+**Acceptance:**
+- A send to an unconnected peer resolves its address through the DHT, dials it,
+  and delivers — subject to `max_connections` and without a dial per message.
+- Failed resolutions are negatively cached, so an unreachable peer does not
+  trigger a lookup on every send.
+- Test: three nodes where A and C know only B; A sends to C and it arrives,
+  and a send to an unknown id fails without an unbounded lookup.
 
 ### T-14 · Channel events and flood dedup expiry
 

@@ -309,6 +309,16 @@ impl DhtEngine {
                         }
                         match self.store_record(record.clone()).await {
                             Ok(_) => return Some(record),
+                            Err(RecordRejection::Stale) => {
+                                // Another lookup for the same node cached an
+                                // at-least-as-new record while this one was in
+                                // flight. That answer is just as good as ours,
+                                // and reporting "not found" because of it
+                                // would make concurrent lookups fail at random.
+                                if let Some(current) = self.lookup_record(target).await {
+                                    return Some(current);
+                                }
+                            }
                             Err(e) => {
                                 debug!("DHT: discarding an unacceptable record: {}", e);
                             }
@@ -836,6 +846,52 @@ mod tests {
             record: record.clone(),
         });
 
+        assert_eq!(
+            local
+                .iterative_find_value(net, &publisher.node_id())
+                .await
+                .as_ref(),
+            Some(&record)
+        );
+    }
+
+    /// Answers a lookup after first caching the record in the engine itself,
+    /// which is what a second concurrent lookup for the same node looks like.
+    struct ConcurrentPeer {
+        engine: Arc<DhtEngine>,
+        record: DhtRecord,
+    }
+
+    #[async_trait::async_trait]
+    impl DhtRpc for ConcurrentPeer {
+        async fn request(&self, _peer: PeerInfo, request: DhtRequest) -> Option<DhtReply> {
+            self.engine.store_record(self.record.clone()).await.ok();
+            Some(DhtReply {
+                request_id: request.request_id,
+                body: DhtReplyBody::FoundValue {
+                    record: self.record.clone(),
+                },
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_lookup_raced_by_another_returns_the_cached_record() {
+        let local = Arc::new(engine());
+        local
+            .add_peer(peer_info(Identity::generate().node_id(), 1))
+            .await;
+
+        let publisher = Identity::generate();
+        let record = DhtRecord::new_signed(&publisher, make_addr(9000), unix_now());
+        let net = Arc::new(ConcurrentPeer {
+            engine: local.clone(),
+            record: record.clone(),
+        });
+
+        // Our own store already holds the answer by the time we try to store
+        // it, so `store_record` says `Stale`. Returning None there would make
+        // two concurrent lookups for the same node fail at random.
         assert_eq!(
             local
                 .iterative_find_value(net, &publisher.node_id())

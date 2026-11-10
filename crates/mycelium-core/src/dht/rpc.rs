@@ -30,6 +30,12 @@ pub const MAX_WIRE_MESSAGE: usize = 1_048_576;
 /// before it has proved anything.
 pub const MAX_HANDSHAKE_FRAME: usize = 1024;
 
+/// The exact size of a sealed `Confirm` frame: tag byte, transcript, AEAD tag.
+///
+/// Confirmation is read *before* the peer has proved it holds the channel key,
+/// so it gets its own exact cap rather than the 1 MiB data-frame cap.
+pub const CONFIRM_FRAME_LEN: usize = 1 + 32 + AEAD_TAG_LEN;
+
 /// Largest plaintext that can be sealed into one frame.
 pub const MAX_PLAINTEXT_FRAME: usize = MAX_WIRE_MESSAGE - AEAD_TAG_LEN;
 
@@ -421,6 +427,18 @@ mod tests {
         roundtrip(InternetWireMessage::Confirm {
             transcript: [7u8; 32],
         });
+    }
+
+    #[test]
+    fn test_a_sealed_confirmation_is_exactly_the_declared_size() {
+        let body = encode_body(&InternetWireMessage::Confirm {
+            transcript: [7u8; 32],
+        });
+        assert_eq!(
+            body.len() + AEAD_TAG_LEN,
+            CONFIRM_FRAME_LEN,
+            "the confirmation cap must match what sealing one actually produces"
+        );
     }
 
     #[test]
