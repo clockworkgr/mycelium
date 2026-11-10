@@ -131,7 +131,15 @@ let mut registry = PluginRegistry::new();
 registry.register("meshtastic", Box::new(MeshtasticFactory));
 ```
 
-The node reads plugin config from `NodeConfig.plugins` and calls `registry.create_plugin()` for each enabled entry.
+> **Not yet wired.** `NodeConfig.plugins` is parsed but nothing reads it, so no
+> plugin is instantiated at startup today. Turning a `Box<dyn TransportPlugin>`
+> into the `Arc<dyn Transport>` the manager wants needs trait upcasting
+> (MSRV 1.86) or a wrapper type. Until that lands, add a plugin to the manager
+> directly with `TransportManager::add_transport()`. Tracked as `T-13` in
+> [`ROADMAP.md`](../ROADMAP.md).
+
+The intent is that the node reads plugin config from `NodeConfig.plugins` and
+calls `registry.create_plugin()` for each enabled entry.
 
 ## Configuration (TOML)
 
@@ -277,11 +285,16 @@ impl PluginFactory for MeshtasticFactory {
 
 ### 4. Register in the node
 
-In `mycelium-node/src/main.rs` or at initialization:
+The daemon entry point is `crates/mycelium-daemon/src/main.rs` (ADR-004 — the
+binary is named `mycelium-node` but lives in the `mycelium-daemon` crate):
 
 ```rust
 registry.register("meshtastic", Box::new(MeshtasticFactory));
 ```
+
+See the caveat under [Registration](#registration): nothing calls into the
+registry yet, so for now also call
+`transport_manager.add_transport(plugin).await` yourself.
 
 ## Node ID Bridging
 
@@ -309,7 +322,7 @@ See `BleTransport` and `WifiDirectTransport` for examples of this pattern.
 | BLE | 512 B | 10-100m | ~1 Mbps | Discovery, small messages |
 | Wi-Fi Direct | 64 KB | 50-200m | ~50 Mbps | Bulk data, file sharing |
 | BT Classic | 16 KB | 10-100m | ~2 Mbps | Medium data, voice notes |
-| LoRa | 51-222 B | 1-15+ km | 0.25-5.5 kbps | Long-range relay, emergency |
+| LoRa | 2 KB message / 51-222 B frame | 1-15+ km | 0.25-37 kbps | Long-range relay, emergency |
 | Internet Tunnel | 64 KB | Global | Variable | WAN bridge, supernodes |
 
 ## Files
@@ -320,3 +333,6 @@ See `BleTransport` and `WifiDirectTransport` for examples of this pattern.
 | `crates/mycelium-core/src/transport/plugin.rs` | `TransportPlugin`, `PluginFactory`, `PluginRegistry`, `PluginConfig` |
 | `crates/mycelium-core/src/transport/manager.rs` | `TransportManager` — owns and dispatches across all transports |
 | `crates/mycelium-node/src/config.rs` | `PluginConfigEntry` — TOML config for plugins |
+
+See also [`MYCELIUM_SPEC.md`](../MYCELIUM_SPEC.md) §8.5 for the plugin API in
+protocol context and §18 for the two adapters the core team maintains.

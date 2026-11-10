@@ -44,9 +44,9 @@ Every message is end-to-end encrypted using the Signal Protocol (X3DH key exchan
 - SQLCipher encrypted database
 
 **Platform**
-- Rust core (7 crates, 186 tests)
-- Local REST API (47 endpoints) + WebSocket server
-- Flutter/Android mobile app (14 screens)
+- Rust core (10 crates, 280 tests)
+- Local REST API (38 endpoints) + WebSocket server, bearer-token authenticated (ADR-006)
+- Flutter mobile app for Android and iOS (14 screens, 49 Dart files)
 - Onboarding with seed phrase groups or QR code scanning
 - Emergency broadcast system (3 trust-gated tiers)
 - Battery-adaptive power modes (5 levels)
@@ -87,7 +87,7 @@ The Rust daemon exposes a local API on `127.0.0.1:9735`. The Flutter app (and an
 ```bash
 # Rust workspace
 make build    # Debug build
-make test     # Run all 186 tests
+make test     # Run all 280 tests
 make lint     # cargo fmt --check + cargo clippy
 
 # Flutter app
@@ -103,13 +103,16 @@ make check    # lint + test + flutter-analyze
 
 ```bash
 # Phone mode (default)
-cargo run -p mycelium-node
+cargo run -p mycelium-daemon
 
 # Supernode mode (always-on, 2GB DTN, internet transport, API on 0.0.0.0)
-cargo run -p mycelium-node -- --supernode
+cargo run -p mycelium-daemon -- --supernode
 
 # With custom settings
-cargo run -p mycelium-node -- --data-dir /path/to/data --port 9800
+cargo run -p mycelium-daemon -- --data-dir /path/to/data --port 9800
+
+# Same via environment (flags win over env; used by the Docker testbed)
+MYCELIUM_DATA_DIR=/path/to/data MYCELIUM_DISPLAY_NAME=alice cargo run -p mycelium-daemon
 ```
 
 ### Run on Android
@@ -122,16 +125,24 @@ Both phones need Bluetooth and Location enabled. Grant all permissions when prom
 
 ## API
 
-The node exposes a local REST + WebSocket API for all operations.
+The node exposes a local REST + WebSocket API for all operations. Every
+request needs the node's bearer token, generated on first start at
+`<data_dir>/api.token` (ADR-006):
 
-### REST Endpoints (47 total)
+```bash
+TOKEN=$(cat ./mycelium-data/api.token)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9735/v1/node/status
+# WebSocket clients may pass it as ?token=$TOKEN
+```
+
+### REST Endpoints (38 total, 31 unique paths)
 
 | Group | Endpoints | Description |
 |-------|-----------|-------------|
 | `/v1/node/` | `status`, `identity`, `trust` | Node info and trust stats |
 | `/v1/messages/` | CRUD + mark-read | Send/receive messages |
 | `/v1/conversations/` | list, unread count | Conversation summaries |
-| `/v1/contacts/` | CRUD + trust + vouch + verify | Contact management |
+| `/v1/contacts/` | CRUD + trust + vouch + verify + safety-number | Contact management |
 | `/v1/groups/` | CRUD + members + messages | Group messaging |
 | `/v1/channels/` | CRUD + subscribe + messages | Public channels |
 | `/v1/prekeys/{id}` | GET | Cached prekey bundles |
@@ -148,26 +159,32 @@ Connect to `ws://127.0.0.1:9735/v1/ws` for real-time events:
 - `network` — Periodic status (every 5s)
 - `channel_message` — Channel broadcasts
 - `emergency` — Emergency alerts
+- `send_result` — Reply to your `send` frame (message id or error)
 
 ## Project Structure
 
 ```
 mycelium/
 ├── crates/
-│   ├── mycelium-protocol/    # Wire format types + binary codec (29 tests)
-│   ├── mycelium-crypto/      # X3DH, Double Ratchet, WoT, Groups (43 tests)
-│   ├── mycelium-core/        # Transports, AODV, DTN, DHT (51 tests)
-│   ├── mycelium-storage/     # SQLCipher database (9 tests)
-│   ├── mycelium-node/        # Node daemon + CLI (43 tests)
-│   ├── mycelium-api/         # REST + WebSocket API server (11 tests)
-│   └── mycelium-ffi/         # C FFI for mobile (64 functions)
-├── flutter/                  # Flutter Android app (47 Dart files)
-├── scripts/                  # Build scripts
+│   ├── mycelium-protocol/    # Wire format types + binary codec (39 tests)
+│   ├── mycelium-crypto/      # X3DH, Double Ratchet, WoT, Groups (53 tests)
+│   ├── mycelium-core/        # Transports, AODV, DTN, DHT (77 tests)
+│   ├── mycelium-storage/     # SQLCipher database (10 tests)
+│   ├── mycelium-node/        # Node library: event loop, message pipeline, groups (45 tests)
+│   ├── mycelium-api/         # REST + WebSocket API server, bearer auth (19 tests)
+│   ├── mycelium-daemon/      # `mycelium-node` binary: node + API server (ADR-004)
+│   ├── mycelium-ffi/         # C FFI for mobile (64 functions)
+│   ├── mycelium-meshtastic/  # Meshtastic adapter (16 tests; not yet interoperable)
+│   └── mycelium-reticulum/   # Reticulum adapter (21 tests; not yet interoperable)
+├── flutter/                  # Flutter app, Android + iOS (49 Dart files)
+├── openwrt/                  # .ipk package files + LuCI app
+├── testbed/                  # Docker mesh testbed (Dockerfile, compose, scenarios)
+├── scripts/                  # Build scripts (Android, iOS, OpenWRT)
 ├── docs/adr/                 # Architecture Decision Records
-├── ARCHITECTURE.md           # Comprehensive codebase documentation
-├── MYCELIUM_SPEC.md          # Protocol specification
-├── CONTRIBUTING.md           # Build setup and conventions
-└── REMAINING_WORK.md         # Task tracking (85% complete)
+├── docs/plugin-api.md        # Transport plugin development guide
+├── MYCELIUM_SPEC.md          # Protocol + architecture specification
+├── ROADMAP.md                # Open work
+└── CONTRIBUTING.md           # Build setup and conventions
 ```
 
 ## Wire Format
@@ -198,42 +215,57 @@ Groups:    Sender Key chains with HKDF-derived message keys
 Trust:     BFS with exponential decay (1.0, 0.5, 0.25, 0.125 over 4 hops)
 ```
 
-8 HKDF info strings for domain separation. See `ARCHITECTURE.md` Section 16 for full details.
+8 HKDF info strings for domain separation. See `MYCELIUM_SPEC.md` §5 for the full key hierarchy.
 
 ## Transport Layer
 
 | Transport | MTU | Throughput | Range | Status |
 |-----------|-----|------------|-------|--------|
-| BLE | 512 B | ~100 kbps | 10-30m | Full (Android + iOS) |
-| Wi-Fi Direct | 65 KB | ~50 Mbps | 50-200m | Full (Android only) |
-| LoRa | 51-222 B | ~1-37 kbps | 1-15 km | Rust + BLE bridge (Android + iOS) |
-| BT Classic | 16 KB | ~2 Mbps | 10-100m | Rust only |
-| Internet | 65 KB | varies | global | Rust + FFI |
+| BLE | 512 B | ~100 kbps | 10-30 m | Working on Android + iOS |
+| Wi-Fi Direct | 65 KB | ~50 Mbps | 50-200 m | Working on Android (iOS does not expose it) |
+| LoRa | 2 KB msgs (51-222 B frames) | 0.25-37 kbps | 1-15 km | Complete in software; **untested on hardware** |
+| BT Classic | 16 KB | ~2 Mbps | 10-100 m | Complete in software, Android only; **untested on hardware** |
+| Internet | 65 KB | varies | global | Partial — peer identity is not yet authenticated |
 
-The `TransportPlugin` trait allows third-party transports (e.g., Meshtastic, Reticulum) to integrate as plugins.
+The `TransportPlugin` trait allows third-party transports to integrate as plugins. The `mycelium-meshtastic` and `mycelium-reticulum` crates implement it but are not yet wired into the node or interoperable with the real protocols.
 
 ## Documentation
 
 | Document | Purpose |
 |----------|---------|
-| `MYCELIUM_SPEC.md` | Protocol specification |
-| `ARCHITECTURE.md` | Codebase documentation (all modules, all types) |
-| `IMPLEMENTATION_SPEC.md` | Roadmap and design decisions |
-| `CONTRIBUTING.md` | Build setup, test commands, conventions |
-| `REMAINING_WORK.md` | Task tracking with completion status |
+| [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md) | The spec: wire protocol, cryptography, architecture as built, compliance matrix |
+| [`ROADMAP.md`](ROADMAP.md) | The plan: everything still open, prioritised, with acceptance criteria |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build setup, test commands, conventions |
+| [`docs/adr/`](docs/adr/) | Architecture Decision Records (ADR-001 … ADR-008) |
+| [`docs/plugin-api.md`](docs/plugin-api.md) | Transport plugin development guide |
 | `CLAUDE.md` | AI assistant instructions |
-| `docs/adr/` | Architecture Decision Records |
+
+Two documents, by design. The spec says what Mycelium is and what is built; the
+roadmap says what is not. Anything else drifts.
 
 ## Status
 
-**85% complete** (124/146 tasks). Phases 1-13 done. Remaining:
+**v0.1, pre-release.** Everything in the v0.1 scope is implemented: 1:1 and
+group messaging, channels, emergency broadcast, AODV multi-hop, DTN
+store-and-forward, Web of Trust, onboarding, battery adaptation, the local API,
+and the Android + iOS apps. `cargo test`, `clippy -D warnings`, `cargo fmt` and
+`flutter analyze` are all green.
 
-- External radio platform bridges (LoRa BLE GATT, USB serial, BT Classic Kotlin/Dart)
-- OpenWRT cross-compilation and LuCI web plugin
-- Protocol adapter crates (Meshtastic, Reticulum)
-- Plugin API documentation
+What stands between here and a release (see [`ROADMAP.md`](ROADMAP.md) for the
+full list with acceptance criteria):
 
-See `REMAINING_WORK.md` for the detailed task list.
+- **Hardening of shipped features** — FFI panic guards, ratchet
+  persist-before-send, identity key in the platform keystore, emergency
+  co-signer signature verification, internet-transport peer authentication,
+  group-discovery proof of possession.
+- **Validation** — LoRa, BT Classic and OpenWRT work in software but have never
+  run against real hardware. There is no CI, and the Docker testbed has no
+  scenario runner.
+- **v0.2 features** — Meshtastic and Reticulum interoperability, plugin
+  instantiation, per-app API tokens, protocol capability negotiation.
+
+Deferred to v0.3+: multi-device sync, geographic overlay, threshold key
+revocation, Wi-Fi Aware.
 
 ## License
 

@@ -76,7 +76,7 @@ export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 ```bash
 make build          # Debug build
 make build-release  # Release build
-make test           # Run all 186 workspace tests
+make test           # Run all 280 workspace tests
 make lint           # cargo fmt --check + cargo clippy
 ```
 
@@ -201,14 +201,17 @@ cd flutter && flutter test
 ```
 mycelium/
 ├── crates/
-│   ├── mycelium-protocol/    # Wire format types + binary codec (29 tests)
-│   ├── mycelium-crypto/      # Ed25519, X3DH, Double Ratchet, Sender Key, WoT, Discovery (43 tests)
-│   ├── mycelium-core/        # Transports (BLE/WiFi/LoRa/BT/Internet/Plugin/Mock), AODV, DTN, DHT (51 tests)
-│   ├── mycelium-storage/     # SQLCipher database, CRUD, channels (9 tests)
-│   ├── mycelium-node/        # Node daemon, event loop, message pipeline, CLI (43 tests)
-│   ├── mycelium-api/         # Local REST (47 endpoints) + WebSocket API server (11 tests)
-│   └── mycelium-ffi/         # C FFI bindings for mobile (64 extern functions)
-├── flutter/                  # Flutter mobile app (47 Dart files, 14 screens)
+│   ├── mycelium-protocol/    # Wire format types + binary codec (39 tests)
+│   ├── mycelium-crypto/      # Ed25519, X3DH, Double Ratchet, Sender Key, WoT, Discovery (53 tests)
+│   ├── mycelium-core/        # Transports (BLE/WiFi/LoRa/BT/Internet/Plugin/Mock), AODV, DTN, DHT (77 tests)
+│   ├── mycelium-storage/     # SQLCipher database, CRUD, channels (10 tests)
+│   ├── mycelium-node/        # Node library: event loop, message pipeline, groups (45 tests)
+│   ├── mycelium-api/         # Local REST (38 endpoints, bearer auth) + WebSocket API server (19 tests)
+│   ├── mycelium-daemon/      # `mycelium-node` binary: node + API server (ADR-004)
+│   ├── mycelium-ffi/         # C FFI bindings for mobile (64 extern functions)
+│   ├── mycelium-meshtastic/  # Meshtastic protocol adapter (16 tests)
+│   └── mycelium-reticulum/   # Reticulum protocol adapter (21 tests)
+├── flutter/                  # Flutter mobile app (49 Dart files, 14 screens)
 │   ├── lib/src/
 │   │   ├── ffi/              # FFI library loading
 │   │   ├── models/           # Data models (NodeId, Message, Contact, Group, etc.)
@@ -217,16 +220,24 @@ mycelium/
 │   │   ├── service/          # ApiClient, WsService, MyceliumService, BleManager, etc.
 │   │   ├── widgets/          # Reusable UI components (6 widgets)
 │   │   └── router/           # GoRouter navigation (6-tab shell + onboarding)
-│   ├── android/              # Android platform code (Kotlin BLE + Wi-Fi Direct)
+│   ├── android/              # Android platform code (Kotlin BLE, Wi-Fi Direct, LoRa GATT/USB, BT Classic)
 │   └── ios/                  # iOS platform code (Swift BLE + LoRa)
-├── scripts/                  # Build and utility scripts
-├── docs/adr/                 # Architecture Decision Records
-├── ARCHITECTURE.md           # Comprehensive codebase documentation
-├── IMPLEMENTATION_SPEC.md    # Implementation roadmap and design decisions
-├── REMAINING_WORK.md         # Task tracking (124/146 complete = 85%)
-├── MYCELIUM_SPEC.md          # Protocol specification
+├── openwrt/                  # OpenWRT .ipk Makefile, init script, LuCI app
+├── testbed/                  # Docker mesh testbed (Dockerfile, compose, scenarios)
+├── scripts/                  # Build scripts (build-android.sh, build-ios.sh, build-openwrt.sh)
+├── docs/
+│   ├── adr/                  # Architecture Decision Records
+│   └── plugin-api.md         # Transport plugin development guide
+├── MYCELIUM_SPEC.md          # The spec: protocol, crypto, architecture as built
+├── ROADMAP.md                # The plan: open work, prioritised
 └── CLAUDE.md                 # AI assistant instructions
 ```
+
+The repository keeps exactly **two** living documents: `MYCELIUM_SPEC.md` for
+what Mycelium is and what exists, and `ROADMAP.md` for what does not. ADRs are
+an append-only record of decisions and are never rewritten. Resist adding a
+third overview document — the ones this replaced had drifted out of sync with
+each other and with the code.
 
 ---
 
@@ -237,7 +248,12 @@ mycelium/
   - Scopes: `protocol`, `crypto`, `core`, `storage`, `node`, `api`, `ffi`, `flutter`, `ble`, `docs`, `build`, `test`
   - Example: `core: add multi-hop message forwarding via AODV`
 - Reference ADRs in commits when making architectural decisions: `See ADR-001`
-- Update documentation (ARCHITECTURE.md, etc.) in the same commit as the feature they describe
+- Update documentation in the same commit as the change it describes:
+  - behaviour, wire format, crypto, API or architecture changed → `MYCELIUM_SPEC.md`
+  - a task is finished, newly scoped, or re-prioritised → `ROADMAP.md`
+  - a significant decision was made → a new ADR in `docs/adr/`
+  - the test count changed → `CONTRIBUTING.md` and `README.md` (the only two
+    places that carry it)
 
 ---
 

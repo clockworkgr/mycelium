@@ -31,11 +31,6 @@ identity.key
 # Pre-built Android native libraries (built from source)
 /android-libs/
 
-# Legacy Android directory (Flutter android is at /flutter/android/)
-/android/.gradle
-/android/build
-/android/app/build
-/android/local.properties
 
 # Claude AI project settings (contains local paths)
 /.claude/
