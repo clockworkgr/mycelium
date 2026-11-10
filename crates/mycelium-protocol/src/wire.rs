@@ -964,6 +964,10 @@ pub fn serialize_emergency_broadcast(
     message: &[u8],
     cosigners: &[EmergencyCosigner],
 ) -> Vec<u8> {
+    // Note: the co-signatures cover the envelope's `message_id` as the
+    // broadcast id (see `mycelium_crypto::emergency`), which is why the id is
+    // not repeated in the body.
+
     let mut buf =
         Vec::with_capacity(1 + 1 + 4 + message.len() + 1 + cosigners.len() * COSIGNER_ENTRY_LEN);
     buf.push(WirePayloadType::EmergencyBroadcast as u8);

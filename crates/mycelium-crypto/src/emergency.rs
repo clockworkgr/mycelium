@@ -9,19 +9,27 @@
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
-use mycelium_protocol::types::NodeId;
+use mycelium_protocol::types::{MessageId, NodeId};
 use mycelium_protocol::wire::{EmergencyCosigner, EmergencyLevel, EMERGENCY_COSIGN_CONTEXT};
 
 use crate::identity::{node_id_from_public_key, Identity};
 
 /// The bytes a co-signer signs.
 ///
-/// Binds the approval to the originator, the level and the exact message, so a
-/// signature cannot be lifted onto a different broadcast, replayed at a
-/// different level, or reused by a different originator.
-pub fn cosign_digest(originator: &NodeId, level: EmergencyLevel, message: &[u8]) -> [u8; 32] {
+/// Binds the approval to **this** broadcast: its id, the originator, the level
+/// and the exact message. Without the id, an intercepted critical alert could
+/// be re-flooded under a fresh envelope id indefinitely — the content-only
+/// digest would still verify, and the receiving node's dedup set is keyed on
+/// the envelope id it no longer matches.
+pub fn cosign_digest(
+    broadcast_id: &MessageId,
+    originator: &NodeId,
+    level: EmergencyLevel,
+    message: &[u8],
+) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(EMERGENCY_COSIGN_CONTEXT);
+    hasher.update(broadcast_id.as_bytes());
     hasher.update(originator.as_bytes());
     hasher.update([level as u8]);
     hasher.update((message.len() as u32).to_le_bytes());
@@ -32,11 +40,12 @@ pub fn cosign_digest(originator: &NodeId, level: EmergencyLevel, message: &[u8])
 /// Co-sign a level-3 broadcast.
 pub fn cosign(
     signer: &Identity,
+    broadcast_id: &MessageId,
     originator: &NodeId,
     level: EmergencyLevel,
     message: &[u8],
 ) -> EmergencyCosigner {
-    let digest = cosign_digest(originator, level, message);
+    let digest = cosign_digest(broadcast_id, originator, level, message);
     EmergencyCosigner {
         node_id: signer.node_id(),
         signature: signer.sign(&digest).to_bytes(),
@@ -66,6 +75,7 @@ pub enum CosignerRejection {
 pub fn verify_cosigner(
     cosigner: &EmergencyCosigner,
     identity_key: Option<[u8; 32]>,
+    broadcast_id: &MessageId,
     originator: &NodeId,
     level: EmergencyLevel,
     message: &[u8],
@@ -81,7 +91,7 @@ pub fn verify_cosigner(
     let verifying =
         VerifyingKey::from_bytes(&key).map_err(|_| CosignerRejection::MalformedIdentityKey)?;
     let signature = Signature::from_bytes(&cosigner.signature);
-    let digest = cosign_digest(originator, level, message);
+    let digest = cosign_digest(broadcast_id, originator, level, message);
 
     verifying
         .verify(&digest, &signature)
@@ -92,72 +102,92 @@ pub fn verify_cosigner(
 mod tests {
     use super::*;
 
-    fn setup() -> (Identity, NodeId, Vec<u8>) {
-        let signer = Identity::generate();
-        let originator = Identity::generate().node_id();
-        (signer, originator, b"flood warning".to_vec())
+    struct Fixture {
+        signer: Identity,
+        broadcast_id: MessageId,
+        originator: NodeId,
+        message: Vec<u8>,
+    }
+
+    fn setup() -> Fixture {
+        Fixture {
+            signer: Identity::generate(),
+            broadcast_id: MessageId::random(),
+            originator: Identity::generate().node_id(),
+            message: b"flood warning".to_vec(),
+        }
+    }
+
+    fn verify(
+        f: &Fixture,
+        cs: &EmergencyCosigner,
+        key: Option<[u8; 32]>,
+    ) -> Result<(), CosignerRejection> {
+        verify_cosigner(
+            cs,
+            key,
+            &f.broadcast_id,
+            &f.originator,
+            EmergencyLevel::Critical,
+            &f.message,
+        )
+    }
+
+    fn sign(f: &Fixture) -> EmergencyCosigner {
+        cosign(
+            &f.signer,
+            &f.broadcast_id,
+            &f.originator,
+            EmergencyLevel::Critical,
+            &f.message,
+        )
     }
 
     #[test]
     fn test_valid_cosignature_verifies() {
-        let (signer, originator, message) = setup();
-        let cs = cosign(&signer, &originator, EmergencyLevel::Critical, &message);
-        assert_eq!(
-            verify_cosigner(
-                &cs,
-                Some(signer.public_key_bytes()),
-                &originator,
-                EmergencyLevel::Critical,
-                &message
-            ),
-            Ok(())
-        );
+        let f = setup();
+        let cs = sign(&f);
+        assert_eq!(verify(&f, &cs, Some(f.signer.public_key_bytes())), Ok(()));
     }
 
     /// A bare NodeId with no signature must not pass. This is the whole point
-    /// of the task: the previous format carried only ids.
+    /// of the task: the previous wire format carried only ids.
     #[test]
     fn test_forged_signature_rejected() {
-        let (signer, originator, message) = setup();
+        let f = setup();
         let forged = EmergencyCosigner {
-            node_id: signer.node_id(),
+            node_id: f.signer.node_id(),
             signature: [0u8; 64],
         };
         assert_eq!(
-            verify_cosigner(
-                &forged,
-                Some(signer.public_key_bytes()),
-                &originator,
-                EmergencyLevel::Critical,
-                &message
-            ),
+            verify(&f, &forged, Some(f.signer.public_key_bytes())),
             Err(CosignerRejection::BadSignature)
         );
     }
 
     #[test]
     fn test_unknown_identity_key_is_not_an_approval() {
-        let (signer, originator, message) = setup();
-        let cs = cosign(&signer, &originator, EmergencyLevel::Critical, &message);
+        let f = setup();
+        let cs = sign(&f);
         assert_eq!(
-            verify_cosigner(&cs, None, &originator, EmergencyLevel::Critical, &message),
+            verify(&f, &cs, None),
             Err(CosignerRejection::UnknownIdentityKey)
         );
     }
 
-    /// A signature cannot be lifted onto a different message, level or
-    /// originator.
+    /// A signature must not transfer to another message, level or originator.
     #[test]
     fn test_signature_is_bound_to_the_broadcast() {
-        let (signer, originator, message) = setup();
-        let cs = cosign(&signer, &originator, EmergencyLevel::Critical, &message);
-        let key = Some(signer.public_key_bytes());
+        let f = setup();
+        let cs = sign(&f);
+        let key = Some(f.signer.public_key_bytes());
 
         assert_eq!(
             verify_cosigner(
                 &cs,
                 key,
-                &originator,
+                &f.broadcast_id,
+                &f.originator,
                 EmergencyLevel::Critical,
                 b"different message"
             ),
@@ -165,7 +195,14 @@ mod tests {
             "must not transfer to another message"
         );
         assert_eq!(
-            verify_cosigner(&cs, key, &originator, EmergencyLevel::Urgent, &message),
+            verify_cosigner(
+                &cs,
+                key,
+                &f.broadcast_id,
+                &f.originator,
+                EmergencyLevel::Urgent,
+                &f.message
+            ),
             Err(CosignerRejection::BadSignature),
             "must not transfer to another level"
         );
@@ -173,28 +210,44 @@ mod tests {
             verify_cosigner(
                 &cs,
                 key,
+                &f.broadcast_id,
                 &Identity::generate().node_id(),
                 EmergencyLevel::Critical,
-                &message
+                &f.message
             ),
             Err(CosignerRejection::BadSignature),
             "must not transfer to another originator"
         );
     }
 
+    /// An intercepted critical alert must not be re-floodable under a fresh
+    /// envelope id: the receiver's dedup set is keyed on that id, so a
+    /// content-only digest would let the same approval be replayed forever.
     #[test]
-    fn test_identity_key_must_hash_to_the_claimed_id() {
-        let (signer, originator, message) = setup();
-        let mut cs = cosign(&signer, &originator, EmergencyLevel::Critical, &message);
-        cs.node_id = NodeId([9u8; 32]);
+    fn test_signature_cannot_be_replayed_under_a_new_broadcast_id() {
+        let f = setup();
+        let cs = sign(&f);
         assert_eq!(
             verify_cosigner(
                 &cs,
-                Some(signer.public_key_bytes()),
-                &originator,
+                Some(f.signer.public_key_bytes()),
+                &MessageId::random(),
+                &f.originator,
                 EmergencyLevel::Critical,
-                &message
+                &f.message
             ),
+            Err(CosignerRejection::BadSignature),
+            "a co-signature must not verify for a different broadcast id"
+        );
+    }
+
+    #[test]
+    fn test_identity_key_must_hash_to_the_claimed_id() {
+        let f = setup();
+        let mut cs = sign(&f);
+        cs.node_id = NodeId([9u8; 32]);
+        assert_eq!(
+            verify(&f, &cs, Some(f.signer.public_key_bytes())),
             Err(CosignerRejection::IdentityMismatch)
         );
     }

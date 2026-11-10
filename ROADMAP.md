@@ -13,7 +13,7 @@ Verified on 2026-11-10 against the working tree, after the T-06/07/10/11 work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **307 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **308 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -101,25 +101,33 @@ and be auto-trusted by the whole group — which collapses the Sybil defence
 - Test: a node that knows only a captured hash fails the exchange; a node with
   the passphrase succeeds.
 
-### T-05 · Emergency level-3 co-signer signatures
+### T-05 · Collect emergency level-3 co-signatures
 
-**Area:** `mycelium-node`, `mycelium-storage` · **Spec:** §9.5
+**Area:** `mycelium-node`, `mycelium-api`, Flutter · **Spec:** §9.5 · **ADR-010**
 
-Level 3 floods the entire mesh and bypasses routing rules. It is supposed to
-require three co-signers with trust > 0.8, but co-signers are carried as bare
-NodeIds and are never signature-verified. Any node can list three trusted
-NodeIds it does not control and trigger a network-wide flood.
+**Verification landed on 2026-11-10.** Co-signer entries are now
+`node_id(32) + signature(64)`; the signature covers
+`broadcast_id ‖ originator ‖ level ‖ message`, and a receiver counts an entry
+only when it holds an identity key for that NodeId, the key hashes to the id,
+the signature verifies and the co-signer's trust exceeds 0.8. Contacts now
+record real Ed25519 identity keys at the ingress paths that already verify
+them. See ADR-010.
 
-Blocked on storing contacts' Ed25519 identity keys — the contact record
-currently has no key to verify against.
+**What remains: nothing collects co-signatures.** There is no request protocol,
+no approval UI, and `POST /v1/emergency/broadcast` sends an empty list — so a
+level-3 broadcast is now refused by every receiver. Unusable is the correct
+failure direction for a mesh-wide flood (it was previously forgeable), but
+level 3 is unavailable until this is built.
 
 **Acceptance:**
-- Contacts persist an identity key; it is populated from prekey bundles and
-  vouches.
-- A level-3 broadcast carries a signature per co-signer over the broadcast
-  content, and all are verified before the flood.
-- An unverifiable or insufficient co-signer set is dropped and logged.
-- Test: forged co-signer list rejected; correctly signed set accepted.
+- A wire exchange by which an originator requests approval from trusted peers
+  and receives signed co-signatures, with a bounded wait and no amplification.
+- An approval prompt in the app showing who is asking, the level and the exact
+  message, since a co-signer is vouching for a mesh-wide flood.
+- `POST /v1/emergency/broadcast` accepts or gathers co-signatures for level 3
+  and returns a clear error when fewer than three are obtained.
+- An end-to-end test: four nodes, three approve, the flood is accepted; with
+  two approvals it is refused everywhere.
 
 ### T-08 · Identity key at rest
 
@@ -170,6 +178,103 @@ timeouts, no TTL or cap on stored records, no record signatures.
   cap and a signature.
 
 ---
+
+### T-24 · Group messages are forgeable by any member
+
+**Area:** `mycelium-crypto`, `mycelium-protocol` · **Spec:** §5.4
+
+Sender keys are symmetric: every member holds every other member's chain key so
+it can decrypt their messages. That also means any member can *encrypt* a
+message under another member's chain key and have it attributed to them. The
+spec presents groups as authenticated; within a group they are not.
+
+Found by the ADR review on 2026-11-10 against §5.4. This is inherent to plain
+sender keys and is the strongest argument for the MLS migration the spec keeps
+deferring; a cheaper fix is a per-sender signing key with group messages signed
+as well as encrypted.
+
+**Acceptance:** a member cannot produce a message that another member's node
+attributes to a third member; a test attempts exactly that and fails to.
+Spec §5.4 states the property either way rather than leaving it implied.
+
+### T-25 · DTN eviction leaves rows in the database
+
+**Area:** `mycelium-core`, `mycelium-node` · **Spec:** §7.2
+
+`DtnEngine::remove_bundle` drops the in-memory bundle but nothing deletes the
+`dtn_store` row. Evicted and expired bundles therefore come back on the next
+start, and the persisted store grows past the configured quota — which also
+undermines the eviction policy T-11 just landed.
+
+**Acceptance:** eviction and expiry return the removed ids and the caller
+deletes their rows; `dtn_storage_used()` after a restart matches the engine's
+accounting; a test fills the store, restarts, and asserts the quota holds.
+
+### T-26 · DTN delivery drops group messages and first-contact prekey requests
+
+**Area:** `mycelium-node` · **Spec:** §7.2, §9.4
+
+`handle_dtn_relay`'s local-delivery path handles only `EncryptedMessage` and
+`SessionInit`. A bundled `GroupMessage` or a `PrekeyRequest` carried across a
+partition is silently discarded, so group traffic and first contact do not
+survive the delay-tolerant path the spec promises for them.
+
+**Acceptance:** inner envelopes are dispatched through the shared ingress path
+rather than a private match; tests cover partitioned first contact and
+partitioned group delivery.
+
+### T-27 · Receipts are dropped when no route exists
+
+**Area:** `mycelium-node` · **Spec:** §9.3
+
+§9.3 says receipts travel back by the same routing as messages, "so in DTN mode
+a receipt can take as long as the original message". They do not: the receipt
+send path drops the receipt when AODV has no route, with no DTN fallback. A
+message delivered over DTN is therefore never acknowledged to the sender.
+
+**Acceptance:** a receipt with no route enters DTN and is delivered on reunion;
+the partition test asserts the sender's message reaches `delivered`.
+
+### T-28 · DTN spray copies are spent before the send is attempted
+
+**Area:** `mycelium-core`, `mycelium-node` · **Spec:** §7.2
+
+`on_neighbor_encountered` decrements `copies_remaining` and records the peer in
+`sprayed_to` in the same call that *builds* the actions — before the caller has
+touched a transport. The `Err` branch logs "keeping bundle", but the copy is
+already spent and the peer is already recorded as a holder. A flaky link burns
+the budget of L=8 without delivering anything.
+
+**Acceptance:** a failed transport send leaves `copies_remaining` and
+`sprayed_to` unchanged; a successful one updates both. Test: a mock transport
+configured to fail, asserting the budget is intact.
+
+### T-29 · Protocol IDs are not carried end to end
+
+**Area:** `mycelium-node`, `mycelium-api`, `mycelium-protocol` · **Spec:** §16.4
+
+§16.4 presents protocol IDs as implemented — the mechanism by which several
+applications share one node. They are not: REST and WebSocket sends discard the
+supplied id, and incoming events hardcode `mycelium.chat.v1`. Any second client
+would receive the chat app's traffic and vice versa, so the platform claim in
+§1 does not hold yet.
+
+**Acceptance:** the id is carried through encryption, storage and events, and a
+client subscribed to one id never receives another's traffic; or §16.4 is
+marked Partial and this task carries the remaining work. (Spec has been marked
+Partial pending this.)
+
+### T-30 · Battery power policies are not enforced
+
+**Area:** `mycelium-node` · **Spec:** §11.2
+
+§11.2 tabulates five modes with distinct behaviour. `Moderate` and `Light`
+share one unrestricted relay boolean, and `Hibernate` neither disconnects
+transports nor queues outgoing sends. The modes are computed and reported but
+only two of them change anything.
+
+**Acceptance:** each mode's documented behaviour is enforced and tested, or
+§11.2 is reduced to what the code does.
 
 ## P1 — v0.1 completeness
 

@@ -436,7 +436,7 @@ async fn test_stale_bundle_is_rejected_and_discarded() {
         .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    alice
+    let doomed_id = alice
         .send_message(bob_node_id, b"doomed", ContentType::Text)
         .await
         .expect("send is accepted locally");
@@ -456,6 +456,23 @@ async fn test_stale_bundle_is_rejected_and_discarded() {
     assert!(
         discarded,
         "a SessionReject must make the initiator discard the unusable cached bundle"
+    );
+
+    // And the message that died with the handshake must be reported, not left
+    // claiming "sent". The first version took the message ids after
+    // `remove_session` had already cleared them, so nothing was ever marked.
+    let mut status = String::new();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        status = alice.db.get_message(&doomed_id).unwrap().status;
+        if status == "failed" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        status, "failed",
+        "a message sent under a rejected handshake must be reported failed"
     );
 }
 

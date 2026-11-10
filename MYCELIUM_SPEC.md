@@ -13,7 +13,7 @@
 This is the single normative document for Mycelium. It specifies the wire
 protocol and cryptography, and describes the architecture as built. The
 companion document is [`ROADMAP.md`](ROADMAP.md), which tracks the open work.
-Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/) (ADR-001 … ADR-009);
+Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/) (ADR-001 … ADR-010);
 build and contribution mechanics live in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### Status legend
@@ -383,11 +383,17 @@ a cached bundle survives a rotation. An id outside the retention window is a
 hard error, never a silently mismatched derivation (ADR-009).
 
 **Rejection.** When a `SessionInit` cannot be accepted the responder sends
-`SessionReject` (`0x22`), and the initiator discards its cached bundle so the
-next send re-requests a fresh one. A reject is unauthenticated by construction,
-so it acts only on an unconfirmed handshake: a session older than the 60 s
-initiation window is never touched, and the message does nothing when no bundle
-is cached. See ADR-009 for the full argument.
+`SessionReject` (`0x22`). A reject is unauthenticated by construction — no
+confirmed session exists yet to sign it with — so it acts **only** on a
+handshake the peer has not confirmed.
+
+A handshake is **confirmed** the moment the initiator successfully decrypts
+anything from that peer: only the peer's own ratchet could have produced it.
+Until then, a reject discards the unconfirmed session, the cached bundle (in
+memory and in storage) and reports the messages sent under it as failed. A
+confirmed session **must not** be torn down by a reject, which is what stops a
+forgery from killing working traffic. Confirmation is a state, not a deadline:
+an elapsed-time cutoff was tried first and was wrong both ways. See ADR-009.
 
 ### 5.3 Double Ratchet
 
@@ -900,9 +906,21 @@ Thresholds are enforced as specified. Emergency messages carry the sender's
 identity — they are deliberately non-anonymous, for accountability — and a
 false emergency is intended to incur a trust penalty.
 
-**Known gap:** level-3 co-signers are carried as bare NodeIds and are not
-signature-verified, so the co-signing requirement is advisory. Fixing it
-requires storing contacts' identity keys. See ROADMAP T-05.
+**Co-signatures are verified.** A co-signer entry is
+`node_id(32) + signature(64)`; the signature covers
+`broadcast_id ‖ originator ‖ level ‖ message`, so an approval cannot be
+replayed under a new envelope id, reused by another originator, or promoted to
+a higher level. A receiver counts an entry only when it holds an identity key
+for that NodeId, the key hashes to the id, the signature verifies, and the
+co-signer's trust exceeds 0.8; three distinct such entries are required
+(ADR-010). Identity keys are recorded by the ingress paths that already verify
+them against the NodeId.
+
+**Known gap:** nothing *collects* co-signatures. There is no request protocol
+and no approval UI, and `POST /v1/emergency/broadcast` sends an empty list, so
+a level-3 broadcast is refused by every receiver. Unusable is the correct
+failure direction for a mesh-wide flood, but level 3 is not available until
+collection exists. See ROADMAP T-05.
 
 ### 9.6 Multi-device support
 
@@ -1090,13 +1108,20 @@ pub struct Node {
 }
 ```
 
-`start()` spawns three tasks, all cancelled by `cancel_token`:
+`start()` spawns four tasks, all cancelled by `cancel_token`:
 
 1. **Transport event listener** — `NeighborDiscovered`, `NeighborLost`,
    `DataReceived`.
 2. **Beacon broadcaster** — every `beacon_interval_secs`.
-3. **Maintenance timer** — every 30 s: expire AODV routes, expire DTN bundles,
-   clean up the rate limiter, rotate signed prekeys (~every 24 h, 2880 ticks).
+3. **Route-discovery sweep** — every 1 s, so the 5 s discovery timeout (§7.3)
+   is honoured. It has its own ticker precisely because the maintenance
+   interval is too coarse.
+4. **Maintenance timer** — every 30 s: expire AODV routes, expire DTN bundles,
+   clean up the rate limiter, expire cached prekey bundles, and rotate the
+   signed prekey weekly. The rotation interval is coupled to the retained-key
+   count and the bundle-cache lifetime (§5.2, ADR-009): the retained keys must
+   span the cache, or a peer initiating from a still-valid cached bundle
+   fails.
 
 ### 14.2 Send pipeline
 
@@ -1332,7 +1357,11 @@ the FFI layer restart cleanly.
 
 ### 16.4 Protocol IDs
 
-**Status: Implemented** (routing and filtering; beacon advertisement is Partial).
+**Status: Partial.** The id travels in the payload and clients can declare
+interest, but REST and WebSocket sends currently discard the supplied id and
+incoming events hardcode `mycelium.chat.v1`, so a second application would
+receive the chat app's traffic. Beacon advertisement of supported protocols is
+also absent. See ROADMAP T-29.
 
 A protocol ID is a free-form string, conventionally reverse-DNS
 (`mycelium.chat.v1`, `com.example.game`). It rides in the envelope payload
@@ -1347,8 +1376,8 @@ encryption without implementing any crypto.
 | `mycelium.system.v1` | Internal control messages |
 
 Clients declare the IDs they care about with a WebSocket `subscribe` frame.
-Advertising supported protocols in the beacon for capability discovery is not
-yet implemented.
+Until T-29 lands, treat a node as single-application: the platform claim in §1
+is the design intent, not the current behaviour.
 
 ## 17. FFI and mobile platform bridges
 
@@ -1555,7 +1584,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 5.1 | Ed25519/X25519 identity | **Implemented** | Device-bound, NodeId ↔ key binding enforced |
 | 5.2 | X3DH | **Implemented** | SPK + OTP issued once, signature verified, rotated SPKs retained, stale bundles rejected and recovered (ADR-009) |
 | 5.3 | Double Ratchet | **Implemented** | Transactional decrypt, bounded skips, ratchet state durable before transmit, key material zeroized |
-| 5.4 | Group encryption | **Implemented** | Sender keys over pairwise sessions (ADR-007), not an MLS tree. No admin model |
+| 5.4 | Group encryption | **Implemented** | Sender keys over pairwise sessions (ADR-007), not an MLS tree. No admin model, and any member can forge messages attributed to another (T-24) |
 | 5.5 | Safety numbers | **Implemented** | 60-digit, symmetric, verify flow in the app |
 | 6.1 | Web of Trust | **Implemented** | BFS with decay, signed vouches |
 | 6.2 | Sybil resistance | **Implemented** | Trust-gated rate limits + blacklisting |
@@ -1573,16 +1602,16 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 8.6 | iOS strategy | **Implemented** | Dual-role CoreBluetooth, background restoration, LoRa bridge |
 | 9.1 | Content types | **Implemented** | All seven |
 | 9.2 | Lamport ordering | **Implemented** | Tick on send, merge on receive |
-| 9.3 | Receipts | **Implemented** | All delivery paths, recipient-only, WS push, UI indicators |
+| 9.3 | Receipts | **Partial** | Recipient-only, WS push, UI indicators. Dropped when no route exists, so DTN deliveries are never acknowledged (T-27) |
 | 9.4 | Public channels | **Implemented** | Wire types, storage, flooding, 6 REST endpoints, 2 screens. Channel `NodeEvent` + dedup expiry open (T-14) |
 | 9.4 | Regional channels | **Planned** | Needs the geographic overlay |
-| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced; co-signer signatures unverified (T-05) |
+| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified and replay-bound (ADR-010). Nothing collects co-signatures, so level 3 is refused everywhere (T-05) |
 | 9.6 | Multi-device / CRDT sync | **Planned** | v0.3 |
 | 10.1 | Beacon | **Implemented** | Node type, battery, neighbour count, group hash; LoRa broadcast |
 | 10.2 | Seed phrase groups | **Partial** | Derivation + beacon match + auto-vouch; no proof of possession (T-04) |
 | 10.3 | First-launch flow | **Implemented** | 4 onboarding screens + QR |
 | 11.1 | Supernode | **Partial** | CLI, auto-config, prekey cache, `.ipk`, LuCI app. No router hardware test (T-15) |
-| 11.2 | Battery management | **Implemented** | 5 modes, platform injection, beacon field |
+| 11.2 | Battery management | **Partial** | 5 modes computed and reported, but Moderate/Light share one relay flag and Hibernate does not disconnect (T-30) |
 | 12 | Rate limiting | **Implemented** | Per-tier limits, auto-blacklist, wired to the trust graph |
 | 13 | Protocol versioning | **Partial** | Version in the envelope; no negotiation (T-20) |
 | 16 | Local API | **Implemented** | 38 endpoints, 7 WS event types, bearer auth (ADR-006). Per-app tokens open (T-18) |

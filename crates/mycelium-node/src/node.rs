@@ -3226,8 +3226,13 @@ impl Node {
             if !sm.handshake_unconfirmed(&envelope.source) {
                 None
             } else {
+                // Take the message ids *first*: `remove_session` also clears
+                // the unconfirmed-handshake entry, so taking them afterwards
+                // always yielded an empty list and nothing was ever reported
+                // failed.
+                let dead = sm.take_unconfirmed_messages(&envelope.source);
                 sm.remove_session(&envelope.source);
-                Some(sm.take_unconfirmed_messages(&envelope.source))
+                Some(dead)
             }
         };
 
@@ -3948,6 +3953,7 @@ impl Node {
                         if let Err(reason) = mycelium_crypto::emergency::verify_cosigner(
                             cs,
                             key,
+                            &envelope.message_id,
                             &envelope.source,
                             level,
                             &message_bytes,
