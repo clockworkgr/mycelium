@@ -9,7 +9,7 @@
       <tr class="tr"><td class="td"><%:Status%></td><td class="td" id="daemon-status">-</td></tr>
       <tr class="tr"><td class="td"><%:Node ID%></td><td class="td" id="node-id">-</td></tr>
       <tr class="tr"><td class="td"><%:Display Name%></td><td class="td" id="display-name">-</td></tr>
-      <tr class="tr"><td class="td"><%:Node Type%></td><td class="td" id="node-type">-</td></tr>
+      <tr class="tr"><td class="td"><%:Power Mode%></td><td class="td" id="power-mode">-</td></tr>
       <tr class="tr"><td class="td"><%:Sessions%></td><td class="td" id="session-count">-</td></tr>
       <tr class="tr"><td class="td"><%:Prekeys Remaining%></td><td class="td" id="prekey-count">-</td></tr>
     </table>
@@ -76,20 +76,24 @@
             var s = data.status || {};
             document.getElementById('node-id').textContent = s.node_id || '-';
             document.getElementById('display-name').textContent = s.display_name || '-';
-            document.getElementById('node-type').textContent = s.node_type || '-';
+            document.getElementById('power-mode').textContent = s.power_mode || '-';
             document.getElementById('session-count').textContent = (s.session_count != null) ? s.session_count : '-';
             document.getElementById('prekey-count').textContent = (s.prekey_remaining != null) ? s.prekey_remaining : '-';
 
-            // Network
-            document.getElementById('neighbor-count').textContent = (s.neighbor_count != null) ? s.neighbor_count : '-';
+            // Network (from /v1/network/status)
+            var n = data.network || {};
+            document.getElementById('neighbor-count').textContent = (n.neighbor_count != null) ? n.neighbor_count : '-';
 
-            // DTN
-            var d = data.dtn || {};
-            document.getElementById('dtn-queue').textContent = (d.queue_size != null) ? d.queue_size + ' bundles' : '-';
-            document.getElementById('dtn-storage').textContent = (d.storage_used_mb != null) ? d.storage_used_mb + ' MB' : '-';
+            // DTN: queue size from network status, bundle list from /v1/network/dtn
+            var bundles = Array.isArray(data.dtn) ? data.dtn : [];
+            var queueSize = (n.dtn_queue_size != null) ? n.dtn_queue_size : bundles.length;
+            document.getElementById('dtn-queue').textContent = queueSize + ' bundles';
+            document.getElementById('dtn-storage').textContent = (n.dtn_storage_used != null)
+                ? (n.dtn_storage_used / (1024 * 1024)).toFixed(2) + ' MB'
+                : '-';
 
-            // Peers
-            var peers = (data.peers && data.peers.peers) || [];
+            // Peers (/v1/network/peers returns a JSON array)
+            var peers = Array.isArray(data.peers) ? data.peers : [];
             var tbody = document.getElementById('peers-table');
             // Remove old rows (keep header)
             while (tbody.rows.length > 1) tbody.deleteRow(1);

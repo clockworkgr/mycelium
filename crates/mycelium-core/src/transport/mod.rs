@@ -107,4 +107,11 @@ pub trait Transport: Send + Sync {
 
     /// Get the maximum transmission unit for this transport.
     fn mtu(&self) -> usize;
+
+    /// Whether `send(&NodeId::ZERO, ..)` reaches every node in range (a
+    /// broadcast medium such as LoRa). Used to announce beacons before any
+    /// peer is known. Default: no.
+    fn supports_broadcast(&self) -> bool {
+        false
+    }
 }

@@ -1,7 +1,7 @@
 ## Multi-stage build for mycelium-node testbed container
 
 # Stage 1: Build
-FROM rust:1.75-bookworm AS builder
+FROM rust:1.82-bookworm AS builder
 
 WORKDIR /build
 COPY . .
@@ -22,6 +22,7 @@ COPY --from=builder /build/target/release/mycelium-node /usr/local/bin/mycelium-
 
 RUN mkdir -p /data/mycelium
 
+# Read by mycelium-node at startup (CLI flags take precedence).
 ENV MYCELIUM_DATA_DIR=/data/mycelium
 ENV MYCELIUM_DISPLAY_NAME=testbed-node
 ENV RUST_LOG=info

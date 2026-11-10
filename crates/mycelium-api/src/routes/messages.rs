@@ -4,13 +4,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 
-use mycelium_protocol::types::ContentType;
-
 use crate::state::AppState;
 use crate::types::{
     ApiError, MessageQueryParams, MessageResponse, SendMessageRequest, SendMessageResponse,
 };
-use crate::util::parse_node_id;
+use crate::util::{parse_content_type, parse_node_id};
 
 /// POST /v1/messages — Send a message
 pub async fn send_message(
@@ -19,14 +17,7 @@ pub async fn send_message(
 ) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, Json<ApiError>)> {
     let destination = parse_node_id(&req.destination)?;
 
-    let content_type = match req.content_type.as_str() {
-        "text" => ContentType::Text,
-        "image" => ContentType::Image,
-        "file" => ContentType::File,
-        "gps_pin" => ContentType::GpsPin,
-        "voice_note" => ContentType::VoiceNote,
-        _ => ContentType::Text,
-    };
+    let content_type = parse_content_type(&req.content_type);
 
     let message_id = state
         .node

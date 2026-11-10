@@ -4,7 +4,6 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 
-use mycelium_crypto::group::{SenderKey, SenderKeyGroup};
 use mycelium_protocol::types::ContentType;
 
 use crate::state::AppState;
@@ -61,32 +60,15 @@ fn byte_to_content_type(b: u8) -> ContentType {
 pub async fn create_group(
     State(state): State<AppState>,
 ) -> Result<(StatusCode, Json<CreateGroupResponse>), (StatusCode, Json<ApiError>)> {
-    // Generate random 32-byte group_id
-    let mut group_id = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_id);
-
-    let group = SenderKeyGroup::new(group_id);
-
-    // Persist to DB
-    state
-        .node
-        .db
-        .save_group_blob(&group_id, &group.to_bytes())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
-
-    // Store in node.groups HashMap
-    {
-        let mut groups = state.node.groups.write().await;
-        groups.insert(group_id, group);
-    }
+    let group_id = state.node.create_group().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError {
+                error: e.to_string(),
+                code: 500,
+            }),
+        )
+    })?;
 
     Ok((
         StatusCode::CREATED,
@@ -149,35 +131,13 @@ pub async fn add_member(
     let group_id = parse_group_id(&group_id_hex)?;
     let member_node_id = parse_node_id(&req.node_id)?;
 
-    let mut groups = state.node.groups.write().await;
-    let group = groups.get_mut(&group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: "Group not found".to_string(),
-                code: 404,
-            }),
-        )
-    })?;
-
-    // Generate a sender key for the new member
-    let sender_key = SenderKey::generate();
-    group.add_member(member_node_id, sender_key);
-
-    // Persist updated group state to DB
+    // The node adds the member and distributes sender keys over the
+    // pairwise sessions (establishing them if needed).
     state
         .node
-        .db
-        .save_group_blob(&group_id, &group.to_bytes())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .add_group_member(group_id, member_node_id)
+        .await
+        .map_err(group_error)?;
 
     Ok(StatusCode::CREATED)
 }
@@ -190,35 +150,29 @@ pub async fn remove_member(
     let group_id = parse_group_id(&group_id_hex)?;
     let member_node_id = parse_node_id(&member_id_hex)?;
 
-    let mut groups = state.node.groups.write().await;
-    let group = groups.get_mut(&group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiError {
-                error: "Group not found".to_string(),
-                code: 404,
-            }),
-        )
-    })?;
-
-    group.remove_member(&member_node_id);
-
-    // Persist updated group state to DB
+    // Rotates our sender key and redistributes it with the new roster.
     state
         .node
-        .db
-        .save_group_blob(&group_id, &group.to_bytes())
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiError {
-                    error: e.to_string(),
-                    code: 500,
-                }),
-            )
-        })?;
+        .remove_group_member(group_id, member_node_id)
+        .await
+        .map_err(group_error)?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn group_error(e: mycelium_node::node::NodeError) -> (StatusCode, Json<ApiError>) {
+    let (status, code) = match e {
+        mycelium_node::node::NodeError::GroupNotFound => (StatusCode::NOT_FOUND, 404),
+        mycelium_node::node::NodeError::SendToSelf => (StatusCode::BAD_REQUEST, 400),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, 500),
+    };
+    (
+        status,
+        Json(ApiError {
+            error: e.to_string(),
+            code,
+        }),
+    )
 }
 
 /// POST /v1/groups/:group_id/messages -- Send a group message

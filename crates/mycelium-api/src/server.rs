@@ -4,24 +4,52 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use axum::http::HeaderValue;
 use axum::routing::{delete, get, post};
-use axum::Router;
+use axum::{middleware, Router};
 use tokio::net::TcpListener;
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tracing::{debug, info, warn};
 
 /// Bind a TCP listener with SO_REUSEADDR to allow quick rebinding.
 async fn bind_reuseaddr(addr: SocketAddr) -> Result<TcpListener, std::io::Error> {
-    let socket = tokio::net::TcpSocket::new_v4()?;
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
     socket.set_reuseaddr(true)?;
     socket.bind(addr)?;
     socket.listen(128)
+}
+
+/// Handle to a running API server. Dropping it does not stop the server;
+/// call [`shutdown`](Self::shutdown).
+pub struct ApiServerHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl ApiServerHandle {
+    /// Stop the listener, the event bridge, the status broadcaster and every
+    /// WebSocket session. Returns once the cancellation has been signalled;
+    /// the serve task is aborted so no lingering connection can keep it alive.
+    pub fn shutdown(self) {
+        self.shutdown.cancel();
+        self.task.abort();
+    }
+
+    /// Whether the serve task has exited.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
 use mycelium_node::config::ApiConfig;
 use mycelium_node::events::NodeEvent;
 use mycelium_node::node::Node;
 
+use crate::auth;
 use crate::routes::{
     channels, contacts, conversations, emergency, groups, messages, network, node, prekeys,
 };
@@ -106,26 +134,48 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/network/events", get(network::get_events))
         // WebSocket
         .route("/v1/ws", get(ws::ws_upgrade))
-        // Middleware
-        .layer(CorsLayer::permissive())
+        // Middleware: bearer token + WebSocket origin check (inner), then
+        // CORS restricted to loopback browser origins (outer, so preflight
+        // requests are answered without a token).
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
+                    auth::is_loopback_origin(origin.to_str().unwrap_or(""))
+                }))
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
         .with_state(state)
 }
 
-/// Start the API server. Returns a JoinHandle that can be awaited or aborted.
+/// Start the API server. Returns a handle used to stop it again.
 pub async fn start_server(
     node: Arc<Node>,
     config: &ApiConfig,
-) -> Result<tokio::task::JoinHandle<()>, std::io::Error> {
-    let state = AppState::new(node.clone());
+) -> Result<ApiServerHandle, std::io::Error> {
+    let state = AppState::new(node.clone()).with_auth_token(config.auth_token.clone());
+    if config.auth_token.is_none() {
+        warn!("API server starting WITHOUT authentication");
+    }
+    let shutdown = state.shutdown.clone();
 
     // Spawn bridge task: NodeEvent → WsServerMessage
     let ws_tx = state.event_tx.clone();
     let bridge_log = state.event_log.clone();
     let bridge_start = state.started_at;
+    let bridge_cancel = shutdown.clone();
     let mut node_rx = node.event_tx.subscribe();
     tokio::spawn(async move {
         loop {
-            match node_rx.recv().await {
+            let received = tokio::select! {
+                _ = bridge_cancel.cancelled() => break,
+                r = node_rx.recv() => r,
+            };
+            match received {
                 Ok(event) => {
                     let (evt_type, detail) = event_summary(&event);
                     if let Ok(mut log) = bridge_log.lock() {
@@ -156,10 +206,14 @@ pub async fn start_server(
     // Spawn periodic NetworkEvent broadcast (every 5 seconds)
     let net_tx = state.event_tx.clone();
     let net_node = node.clone();
+    let net_cancel = shutdown.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = net_cancel.cancelled() => break,
+                _ = interval.tick() => {}
+            }
             let routing = net_node.routing.read().await;
             let now = Instant::now();
             let neighbor_count = routing
@@ -180,43 +234,32 @@ pub async fn start_server(
 
     let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port)
         .parse()
-        .expect("invalid API bind address");
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid API bind address {}:{}: {}",
+                    config.bind_address, config.port, e
+                ),
+            )
+        })?;
 
     let listener = bind_reuseaddr(addr).await?;
     info!("API server listening on {}", addr);
 
-    let handle = tokio::spawn(async move {
-        // First run with the already-bound listener
-        let app = build_router(state.clone());
-        match axum::serve(listener, app).await {
-            Ok(()) => warn!("API server exited cleanly (unexpected)"),
+    let serve_cancel = shutdown.clone();
+    let task = tokio::spawn(async move {
+        let app = build_router(state);
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move { serve_cancel.cancelled().await })
+            .await;
+        match result {
+            Ok(()) => debug!("API server on {} stopped", addr),
             Err(e) => tracing::error!("API server error: {}", e),
         }
-
-        // Auto-restart loop with SO_REUSEADDR for reliable rebinding
-        for restart in 1..=30u32 {
-            warn!("API server restart #{} on {}", restart, addr);
-            tokio::time::sleep(Duration::from_millis(500)).await;
-
-            let new_listener = match bind_reuseaddr(addr).await {
-                Ok(l) => l,
-                Err(e) => {
-                    tracing::error!("API server rebind failed: {}", e);
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    continue;
-                }
-            };
-            let new_app = build_router(state.clone());
-            info!("API server restarted on {}", addr);
-            match axum::serve(new_listener, new_app).await {
-                Ok(()) => warn!("API server exited cleanly on restart #{}", restart),
-                Err(e) => tracing::error!("API server error on restart #{}: {}", restart, e),
-            }
-        }
-        tracing::error!("API server giving up after 30 restarts");
     });
 
-    Ok(handle)
+    Ok(ApiServerHandle { task, shutdown })
 }
 
 /// Produce a short (event_type, detail) pair for the event log ring buffer.

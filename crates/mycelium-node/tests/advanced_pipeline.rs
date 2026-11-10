@@ -161,13 +161,17 @@ async fn test_beacon_creates_contacts() {
     let alice_node_id = alice_identity.node_id();
     let bob_node_id = bob_identity.node_id();
 
-    let mut alice_config = NodeConfig::default();
-    alice_config.display_name = "Alice".to_string();
-    alice_config.beacon_interval_secs = 1;
+    let alice_config = NodeConfig {
+        display_name: "Alice".to_string(),
+        beacon_interval_secs: 1,
+        ..Default::default()
+    };
 
-    let mut bob_config = NodeConfig::default();
-    bob_config.display_name = "Bob".to_string();
-    bob_config.beacon_interval_secs = 1;
+    let bob_config = NodeConfig {
+        display_name: "Bob".to_string(),
+        beacon_interval_secs: 1,
+        ..Default::default()
+    };
 
     let alice_db = Database::open_in_memory().unwrap();
     let bob_db = Database::open_in_memory().unwrap();

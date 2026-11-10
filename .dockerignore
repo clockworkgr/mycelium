@@ -1,0 +1,13 @@
+# Keep the Docker build context small: only sources needed for `cargo build`.
+target/
+openwrt-bin/
+android-libs/
+ios-libs/
+flutter/
+android/
+docs/
+testbed/
+.git/
+.claude/
+.cargo/
+*.md

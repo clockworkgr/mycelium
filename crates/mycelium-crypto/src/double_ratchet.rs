@@ -17,7 +17,12 @@ pub struct RatchetHeader {
     pub message_number: u32,
 }
 
+/// Upper bound on skipped message keys retained across all chains. Bounds
+/// memory even if a peer legitimately drops many messages.
+const MAX_SKIPPED_KEYS_TOTAL: usize = 2000;
+
 /// The Double Ratchet state machine.
+#[derive(Clone)]
 pub struct RatchetState {
     /// Our current DH ratchet key pair.
     dh_secret: X25519Secret,
@@ -120,7 +125,24 @@ impl RatchetState {
     }
 
     /// Decrypt a received message.
+    ///
+    /// State changes (DH ratchet step, chain advance, skipped-key bookkeeping)
+    /// are committed only if the ciphertext authenticates. The header travels
+    /// in cleartext, so a relay could otherwise desynchronize the session by
+    /// flipping a bit in it.
     pub fn decrypt(
+        &mut self,
+        header: &RatchetHeader,
+        ciphertext: &[u8],
+        ad: &[u8],
+    ) -> Result<Vec<u8>, RatchetError> {
+        let mut candidate = self.clone();
+        let plaintext = candidate.decrypt_in_place(header, ciphertext, ad)?;
+        *self = candidate;
+        Ok(plaintext)
+    }
+
+    fn decrypt_in_place(
         &mut self,
         header: &RatchetHeader,
         ciphertext: &[u8],
@@ -191,7 +213,11 @@ impl RatchetState {
     /// Skip message keys for out-of-order decryption.
     fn skip_message_keys(&mut self, until: u32) -> Result<(), RatchetError> {
         if let Some(chain_key) = &self.chain_key_recv {
-            if until > self.recv_count + self.max_skip {
+            if until > self.recv_count.saturating_add(self.max_skip) {
+                return Err(RatchetError::TooManySkippedKeys);
+            }
+            let to_skip = until.saturating_sub(self.recv_count) as usize;
+            if self.skipped_keys.len().saturating_add(to_skip) > MAX_SKIPPED_KEYS_TOTAL {
                 return Err(RatchetError::TooManySkippedKeys);
             }
 
@@ -613,6 +639,37 @@ mod tests {
 
         let pt2 = bob.decrypt(&h2, &c2, ad).unwrap();
         assert_eq!(pt2, b"msg2");
+    }
+
+    /// A message whose cleartext header was tampered with in transit must
+    /// fail without corrupting the session: the untampered copy and all
+    /// later traffic in both directions must still decrypt.
+    #[test]
+    fn test_ratchet_tampered_header_does_not_corrupt_state() {
+        let shared_secret = [42u8; 32];
+        let bob_spk_secret = X25519Secret::random_from_rng(rand::rngs::OsRng);
+        let bob_spk_public = X25519Public::from(&bob_spk_secret);
+        let mut alice = RatchetState::init_alice(shared_secret, *bob_spk_public.as_bytes());
+        let mut bob = RatchetState::init_bob(shared_secret, bob_spk_secret);
+        let ad = b"ad";
+
+        let (h1, c1) = alice.encrypt(b"one", ad).unwrap();
+        assert_eq!(bob.decrypt(&h1, &c1, ad).unwrap(), b"one");
+
+        let (h2, c2) = alice.encrypt(b"two", ad).unwrap();
+        let mut forged = h2.clone();
+        forged.dh_public[0] ^= 0x01; // looks like a new DH ratchet key
+        assert!(bob.decrypt(&forged, &c2, ad).is_err());
+
+        // Forged message_number far ahead with garbage ciphertext: no keys retained.
+        let mut jump = h2.clone();
+        jump.message_number += 500;
+        assert!(bob.decrypt(&jump, b"garbage", ad).is_err());
+        assert!(bob.skipped_keys.is_empty());
+
+        assert_eq!(bob.decrypt(&h2, &c2, ad).unwrap(), b"two");
+        let (h3, c3) = bob.encrypt(b"three", ad).unwrap();
+        assert_eq!(alice.decrypt(&h3, &c3, ad).unwrap(), b"three");
     }
 
     #[test]

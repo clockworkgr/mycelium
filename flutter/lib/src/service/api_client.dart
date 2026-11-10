@@ -7,7 +7,12 @@ import 'package:http/http.dart' as http;
 /// The daemon (Rust) runs the API server on localhost:9735.
 class ApiClient {
   static const _baseUrl = 'http://127.0.0.1:9735';
-  final http.Client _client = http.Client();
+
+  /// Bearer token the API server requires. Read from `<dataDir>/api.token`
+  /// by [MyceliumService] before the first request.
+  static String? authToken;
+
+  final http.Client _client = _AuthClient(http.Client());
 
   // --- Node ---
 
@@ -22,13 +27,14 @@ class ApiClient {
     return _decode(response);
   }
 
-  /// Check if the API server is reachable.
+  /// Check if the API server is reachable. A 401 still means a server is
+  /// listening (we may not have loaded its token yet).
   Future<bool> isAvailable() async {
     try {
       final response = await _client
           .get(Uri.parse('$_baseUrl/v1/node/status'))
           .timeout(const Duration(seconds: 2));
-      return response.statusCode == 200;
+      return response.statusCode == 200 || response.statusCode == 401;
     } catch (_) {
       return false;
     }
@@ -349,4 +355,23 @@ class ApiException implements Exception {
 
   @override
   String toString() => 'ApiException: $message';
+}
+
+/// Adds the `Authorization: Bearer` header to every request.
+class _AuthClient extends http.BaseClient {
+  final http.Client _inner;
+
+  _AuthClient(this._inner);
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    final token = ApiClient.authToken;
+    if (token != null && token.isNotEmpty) {
+      request.headers['Authorization'] = 'Bearer $token';
+    }
+    return _inner.send(request);
+  }
+
+  @override
+  void close() => _inner.close();
 }

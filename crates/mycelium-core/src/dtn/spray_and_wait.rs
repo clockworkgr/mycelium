@@ -100,6 +100,11 @@ impl DtnEngine {
         source: NodeId,
         payload: Vec<u8>,
     ) -> Result<(), DtnError> {
+        // Storing the same message twice must not double-count its size.
+        if self.bundles.contains_key(&message_id) {
+            return Ok(());
+        }
+
         let size = payload.len();
 
         // Check per-identity quota
@@ -249,6 +254,10 @@ impl DtnEngine {
             self.total_stored_bytes = self.total_stored_bytes.saturating_sub(bundle.size);
             if let Some(used) = self.per_source_bytes.get_mut(&bundle.source) {
                 *used = used.saturating_sub(bundle.size);
+                if *used == 0 {
+                    // Do not keep an entry per source ever seen.
+                    self.per_source_bytes.remove(&bundle.source);
+                }
             }
             self.sprayed_to.remove(message_id);
         }
@@ -348,6 +357,23 @@ mod tests {
         let bundle = engine.get_bundle(&msg_id).unwrap();
         assert_eq!(bundle.destination, node(2));
         assert_eq!(bundle.copies_remaining, 8);
+    }
+
+    #[test]
+    fn test_store_outgoing_twice_does_not_double_count() {
+        let mut engine = DtnEngine::new(DtnConfig::default());
+        let msg_id = MessageId::random();
+        engine
+            .store_outgoing(msg_id, node(2), node(1), vec![0u8; 100])
+            .unwrap();
+        engine
+            .store_outgoing(msg_id, node(2), node(1), vec![0u8; 100])
+            .unwrap();
+        assert_eq!(engine.bundle_count(), 1);
+        assert_eq!(engine.storage_used(), 100);
+        engine.remove_bundle(&msg_id);
+        assert_eq!(engine.storage_used(), 0);
+        assert!(engine.per_source_bytes.is_empty());
     }
 
     #[test]

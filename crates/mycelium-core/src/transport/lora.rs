@@ -10,6 +10,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
@@ -278,6 +279,141 @@ impl AdaptiveDataRate {
     }
 }
 
+/// Length of the duty-cycle accounting window.
+const DUTY_CYCLE_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Maximum packets queued in the outbox while the platform is not polling.
+const MAX_OUTBOX: usize = 256;
+
+/// Fragment header on every LoRa frame: sender tag (u16 LE, random per
+/// transport instance so two radios' fragment ids do not collide), fragment
+/// id (u16 LE), index (u8), count (u8). A 106-byte Mycelium envelope never
+/// fits the 51-byte MTU of SF10-12, so every message is split into frames the
+/// radio can carry.
+const FRAG_HEADER: usize = 6;
+
+/// A LoRa peer that has been silent this long is reported lost. The radio is
+/// a broadcast medium with no link-layer sessions, so presence is inferred
+/// from traffic (beacons every 30 s by default).
+pub const LORA_PEER_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Largest reassembled message the transport accepts.
+pub const LORA_MAX_MESSAGE: usize = 2048;
+
+/// Concurrent reassemblies kept per transport, and how long an incomplete one
+/// waits for its missing fragments before being discarded.
+const MAX_REASSEMBLIES: usize = 64;
+const REASSEMBLY_TTL: Duration = Duration::from_secs(120);
+
+/// Fragments of one message received so far.
+struct Reassembly {
+    parts: Vec<Option<Vec<u8>>>,
+    received: usize,
+    started: Instant,
+}
+
+/// Split `data` into frames of at most `frame_mtu` bytes, each prefixed with
+/// the fragment header.
+pub fn fragment(
+    data: &[u8],
+    frame_mtu: usize,
+    sender_tag: u16,
+    id: u16,
+) -> Result<Vec<Vec<u8>>, TransportError> {
+    if frame_mtu <= FRAG_HEADER {
+        return Err(TransportError::ExceedsMtu {
+            size: data.len(),
+            mtu: 0,
+        });
+    }
+    let chunk = frame_mtu - FRAG_HEADER;
+    let count = data.len().div_ceil(chunk).max(1);
+    if count > u8::MAX as usize {
+        return Err(TransportError::ExceedsMtu {
+            size: data.len(),
+            mtu: chunk * u8::MAX as usize,
+        });
+    }
+    let mut frames = Vec::with_capacity(count);
+    for (index, piece) in data.chunks(chunk).enumerate() {
+        let mut frame = Vec::with_capacity(FRAG_HEADER + piece.len());
+        frame.extend_from_slice(&sender_tag.to_le_bytes());
+        frame.extend_from_slice(&id.to_le_bytes());
+        frame.push(index as u8);
+        frame.push(count as u8);
+        frame.extend_from_slice(piece);
+        frames.push(frame);
+    }
+    if frames.is_empty() {
+        // Empty message still needs one frame so the peer sees it.
+        let mut frame = Vec::with_capacity(FRAG_HEADER);
+        frame.extend_from_slice(&sender_tag.to_le_bytes());
+        frame.extend_from_slice(&id.to_le_bytes());
+        frame.push(0);
+        frame.push(1);
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
+/// Parse a fragment header. Returns (sender_tag, id, index, count, payload).
+fn parse_fragment(frame: &[u8]) -> Option<(u16, u16, u8, u8, &[u8])> {
+    if frame.len() < FRAG_HEADER {
+        return None;
+    }
+    let tag = u16::from_le_bytes([frame[0], frame[1]]);
+    let id = u16::from_le_bytes([frame[2], frame[3]]);
+    let index = frame[4];
+    let count = frame[5];
+    if count == 0 || index >= count {
+        return None;
+    }
+    Some((tag, id, index, count, &frame[FRAG_HEADER..]))
+}
+
+/// The source NodeId of a reassembled message: every Mycelium envelope
+/// starts with the 32-byte source id. Returns `None` for shorter data.
+fn source_from_message(message: &[u8]) -> Option<NodeId> {
+    if message.len() < 32 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&message[..32]);
+    Some(NodeId::from_bytes(id))
+}
+
+/// Airtime accounting that resets every [`DUTY_CYCLE_WINDOW`].
+struct DutyCycleWindow {
+    window_start: Instant,
+    airtime_ms: u64,
+}
+
+impl DutyCycleWindow {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            airtime_ms: 0,
+        }
+    }
+
+    fn roll(&mut self) {
+        if self.window_start.elapsed() >= DUTY_CYCLE_WINDOW {
+            self.window_start = Instant::now();
+            self.airtime_ms = 0;
+        }
+    }
+
+    fn used_ms(&mut self) -> u64 {
+        self.roll();
+        self.airtime_ms
+    }
+
+    fn charge(&mut self, airtime_ms: u64) {
+        self.roll();
+        self.airtime_ms = self.airtime_ms.saturating_add(airtime_ms);
+    }
+}
+
 // --- LoRa Transport ---
 
 /// LoRa transport for long-range mesh communication.
@@ -295,10 +431,18 @@ pub struct LoraTransport {
     /// Outbox queue for outgoing data. Platform polls via FFI.
     #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
-    /// Duty cycle tracking: total airtime used in current window (ms).
-    duty_airtime_ms: Arc<Mutex<u64>>,
+    /// Duty cycle tracking for the current one-hour window.
+    duty_cycle: Arc<Mutex<DutyCycleWindow>>,
     /// Adaptive data rate state per peer.
     adr: Arc<Mutex<AdaptiveDataRate>>,
+    /// Next outgoing fragment id.
+    next_frag_id: Arc<Mutex<u16>>,
+    /// Random tag identifying this radio's fragments to receivers.
+    sender_tag: u16,
+    /// In-progress reassemblies keyed by (sender tag, fragment id).
+    reassembly: Arc<Mutex<HashMap<(u16, u16), Reassembly>>>,
+    /// When each peer was last heard from (for silent-peer expiry).
+    last_seen: Arc<Mutex<HashMap<NodeId, Instant>>>,
 }
 
 impl LoraTransport {
@@ -311,9 +455,104 @@ impl LoraTransport {
             connected_peers: Arc::new(RwLock::new(Vec::new())),
             started: Arc::new(RwLock::new(false)),
             outbox: Arc::new(Mutex::new(VecDeque::new())),
-            duty_airtime_ms: Arc::new(Mutex::new(0)),
+            duty_cycle: Arc::new(Mutex::new(DutyCycleWindow::new())),
             adr: Arc::new(Mutex::new(AdaptiveDataRate::new(initial_sf))),
+            next_frag_id: Arc::new(Mutex::new(0)),
+            sender_tag: rand::random(),
+            reassembly: Arc::new(Mutex::new(HashMap::new())),
+            last_seen: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Report peers that have been silent longer than [`LORA_PEER_TIMEOUT`]
+    /// as lost. Called on every received frame; the platform may also call
+    /// `on_peer_lost` directly.
+    async fn expire_silent_peers(&self) {
+        let now = Instant::now();
+        let expired: Vec<NodeId> = match self.last_seen.lock() {
+            Ok(mut seen) => {
+                let gone: Vec<NodeId> = seen
+                    .iter()
+                    .filter(|(_, t)| now.duration_since(**t) > LORA_PEER_TIMEOUT)
+                    .map(|(p, _)| *p)
+                    .collect();
+                for p in &gone {
+                    seen.remove(p);
+                }
+                gone
+            }
+            Err(_) => Vec::new(),
+        };
+        for peer in expired {
+            info!("LoRa peer {} silent for too long, marking lost", peer);
+            self.on_peer_lost(peer).await;
+        }
+    }
+
+    /// Record traffic from `peer`, announcing it as a neighbour on first
+    /// contact. LoRa has no link-layer discovery: hearing a node is
+    /// discovering it.
+    async fn note_peer_heard(&self, peer: NodeId) {
+        if let Ok(mut seen) = self.last_seen.lock() {
+            seen.insert(peer, Instant::now());
+        }
+        self.on_peer_discovered(peer).await;
+    }
+
+    /// Number of incomplete reassemblies currently held.
+    pub fn pending_reassemblies(&self) -> usize {
+        self.reassembly.lock().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// Feed one received frame into reassembly. Returns the complete message
+    /// once every fragment has arrived.
+    fn reassemble(&self, frame: &[u8]) -> Option<Vec<u8>> {
+        let (tag, id, index, count, payload) = match parse_fragment(frame) {
+            Some(f) => f,
+            None => {
+                debug!("LoRa: dropping malformed frame");
+                return None;
+            }
+        };
+        if count == 1 {
+            return Some(payload.to_vec());
+        }
+
+        let mut map = self.reassembly.lock().ok()?;
+        let now = Instant::now();
+        map.retain(|_, r| now.duration_since(r.started) < REASSEMBLY_TTL);
+        let key = (tag, id);
+        if !map.contains_key(&key) && map.len() >= MAX_REASSEMBLIES {
+            // Evict the oldest incomplete message rather than grow unbounded.
+            if let Some(oldest) = map.iter().min_by_key(|(_, r)| r.started).map(|(k, _)| *k) {
+                map.remove(&oldest);
+            }
+        }
+        let entry = map.entry(key).or_insert_with(|| Reassembly {
+            parts: vec![None; count as usize],
+            received: 0,
+            started: now,
+        });
+        if entry.parts.len() != count as usize {
+            // Fragment id reused with a different count: start over.
+            entry.parts = vec![None; count as usize];
+            entry.received = 0;
+            entry.started = now;
+        }
+        let slot = &mut entry.parts[index as usize];
+        if slot.is_none() {
+            *slot = Some(payload.to_vec());
+            entry.received += 1;
+        }
+        if entry.received < count as usize {
+            return None;
+        }
+        let done = map.remove(&key)?;
+        let mut out = Vec::new();
+        for part in done.parts.into_iter().flatten() {
+            out.extend_from_slice(&part);
+        }
+        Some(out)
     }
 
     /// Number of packets waiting in the outbox.
@@ -354,11 +593,36 @@ impl LoraTransport {
     }
 
     /// Called by platform when data arrives from a LoRa peer.
-    pub async fn on_data_received(&self, peer: NodeId, data: Vec<u8>) {
-        debug!("LoRa data received: {} bytes from {}", data.len(), peer);
+    /// Called by the platform for every frame the radio receives. The radio
+    /// has no link-layer address, so the platform passes `NodeId::ZERO` and
+    /// the peer is taken from the reassembled envelope's source field; a
+    /// non-zero hint (e.g. from a bridge that knows the sender) is honoured.
+    pub async fn on_data_received(&self, peer_hint: NodeId, data: Vec<u8>) {
+        debug!("LoRa frame received: {} bytes", data.len());
+        self.expire_silent_peers().await;
+        let Some(message) = self.reassemble(&data) else {
+            return;
+        };
+        let peer = if peer_hint != NodeId::ZERO {
+            peer_hint
+        } else {
+            match source_from_message(&message) {
+                Some(src) if src != NodeId::ZERO => src,
+                _ => {
+                    debug!("LoRa: reassembled message carries no source id, dropping");
+                    return;
+                }
+            }
+        };
+        self.note_peer_heard(peer).await;
+        debug!(
+            "LoRa message reassembled: {} bytes from {}",
+            message.len(),
+            peer
+        );
         let _ = self.tx.send(TransportEvent::DataReceived {
             peer,
-            data,
+            data: message,
             transport: TransportType::Lora,
         });
     }
@@ -405,16 +669,22 @@ impl LoraTransport {
         ADR_DISCOVERY_SF
     }
 
-    /// Check if sending would exceed duty cycle limit.
-    fn check_duty_cycle(&self, payload_bytes: usize) -> bool {
+    /// Check if `airtime_ms` more airtime would exceed the duty cycle limit
+    /// for the current one-hour window (regulatory limits such as EU 1% are
+    /// per hour).
+    fn check_duty_cycle_airtime(&self, airtime_ms: u64) -> bool {
         if self.config.duty_cycle_limit >= 1.0 {
             return true; // No limit
         }
-        let airtime = self.config.airtime_ms(payload_bytes);
-        let used = self.duty_airtime_ms.lock().map(|v| *v).unwrap_or(0);
-        // Allow if total airtime is under limit (per 1-hour window = 3_600_000ms)
-        let max_airtime = (3_600_000.0 * self.config.duty_cycle_limit as f64) as u64;
-        used + airtime <= max_airtime
+        let used = self.duty_cycle.lock().map(|mut w| w.used_ms()).unwrap_or(0);
+        let max_airtime =
+            (DUTY_CYCLE_WINDOW.as_millis() as f64 * self.config.duty_cycle_limit as f64) as u64;
+        used + airtime_ms <= max_airtime
+    }
+
+    /// Airtime charged so far in the current duty-cycle window (ms).
+    pub fn duty_cycle_used_ms(&self) -> u64 {
+        self.duty_cycle.lock().map(|mut w| w.used_ms()).unwrap_or(0)
     }
 
     /// Get the current spreading factor from config.
@@ -467,45 +737,74 @@ impl Transport for LoraTransport {
             return Err(TransportError::NotStarted);
         }
 
-        // Use ADR-adjusted SF for MTU check
-        let peer_sf = self.effective_sf(peer);
-        let peer_mtu = LoraConfig::max_payload_for_sf(peer_sf);
-        if data.len() > peer_mtu {
+        // Unknown peers must fail so TransportManager's fallback does not
+        // report success for an unreachable node. `NodeId::ZERO` is the
+        // radio broadcast (see `supports_broadcast`).
+        let is_broadcast = *peer == NodeId::ZERO;
+        if !is_broadcast && !self.connected_peers.read().await.contains(peer) {
+            return Err(TransportError::PeerNotConnected(*peer));
+        }
+
+        if data.len() > LORA_MAX_MESSAGE {
             return Err(TransportError::ExceedsMtu {
                 size: data.len(),
-                mtu: peer_mtu,
+                mtu: LORA_MAX_MESSAGE,
             });
         }
 
-        if !self.check_duty_cycle(data.len()) {
+        // Split into radio frames sized for the peer's ADR-adjusted SF
+        // (broadcasts use the discovery SF so every radio can decode them).
+        let peer_sf = if is_broadcast {
+            self.config.spreading_factor.max(ADR_DISCOVERY_SF.min(12))
+        } else {
+            self.effective_sf(peer)
+        };
+        let frame_mtu = LoraConfig::max_payload_for_sf(peer_sf);
+        let frag_id = {
+            let mut next = self
+                .next_frag_id
+                .lock()
+                .map_err(|_| TransportError::Other("fragment id lock".into()))?;
+            let id = *next;
+            *next = next.wrapping_add(1);
+            id
+        };
+        let frames = fragment(data, frame_mtu, self.sender_tag, frag_id)?;
+
+        // Duty cycle: charge the airtime of every frame, not the payload.
+        let airtime: u64 = frames
+            .iter()
+            .map(|f| self.config.airtime_ms_for_sf(f.len(), peer_sf))
+            .sum();
+        if !self.check_duty_cycle_airtime(airtime) {
             warn!("LoRa duty cycle limit reached, dropping send");
             return Err(TransportError::SendFailed(
                 "duty cycle limit exceeded".to_string(),
             ));
         }
-
-        debug!(
-            "LoRa send: {} bytes to {} (SF{})",
-            data.len(),
-            peer,
-            peer_sf
-        );
-
-        // Track airtime using the peer's effective SF
-        let airtime = self.config.airtime_ms_for_sf(data.len(), peer_sf);
-        if let Ok(mut used) = self.duty_airtime_ms.lock() {
-            *used += airtime;
+        if let Ok(mut window) = self.duty_cycle.lock() {
+            window.charge(airtime);
         }
 
-        // Queue for platform polling
+        debug!(
+            "LoRa send: {} bytes to {} as {} frame(s) (SF{}, ~{}ms airtime)",
+            data.len(),
+            peer,
+            frames.len(),
+            peer_sf,
+            airtime
+        );
+
+        // Queue frames for platform polling
         if let Ok(mut outbox) = self.outbox.lock() {
-            outbox.push_back((*peer, data.to_vec()));
-            debug!(
-                "LoRa outbox: queued, depth now {}, airtime ~{}ms (SF{})",
-                outbox.len(),
-                airtime,
-                peer_sf
-            );
+            for frame in frames {
+                if outbox.len() >= MAX_OUTBOX {
+                    warn!("LoRa outbox full ({}), dropping oldest packet", MAX_OUTBOX);
+                    outbox.pop_front();
+                }
+                outbox.push_back((*peer, frame));
+            }
+            debug!("LoRa outbox depth now {}", outbox.len());
         }
 
         Ok(())
@@ -547,7 +846,13 @@ impl Transport for LoraTransport {
     }
 
     fn mtu(&self) -> usize {
-        self.config.max_payload()
+        // Messages are fragmented into radio frames, so the transport-level
+        // MTU is the largest reassembled message, not one frame.
+        LORA_MAX_MESSAGE
+    }
+
+    fn supports_broadcast(&self) -> bool {
+        true
     }
 }
 
@@ -601,18 +906,169 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_lora_send_mtu_check() {
+    async fn test_lora_send_fragments_and_reassembles() {
+        let sender = LoraTransport::new(LoraConfig::default());
+        sender.start().await.unwrap();
+        let peer = NodeId([0xAA; 32]);
+        sender.on_peer_discovered(peer).await;
+
+        // A message looks like an envelope: it starts with the 32-byte source.
+        // 110 bytes at SF10 (51-byte frames, 45 payload each) → 3 frames.
+        let src = NodeId([0xBB; 32]);
+        let mut message: Vec<u8> = src.as_bytes().to_vec();
+        message.extend((0..78u8).collect::<Vec<u8>>());
+        sender.send(&peer, &message).await.unwrap();
+        assert_eq!(sender.outbox_len(), 3);
+        let mut frames = Vec::new();
+        while let Some((to, frame)) = sender.dequeue_send() {
+            assert_eq!(to, peer);
+            assert!(frame.len() <= LoraConfig::max_payload_for_sf(10));
+            frames.push(frame);
+        }
+
+        // Receiver reassembles them even when they arrive out of order and
+        // learns the peer from the envelope source (platform passes ZERO).
+        let receiver = LoraTransport::new(LoraConfig::default());
+        let mut events = receiver.events();
+        receiver
+            .on_data_received(NodeId::ZERO, frames[2].clone())
+            .await;
+        receiver
+            .on_data_received(NodeId::ZERO, frames[0].clone())
+            .await;
+        assert_eq!(receiver.pending_reassemblies(), 1);
+        assert!(
+            events.try_recv().is_err(),
+            "incomplete message must not be delivered"
+        );
+        receiver
+            .on_data_received(NodeId::ZERO, frames[1].clone())
+            .await;
+        match events.try_recv() {
+            Ok(TransportEvent::NeighborDiscovered { peer: p, .. }) => assert_eq!(p, src),
+            other => panic!("expected NeighborDiscovered first, got {:?}", other),
+        }
+        match events.try_recv() {
+            Ok(TransportEvent::DataReceived { peer: p, data, .. }) => {
+                assert_eq!(p, src);
+                assert_eq!(data, message);
+            }
+            other => panic!("expected reassembled DataReceived, got {:?}", other),
+        }
+        assert_eq!(receiver.pending_reassemblies(), 0);
+        assert!(receiver.connected_peers().contains(&src));
+
+        // A late duplicate of a consumed fragment just opens a new partial.
+        receiver
+            .on_data_received(NodeId::ZERO, frames[1].clone())
+            .await;
+        assert_eq!(receiver.pending_reassemblies(), 1);
+    }
+
+    /// Beacons must go out before any peer is known: ZERO is the radio
+    /// broadcast address.
+    #[tokio::test]
+    async fn test_lora_broadcast_without_peers() {
         let transport = LoraTransport::new(LoraConfig::default());
         transport.start().await.unwrap();
-        transport.on_peer_discovered(NodeId([0xAA; 32])).await;
+        assert!(transport.supports_broadcast());
+        let msg = [0x11u8; 60];
+        transport.send(&NodeId::ZERO, &msg).await.unwrap();
+        assert!(transport.outbox_len() >= 2);
+        let (to, _) = transport.dequeue_send().unwrap();
+        assert_eq!(to, NodeId::ZERO);
+    }
 
-        // MTU for SF10 is 51 bytes
-        let result = transport.send(&NodeId([0xAA; 32]), &[0u8; 100]).await;
-        assert!(result.is_err());
+    /// A peer that stops transmitting is reported lost.
+    #[tokio::test]
+    async fn test_lora_silent_peer_expires() {
+        let transport = LoraTransport::new(LoraConfig::default());
+        let mut events = transport.events();
+        let src = NodeId([0xCC; 32]);
+        let mut message: Vec<u8> = src.as_bytes().to_vec();
+        message.push(1);
+        let frame = fragment(&message, 51, 7, 1).unwrap().remove(0);
+        transport
+            .on_data_received(NodeId::ZERO, frame.clone())
+            .await;
         assert!(matches!(
-            result.unwrap_err(),
-            TransportError::ExceedsMtu { .. }
+            events.try_recv(),
+            Ok(TransportEvent::NeighborDiscovered { .. })
         ));
+        let _ = events.try_recv(); // DataReceived
+
+        // Age the peer past the timeout, then any received frame prunes it.
+        if let Ok(mut seen) = transport.last_seen.lock() {
+            seen.insert(
+                src,
+                Instant::now() - LORA_PEER_TIMEOUT - Duration::from_secs(1),
+            );
+        }
+        let other = NodeId([0xDD; 32]);
+        let mut m2: Vec<u8> = other.as_bytes().to_vec();
+        m2.push(2);
+        let f2 = fragment(&m2, 51, 8, 1).unwrap().remove(0);
+        transport.on_data_received(NodeId::ZERO, f2).await;
+        match events.try_recv() {
+            Ok(TransportEvent::NeighborLost { peer, .. }) => assert_eq!(peer, src),
+            other => panic!("expected NeighborLost, got {:?}", other),
+        }
+        assert!(!transport.connected_peers().contains(&src));
+    }
+
+    #[tokio::test]
+    async fn test_lora_send_exceeds_max_message() {
+        let transport = LoraTransport::new(LoraConfig::default());
+        transport.start().await.unwrap();
+        let peer = NodeId([0xAA; 32]);
+        transport.on_peer_discovered(peer).await;
+        let result = transport.send(&peer, &[0u8; LORA_MAX_MESSAGE + 1]).await;
+        assert!(matches!(result, Err(TransportError::ExceedsMtu { .. })));
+        assert_eq!(transport.outbox_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_lora_reassembly_rejects_garbage() {
+        let transport = LoraTransport::new(LoraConfig::default());
+        let mut events = transport.events();
+        let src = NodeId([0xBB; 32]);
+        transport.on_data_received(src, vec![1, 2]).await; // too short
+        transport
+            .on_data_received(src, vec![0, 0, 0, 0, 5, 3, 9])
+            .await; // index >= count
+        transport
+            .on_data_received(src, vec![0, 0, 0, 0, 0, 0, 9])
+            .await; // count 0
+                    // Complete single frame but too short to carry a source id, no hint
+        transport
+            .on_data_received(NodeId::ZERO, vec![0, 0, 7, 0, 0, 1, 42, 43])
+            .await;
+        assert!(events.try_recv().is_err());
+        assert_eq!(transport.pending_reassemblies(), 0);
+
+        // Single-frame message with a peer hint is delivered directly.
+        transport
+            .on_data_received(src, vec![0, 0, 7, 0, 0, 1, 42, 43])
+            .await;
+        let _ = events.try_recv(); // NeighborDiscovered(src)
+        match events.try_recv() {
+            Ok(TransportEvent::DataReceived { data, .. }) => assert_eq!(data, vec![42, 43]),
+            other => panic!("expected DataReceived, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_fragment_bounds() {
+        let frames = fragment(&[0u8; 45], 51, 3, 1).unwrap();
+        assert_eq!(frames.len(), 1);
+        let frames = fragment(&[0u8; 46], 51, 3, 1).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(fragment(&[0u8; 45 * 256], 51, 3, 1).is_err());
+        assert!(fragment(&[0u8; 10], 6, 3, 1).is_err());
+        let empty = fragment(&[], 51, 3, 9).unwrap();
+        assert_eq!(empty.len(), 1);
+        let (tag, id, index, count, payload) = parse_fragment(&empty[0]).unwrap();
+        assert_eq!((tag, id, index, count, payload.len()), (3, 9, 0, 1, 0));
     }
 
     #[test]
@@ -621,22 +1077,39 @@ mod tests {
         config.spreading_factor = 12; // Very long airtime per packet
         let transport = LoraTransport::new(config);
 
+        let airtime = |bytes: usize| transport.config.airtime_ms(bytes);
         // Initially should be allowed
-        assert!(transport.check_duty_cycle(50));
+        assert!(transport.check_duty_cycle_airtime(airtime(50)));
 
         // Simulate heavy usage by setting high airtime
-        if let Ok(mut used) = transport.duty_airtime_ms.lock() {
-            *used = 35_000; // 35 seconds out of 36 allowed (1% of 3600s)
+        if let Ok(mut w) = transport.duty_cycle.lock() {
+            w.airtime_ms = 35_000; // 35 seconds out of 36 allowed (1% of 3600s)
         }
         // Should still pass for small packet
-        assert!(transport.check_duty_cycle(10));
+        assert!(transport.check_duty_cycle_airtime(airtime(10)));
 
         // Set to near limit
-        if let Ok(mut used) = transport.duty_airtime_ms.lock() {
-            *used = 36_000; // At the limit
+        if let Ok(mut w) = transport.duty_cycle.lock() {
+            w.airtime_ms = 36_000; // At the limit
         }
         // Large packet should fail
-        assert!(!transport.check_duty_cycle(50));
+        assert!(!transport.check_duty_cycle_airtime(airtime(50)));
+
+        // Once the hour window has elapsed the budget is available again.
+        if let Ok(mut w) = transport.duty_cycle.lock() {
+            w.window_start = Instant::now() - DUTY_CYCLE_WINDOW - Duration::from_secs(1);
+        }
+        assert!(transport.check_duty_cycle_airtime(airtime(50)));
+        assert_eq!(transport.duty_cycle_used_ms(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_lora_send_unknown_peer_fails() {
+        let transport = LoraTransport::new(LoraConfig::default());
+        transport.start().await.unwrap();
+        let result = transport.send(&NodeId([0xCC; 32]), &[1, 2, 3]).await;
+        assert!(matches!(result, Err(TransportError::PeerNotConnected(_))));
+        assert_eq!(transport.outbox_len(), 0);
     }
 
     #[tokio::test]

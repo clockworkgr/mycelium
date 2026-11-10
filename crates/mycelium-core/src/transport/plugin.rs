@@ -120,9 +120,11 @@ mod tests {
 
     #[test]
     fn test_plugin_config() {
-        let mut config = PluginConfig::default();
-        config.name = "test-radio".to_string();
-        config.enabled = true;
+        let mut config = PluginConfig {
+            name: "test-radio".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
         config
             .settings
             .insert("frequency".to_string(), "915".to_string());

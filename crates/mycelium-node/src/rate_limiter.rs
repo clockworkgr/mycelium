@@ -84,6 +84,8 @@ pub struct RateLimiter {
     violations: HashMap<NodeId, u32>,
     /// Number of violations before auto-blacklist.
     blacklist_threshold: u32,
+    /// When the violation counters were last reset (they cover one hour).
+    violations_reset_at: Instant,
 }
 
 impl RateLimiter {
@@ -94,6 +96,7 @@ impl RateLimiter {
             blacklist_duration: Duration::from_secs(3600), // 1 hour
             violations: HashMap::new(),
             blacklist_threshold: 10, // Auto-blacklist after 10 violations per hour
+            violations_reset_at: Instant::now(),
         }
     }
 
@@ -169,12 +172,18 @@ impl RateLimiter {
             .unwrap_or(false)
     }
 
-    /// Clean up expired state.
+    /// Clean up expired state. Safe to call often: violation counters are
+    /// only reset once per hour so the "10 violations per hour" threshold is
+    /// meaningful regardless of the maintenance interval.
     pub fn cleanup(&mut self) {
         let now = Instant::now();
         self.blacklist.retain(|_, until| now < *until);
-        // Reset violation counters each cleanup cycle
-        self.violations.clear();
+        self.states
+            .retain(|_, s| s.window_start.elapsed() < Duration::from_secs(2 * 3600));
+        if self.violations_reset_at.elapsed() >= Duration::from_secs(3600) {
+            self.violations.clear();
+            self.violations_reset_at = now;
+        }
     }
 }
 
@@ -225,6 +234,23 @@ mod tests {
         assert!(rl.check_dtn_relay(&n, 3, 1_000_000)); // 1MB ok
         assert!(rl.check_dtn_relay(&n, 3, 1_000_000)); // 2MB total ok
         assert!(!rl.check_dtn_relay(&n, 3, 500_000)); // 2.5MB would exceed
+    }
+
+    #[test]
+    fn test_cleanup_keeps_violations_within_the_hour() {
+        let mut rl = RateLimiter::new();
+        let n = node(1);
+        for _ in 0..5 {
+            assert!(!rl.record_violation(&n));
+        }
+        rl.cleanup();
+        // Five more within the same hour must reach the threshold of ten.
+        let mut blacklisted = false;
+        for _ in 0..5 {
+            blacklisted |= rl.record_violation(&n);
+        }
+        assert!(blacklisted);
+        assert!(rl.is_blacklisted(&n));
     }
 
     #[test]

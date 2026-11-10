@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
@@ -23,6 +24,23 @@ pub struct TransportManager {
     event_tx: broadcast::Sender<TransportEvent>,
     /// Whether start() has been called (late-added transports need event forwarding)
     started: RwLock<bool>,
+    /// Cancels the event-forwarder tasks spawned since the last start().
+    forwarder_cancel: RwLock<CancellationToken>,
+}
+
+/// Static preference used to break ties between transports whose measured
+/// link quality is equal (which is the common case, since few transports
+/// report quality changes). Higher is better.
+fn static_priority(t: TransportType) -> u8 {
+    match t {
+        TransportType::WifiDirect => 6,
+        TransportType::WifiAware => 5,
+        TransportType::BtClassic => 4,
+        TransportType::InternetTunnel => 3,
+        TransportType::Ble => 2,
+        TransportType::Lora => 1,
+        TransportType::Mock => 0,
+    }
 }
 
 impl TransportManager {
@@ -33,6 +51,7 @@ impl TransportManager {
             peer_transports: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
             started: RwLock::new(false),
+            forwarder_cancel: RwLock::new(CancellationToken::new()),
         }
     }
 
@@ -41,10 +60,12 @@ impl TransportManager {
     pub async fn add_transport(&self, transport: Arc<dyn Transport>) {
         let already_started = *self.started.read().await;
         if already_started {
-            if let Err(e) = transport.start().await {
-                warn!("Failed to start late-added transport: {}", e);
+            match transport.start().await {
+                Ok(()) | Err(TransportError::AlreadyStarted) => {}
+                Err(e) => warn!("Failed to start late-added transport: {}", e),
             }
-            self.spawn_event_forwarder(&transport);
+            let cancel = self.forwarder_cancel.read().await.clone();
+            self.spawn_event_forwarder(&transport, cancel);
         }
         let mut transports = self.transports.write().await;
         transports.push(transport);
@@ -75,14 +96,27 @@ impl TransportManager {
     }
 
     /// Start all transports and begin forwarding events.
+    ///
+    /// Idempotent: a second call is a no-op, and transports that are already
+    /// running are left alone. Forwarders spawned here (and by later
+    /// `add_transport` calls) live until `stop()`.
     pub async fn start(&self) -> Result<(), TransportError> {
+        if *self.started.read().await {
+            return Ok(());
+        }
+        let cancel = CancellationToken::new();
+        *self.forwarder_cancel.write().await = cancel.clone();
+
         let transports = self.transports.read().await;
         for t in transports.iter() {
-            t.start().await?;
+            match t.start().await {
+                Ok(()) | Err(TransportError::AlreadyStarted) => {}
+                Err(e) => return Err(e),
+            }
         }
         // Spawn event forwarders for each transport
         for t in transports.iter() {
-            self.spawn_event_forwarder(t);
+            self.spawn_event_forwarder(t, cancel.clone());
         }
         *self.started.write().await = true;
         Ok(())
@@ -90,32 +124,55 @@ impl TransportManager {
 
     /// Spawn a task that forwards events from a transport into the unified
     /// event channel and updates per-peer transport tracking.
-    fn spawn_event_forwarder(&self, transport: &Arc<dyn Transport>) {
+    fn spawn_event_forwarder(&self, transport: &Arc<dyn Transport>, cancel: CancellationToken) {
         let mut rx = transport.events();
         let event_tx = self.event_tx.clone();
         let peer_transports = self.peer_transports.clone();
         let transport_type = transport.transport_type();
+        let transport = transport.clone();
 
         tokio::spawn(async move {
-            while let Ok(event) = rx.recv().await {
+            loop {
+                let event = tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    r = rx.recv() => match r {
+                        Ok(event) => event,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            // Never exit on lag: the transport would go
+                            // permanently deaf. Peers dropped here are
+                            // re-learned from later events.
+                            warn!("{} event forwarder lagged, dropped {} events", transport_type, n);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                };
                 match &event {
                     TransportEvent::NeighborDiscovered { peer, .. } => {
                         let mut pt = peer_transports.write().await;
-                        let info = PeerTransportInfo {
-                            transport_type,
-                            quality: LinkQuality {
+                        let infos = pt.entry(*peer).or_default();
+                        if !infos.iter().any(|i| i.transport_type == transport_type) {
+                            // Seed from the transport's own measurement when it
+                            // has one, so selection is not purely by arrival order.
+                            let quality = transport.link_quality(peer).unwrap_or(LinkQuality {
                                 rssi: None,
                                 throughput_bps: 1_000_000,
                                 packet_loss: 0.0,
                                 latency_ms: 50,
-                            },
-                        };
-                        pt.entry(*peer).or_default().push(info);
+                            });
+                            infos.push(PeerTransportInfo {
+                                transport_type,
+                                quality,
+                            });
+                        }
                     }
                     TransportEvent::NeighborLost { peer, transport } => {
                         let mut pt = peer_transports.write().await;
                         if let Some(infos) = pt.get_mut(peer) {
                             infos.retain(|i| i.transport_type != *transport);
+                            if infos.is_empty() {
+                                pt.remove(peer);
+                            }
                         }
                     }
                     TransportEvent::LinkQualityChanged {
@@ -139,13 +196,29 @@ impl TransportManager {
         });
     }
 
-    /// Stop all transports.
+    /// Stop all transports and their event forwarders.
+    ///
+    /// Every transport is asked to stop even if an earlier one fails; the
+    /// first real error is returned. `NotStarted` is not an error here.
     pub async fn stop(&self) -> Result<(), TransportError> {
+        self.forwarder_cancel.read().await.cancel();
+        let mut first_err = None;
         let transports = self.transports.read().await;
         for t in transports.iter() {
-            t.stop().await?;
+            match t.stop().await {
+                Ok(()) | Err(TransportError::NotStarted) => {}
+                Err(e) => {
+                    warn!("Failed to stop {} transport: {}", t.transport_type(), e);
+                    first_err.get_or_insert(e);
+                }
+            }
         }
-        Ok(())
+        *self.started.write().await = false;
+        self.peer_transports.write().await.clear();
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Send data to a peer, selecting the best available transport.
@@ -181,6 +254,22 @@ impl TransportManager {
         Err(TransportError::PeerNotConnected(*peer))
     }
 
+    /// Broadcast on every transport that supports it (see
+    /// [`Transport::supports_broadcast`]). Returns how many transports
+    /// accepted the data. Failures are logged, not returned: a broadcast is
+    /// best effort by nature.
+    pub async fn broadcast(&self, data: &[u8]) -> usize {
+        let transports = self.transports.read().await;
+        let mut accepted = 0;
+        for t in transports.iter().filter(|t| t.supports_broadcast()) {
+            match t.send(&NodeId::ZERO, data).await {
+                Ok(()) => accepted += 1,
+                Err(e) => debug!("Broadcast via {} failed: {}", t.transport_type(), e),
+            }
+        }
+        accepted
+    }
+
     /// Subscribe to unified transport events.
     pub fn events(&self) -> broadcast::Receiver<TransportEvent> {
         self.event_tx.subscribe()
@@ -197,6 +286,10 @@ impl TransportManager {
                         .score()
                         .partial_cmp(&b.quality.score())
                         .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            static_priority(a.transport_type)
+                                .cmp(&static_priority(b.transport_type))
+                        })
                 })
                 .map(|info| info.transport_type)
         })
@@ -212,5 +305,52 @@ impl TransportManager {
 impl Default for TransportManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::mock::{MockLinkConfig, MockNetwork, MockTransport};
+
+    async fn wait_until(manager: &TransportManager, predicate: impl Fn(&[NodeId]) -> bool) {
+        for _ in 0..100 {
+            if predicate(&manager.known_peers().await) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("condition not met in time");
+    }
+
+    #[tokio::test]
+    async fn test_known_peers_forget_lost_peers() {
+        let a = NodeId([1u8; 32]);
+        let b = NodeId([2u8; 32]);
+        let network = MockNetwork::new();
+        let ta = Arc::new(MockTransport::new(a, network.clone()).await);
+        let _tb = Arc::new(MockTransport::new(b, network.clone()).await);
+
+        let manager = TransportManager::new();
+        manager.add_transport(ta.clone()).await;
+        manager.start().await.unwrap();
+        // Idempotent restart must not fail or duplicate anything.
+        manager.start().await.unwrap();
+
+        network.add_link(a, b, MockLinkConfig::default()).await;
+        wait_until(&manager, |peers| peers.contains(&b)).await;
+        // Re-discovery must not duplicate the peer entry.
+        network.add_link(a, b, MockLinkConfig::default()).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(manager.known_peers().await.len(), 1);
+
+        network.remove_link(&a, &b).await;
+        wait_until(&manager, |peers| peers.is_empty()).await;
+
+        // stop() then start() must not leave a stale forwarder or started flag.
+        manager.stop().await.unwrap();
+        manager.stop().await.unwrap();
+        manager.start().await.unwrap();
+        manager.stop().await.unwrap();
     }
 }

@@ -6,13 +6,16 @@ import '../models/message.dart';
 import '../models/node_id.dart';
 import 'service_provider.dart';
 
-final chatMessagesProvider =
-    AsyncNotifierProvider.family<ChatMessagesNotifier, List<Message>, NodeId>(
+/// Messages for one conversation. `autoDispose` so the 5 s fallback poll and
+/// the cached list go away when the chat screen closes instead of
+/// accumulating one timer per chat ever opened.
+final chatMessagesProvider = AsyncNotifierProvider.autoDispose
+    .family<ChatMessagesNotifier, List<Message>, NodeId>(
   ChatMessagesNotifier.new,
 );
 
 class ChatMessagesNotifier
-    extends FamilyAsyncNotifier<List<Message>, NodeId> {
+    extends AutoDisposeFamilyAsyncNotifier<List<Message>, NodeId> {
   Timer? _refreshTimer;
 
   @override

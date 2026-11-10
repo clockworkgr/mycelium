@@ -54,6 +54,13 @@ pub struct ApiConfig {
     pub bind_address: String,
     /// Port (default: 9735).
     pub port: u16,
+    /// Bearer token every REST request (`Authorization: Bearer <token>`) and
+    /// WebSocket upgrade (`?token=<token>` or the same header) must present.
+    /// `None` disables authentication; the daemon and the FFI layer always
+    /// fill it in (from this field or from `<data_dir>/api.token`), so it is
+    /// only `None` in tests.
+    #[serde(default)]
+    pub auth_token: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -62,6 +69,7 @@ impl Default for ApiConfig {
             enabled: true,
             bind_address: "127.0.0.1".to_string(),
             port: 9735,
+            auth_token: None,
         }
     }
 }
@@ -147,7 +155,6 @@ impl NodeConfig {
     }
 
     /// Save config to a TOML file.
-    #[allow(dead_code)]
     pub fn save(&self, path: &str) -> Result<(), anyhow::Error> {
         let content = toml::to_string_pretty(self)?;
         std::fs::write(path, content)?;

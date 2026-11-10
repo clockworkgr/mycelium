@@ -3,9 +3,22 @@
 use axum::http::StatusCode;
 use axum::Json;
 
-use mycelium_protocol::types::NodeId;
+use mycelium_protocol::types::{ContentType, NodeId};
 
 use crate::types::ApiError;
+
+/// Map the JSON content-type string used by REST and WebSocket clients.
+/// Unknown values fall back to `Text`.
+pub fn parse_content_type(s: &str) -> ContentType {
+    match s {
+        "text" => ContentType::Text,
+        "image" => ContentType::Image,
+        "file" => ContentType::File,
+        "gps_pin" => ContentType::GpsPin,
+        "voice_note" => ContentType::VoiceNote,
+        _ => ContentType::Text,
+    }
+}
 
 /// Parse a hex-encoded 32-byte NodeId from a string.
 pub fn parse_node_id(hex_str: &str) -> Result<NodeId, (StatusCode, Json<ApiError>)> {

@@ -105,7 +105,9 @@ impl Envelope {
         let payload_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        if data.len() < offset + payload_len {
+        // Subtract on the trusted side so a huge header length cannot wrap
+        // the comparison on 32-bit targets.
+        if data.len() - offset < payload_len {
             return Err(CodecError::PayloadLengthMismatch {
                 header: payload_len,
                 actual: data.len() - offset,

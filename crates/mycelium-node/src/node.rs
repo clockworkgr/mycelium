@@ -15,7 +15,7 @@ use mycelium_core::transport::manager::TransportManager;
 use mycelium_core::transport::{TransportError, TransportEvent};
 use mycelium_crypto::double_ratchet::RatchetHeader;
 use mycelium_crypto::group::{GroupError, SenderKey, SenderKeyGroup};
-use mycelium_crypto::identity::Identity;
+use mycelium_crypto::identity::{node_id_from_public_key, Identity};
 use mycelium_crypto::session::{SessionError, SessionManager};
 use mycelium_crypto::wot::TrustGraph;
 use mycelium_crypto::x3dh::{PrekeyBundle, PrekeyState};
@@ -59,6 +59,8 @@ pub enum NodeError {
     GroupError(#[from] GroupError),
     #[error("sending to self")]
     SendToSelf,
+    #[error("group not found")]
+    GroupNotFound,
 }
 
 /// A message waiting for a session to be established.
@@ -79,6 +81,10 @@ struct PendingRoute {
 
 /// Maximum number of AODV discovery retries before DTN fallback.
 const MAX_DISCOVERY_RETRIES: u8 = 1;
+
+/// Two peers that initiate a session with each other within this window are
+/// treated as a simultaneous initiation (see `handle_session_init`).
+const SIMULTANEOUS_INIT_WINDOW: Duration = Duration::from_secs(60);
 
 /// The main Mycelium node, tying together all subsystems.
 pub struct Node {
@@ -118,8 +124,29 @@ pub struct Node {
     pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
     /// Dedup set for channel messages (prevents re-processing flooded messages).
     seen_channel_messages: Arc<RwLock<HashSet<MessageId>>>,
+    /// Members we have already sent our current sender key to, per group.
+    /// Not persisted: after a restart the key is simply re-sent once.
+    key_sent_to: Arc<RwLock<HashMap<[u8; 32], HashSet<NodeId>>>>,
     /// Truncated hash of local group discovery key for beacon matching.
     pub local_group_hash: Option<[u8; 8]>,
+}
+
+/// Everything the send pipeline needs. Built from `&Node` for public
+/// methods and from the event loop's cloned handles for handlers that must
+/// reply (e.g. answering a sender-key distribution with our own key).
+struct SendCtx<'a> {
+    local_id: NodeId,
+    identity: &'a Identity,
+    db: &'a Database,
+    transport_manager: &'a TransportManager,
+    routing: &'a RwLock<RoutingCoordinator>,
+    session_manager: &'a RwLock<SessionManager>,
+    prekey_cache: &'a RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>,
+    pending_messages: &'a RwLock<HashMap<NodeId, Vec<PendingMessage>>>,
+    pending_routes: &'a RwLock<HashMap<NodeId, Vec<PendingRoute>>>,
+    lamport_clock: &'a RwLock<LamportClock>,
+    groups: &'a RwLock<HashMap<[u8; 32], SenderKeyGroup>>,
+    key_sent_to: &'a RwLock<HashMap<[u8; 32], HashSet<NodeId>>>,
 }
 
 #[allow(dead_code)]
@@ -195,6 +222,7 @@ impl Node {
             internet_transport: Arc::new(RwLock::new(None)),
             event_tx,
             seen_channel_messages: Arc::new(RwLock::new(HashSet::new())),
+            key_sent_to: Arc::new(RwLock::new(HashMap::new())),
             local_group_hash,
         }
     }
@@ -347,6 +375,7 @@ impl Node {
         let battery = self.battery.clone();
         let event_tx = self.event_tx.clone();
         let seen_channel_messages = self.seen_channel_messages.clone();
+        let key_sent_to = self.key_sent_to.clone();
         let local_group_hash = self.local_group_hash;
         let cancel = self.cancel.clone();
         let node_id = self.node_id;
@@ -385,10 +414,15 @@ impl Node {
                                     &event_tx,
                                     &seen_channel_messages,
                                     local_group_hash,
+                                    &key_sent_to,
                                 ).await;
                             }
-                            Err(e) => {
-                                warn!("Event channel error: {}", e);
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("Node event loop lagged, dropped {} transport events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                warn!("Transport event channel closed, stopping event loop");
+                                break;
                             }
                         }
                     }
@@ -601,6 +635,8 @@ impl Node {
                         for peer in &peers {
                             let _ = transport_manager_b.send(peer, &data).await;
                         }
+                        // Broadcast media (LoRa) hear us before they know us.
+                        let _ = transport_manager_b.broadcast(&data).await;
                     }
                 }
             }
@@ -666,13 +702,43 @@ impl Node {
         plaintext: &[u8],
         content_type: ContentType,
     ) -> Result<MessageId, NodeError> {
-        if destination == self.node_id {
+        Self::send_encrypted(&self.send_ctx(), destination, plaintext, content_type, true).await
+    }
+
+    fn send_ctx(&self) -> SendCtx<'_> {
+        SendCtx {
+            local_id: self.node_id,
+            identity: &self.identity,
+            db: &self.db,
+            transport_manager: &self.transport_manager,
+            routing: &self.routing,
+            session_manager: &self.session_manager,
+            prekey_cache: &self.prekey_cache,
+            pending_messages: &self.pending_messages,
+            pending_routes: &self.pending_routes,
+            lamport_clock: &self.lamport_clock,
+            groups: &self.groups,
+            key_sent_to: &self.key_sent_to,
+        }
+    }
+
+    /// Core of the 1:1 send pipeline. `store` controls whether the outgoing
+    /// message is recorded in the conversation history (protocol/system
+    /// messages such as sender-key distributions are not).
+    async fn send_encrypted(
+        ctx: &SendCtx<'_>,
+        destination: NodeId,
+        plaintext: &[u8],
+        content_type: ContentType,
+        store: bool,
+    ) -> Result<MessageId, NodeError> {
+        if destination == ctx.local_id {
             return Err(NodeError::SendToSelf);
         }
 
         let message_id = MessageId::random();
         let clock_val = {
-            let mut clock = self.lamport_clock.write().await;
+            let mut clock = ctx.lamport_clock.write().await;
             clock.tick()
         };
         let timestamp = SystemTime::now()
@@ -681,44 +747,44 @@ impl Node {
             .as_secs();
 
         // Store outgoing message in DB
-        let record = MessageRecord {
-            message_id,
-            source: self.node_id,
-            destination,
-            content_type: content_type_str(content_type),
-            plaintext: plaintext.to_vec(),
-            lamport_clock: clock_val.0,
-            device_timestamp: timestamp,
-            status: "pending".to_string(),
-            is_incoming: false,
-        };
-        self.db.insert_message(&record)?;
+        if store {
+            let record = MessageRecord {
+                message_id,
+                source: ctx.local_id,
+                destination,
+                content_type: content_type_str(content_type),
+                plaintext: plaintext.to_vec(),
+                lamport_clock: clock_val.0,
+                device_timestamp: timestamp,
+                status: "pending".to_string(),
+                is_incoming: false,
+            };
+            ctx.db.insert_message(&record)?;
+        }
 
         // Check if session exists
         let has_session = {
-            let sm = self.session_manager.read().await;
+            let sm = ctx.session_manager.read().await;
             sm.has_session(&destination)
         };
 
         if !has_session {
             // Check prekey cache
-            let has_prekey = {
-                let cache = self.prekey_cache.read().await;
-                cache.contains_key(&destination)
+            let bundle = {
+                let cache = ctx.prekey_cache.read().await;
+                cache.get(&destination).map(|(b, _)| b.clone())
             };
 
             info!(
                 "send_message: no session with {}, has_prekey={}",
-                destination, has_prekey
+                destination,
+                bundle.is_some()
             );
 
-            if has_prekey {
+            if let Some(bundle) = bundle {
                 // Initiate session from cached prekey bundle
-                let bundle = {
-                    let cache = self.prekey_cache.read().await;
-                    cache.get(&destination).map(|(b, _)| b.clone()).unwrap()
-                };
-                self.initiate_and_send_session(
+                Self::initiate_session_and_send(
+                    ctx,
                     destination,
                     &bundle,
                     plaintext,
@@ -735,7 +801,7 @@ impl Node {
                 );
                 // Queue message and send prekey request
                 {
-                    let mut pm = self.pending_messages.write().await;
+                    let mut pm = ctx.pending_messages.write().await;
                     pm.entry(destination).or_default().push(PendingMessage {
                         plaintext: plaintext.to_vec(),
                         content_type,
@@ -745,9 +811,9 @@ impl Node {
 
                 // Send prekey request
                 let prekey_req_payload =
-                    wire::serialize_prekey_request(&self.identity.public_key_bytes());
+                    wire::serialize_prekey_request(&ctx.identity.public_key_bytes());
                 let envelope = Envelope {
-                    source: self.node_id,
+                    source: ctx.local_id,
                     destination,
                     message_id: MessageId::random(),
                     ttl: 10,
@@ -758,21 +824,21 @@ impl Node {
                     protocol_version: ProtocolVersion::CURRENT,
                     payload: prekey_req_payload,
                 };
-                self.route_and_send_envelope(envelope, message_id).await?;
+                Self::route_and_send(ctx, envelope, message_id).await?;
             }
 
             return Ok(message_id);
         }
 
         // Session exists — encrypt and send
-        let ad = build_ad(self.node_id, destination);
+        let ad = build_ad(ctx.local_id, destination);
         let (header, ciphertext) = {
-            let mut sm = self.session_manager.write().await;
+            let mut sm = ctx.session_manager.write().await;
             sm.encrypt_for(&destination, plaintext, &ad)?
         };
 
         // Persist session after ratchet state advance
-        Self::persist_session(&self.session_manager, &self.db, &destination).await;
+        Self::persist_session(ctx.session_manager, ctx.db, &destination).await;
 
         let enc_payload = EncryptedPayload {
             content_type: content_type_to_byte(content_type),
@@ -785,7 +851,7 @@ impl Node {
         };
 
         let envelope = Envelope {
-            source: self.node_id,
+            source: ctx.local_id,
             destination,
             message_id,
             ttl: 10,
@@ -797,14 +863,205 @@ impl Node {
             payload: enc_payload.serialize(),
         };
 
-        self.route_and_send_envelope(envelope, message_id).await?;
+        Self::route_and_send(ctx, envelope, message_id).await?;
         Ok(message_id)
     }
 
-    /// Send a message to a group.
-    ///
-    /// The message is encrypted with the group's sender key and sent to
-    /// each group member individually via existing routes.
+    // --- Groups ---
+
+    /// Create a new group with a random id. We are its first member.
+    pub async fn create_group(&self) -> Result<[u8; 32], NodeError> {
+        let mut group_id = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_id);
+        let group = SenderKeyGroup::new(group_id);
+        self.db.save_group_blob(&group_id, &group.to_bytes())?;
+        self.groups.write().await.insert(group_id, group);
+        Ok(group_id)
+    }
+
+    /// Add a member and hand every member (old and new) our sender key plus
+    /// the updated roster over their pairwise sessions. The new member replies
+    /// with its own key and existing members send theirs to it.
+    pub async fn add_group_member(
+        &self,
+        group_id: [u8; 32],
+        member: NodeId,
+    ) -> Result<(), NodeError> {
+        if member == self.node_id {
+            return Err(NodeError::SendToSelf);
+        }
+        {
+            let mut groups = self.groups.write().await;
+            let group = groups.get_mut(&group_id).ok_or(NodeError::GroupNotFound)?;
+            group.add_pending_member(member);
+            self.db.save_group_blob(&group_id, &group.to_bytes())?;
+        }
+        // Everyone must learn the new roster: forget who already has our
+        // key so the refreshed distribution goes to every member.
+        {
+            let mut sent = self.key_sent_to.write().await;
+            sent.remove(&group_id);
+        }
+        Self::distribute_sender_key(&self.send_ctx(), group_id, &[]).await;
+        Ok(())
+    }
+
+    /// Remove a member. Our sender key is rotated and re-sent to the
+    /// remaining members together with the new roster.
+    pub async fn remove_group_member(
+        &self,
+        group_id: [u8; 32],
+        member: NodeId,
+    ) -> Result<(), NodeError> {
+        {
+            let mut groups = self.groups.write().await;
+            let group = groups.get_mut(&group_id).ok_or(NodeError::GroupNotFound)?;
+            group.remove_member(&member);
+            self.db.save_group_blob(&group_id, &group.to_bytes())?;
+        }
+        {
+            let mut sent = self.key_sent_to.write().await;
+            sent.remove(&group_id);
+        }
+        Self::distribute_sender_key(&self.send_ctx(), group_id, &[member]).await;
+        Ok(())
+    }
+
+    /// Send our current sender key and roster to every member of the group
+    /// we have not sent it to yet (as a System message over the pairwise
+    /// session, establishing one if needed). Failures are logged: the send
+    /// pipeline queues messages until a session exists.
+    async fn distribute_sender_key(ctx: &SendCtx<'_>, group_id: [u8; 32], removed: &[NodeId]) {
+        let (payload, members) = {
+            let groups = ctx.groups.read().await;
+            let Some(group) = groups.get(&group_id) else {
+                return;
+            };
+            let sk = group.our_sender_key_for_distribution();
+            let payload =
+                wire::serialize_sender_key_distribution(&wire::SenderKeyDistributionPayload {
+                    group_id,
+                    chain_key: sk.chain_key,
+                    iteration: sk.iteration,
+                    members: group.members.clone(),
+                    removed: removed.to_vec(),
+                });
+            (payload, group.members.clone())
+        };
+
+        let targets: Vec<NodeId> = {
+            let sent = ctx.key_sent_to.read().await;
+            let done = sent.get(&group_id);
+            members
+                .into_iter()
+                .filter(|m| *m != ctx.local_id)
+                .filter(|m| done.map(|d| !d.contains(m)).unwrap_or(true))
+                .collect()
+        };
+
+        for target in targets {
+            match Self::send_encrypted(ctx, target, &payload, ContentType::System, false).await {
+                Ok(_) => {
+                    ctx.key_sent_to
+                        .write()
+                        .await
+                        .entry(group_id)
+                        .or_default()
+                        .insert(target);
+                    debug!(
+                        "Sent sender key for group {:?} to {}",
+                        &group_id[..4],
+                        target
+                    );
+                }
+                Err(e) => debug!(
+                    "Sender key for group {:?} to {} not sent: {}",
+                    &group_id[..4],
+                    target,
+                    e
+                ),
+            }
+        }
+    }
+
+    /// Install a sender key received from `source` inside an authenticated
+    /// pairwise message, merge the roster it carries, and reply with our own
+    /// key to members that do not have it yet.
+    async fn install_sender_key(ctx: &SendCtx<'_>, source: NodeId, body: &[u8]) {
+        let dist = match wire::deserialize_sender_key_distribution(body) {
+            Ok(d) => d,
+            Err(e) => {
+                debug!("Bad sender key distribution from {}: {}", source, e);
+                return;
+            }
+        };
+        let group_id = dist.group_id;
+        let sender_key = SenderKey::from_parts(dist.chain_key, dist.iteration);
+
+        {
+            let mut groups = ctx.groups.write().await;
+            match groups.get_mut(&group_id) {
+                Some(group) => {
+                    // Only current members may update the roster or keys.
+                    if !group.is_member(&source) {
+                        debug!(
+                            "Ignoring sender key from non-member {} for group {:?}",
+                            source,
+                            &group_id[..4]
+                        );
+                        return;
+                    }
+                    group.add_member(source, sender_key);
+                    // Rosters only add: a member that has not yet heard of a
+                    // newer addition sends a shorter list, which must not be
+                    // read as a removal. Removals are explicit.
+                    for m in &dist.members {
+                        if *m != ctx.local_id {
+                            group.add_pending_member(*m);
+                        }
+                    }
+                    if dist.removed.contains(&ctx.local_id) {
+                        info!("Removed from group {:?} by {}", &group_id[..4], source);
+                        groups.remove(&group_id);
+                        let _ = ctx.db.remove_group_blob(&group_id);
+                        return;
+                    }
+                    for m in &dist.removed {
+                        group.forget_member(m);
+                    }
+                    let _ = ctx.db.save_group_blob(&group_id, &group.to_bytes());
+                    info!(
+                        "Installed sender key from {} for group {:?} ({} members)",
+                        source,
+                        &group_id[..4],
+                        group.member_count()
+                    );
+                }
+                None => {
+                    // An invitation: a peer we have a session with added us.
+                    let mut group = SenderKeyGroup::new(group_id);
+                    group.add_member(source, sender_key);
+                    for m in &dist.members {
+                        if *m != ctx.local_id {
+                            group.add_pending_member(*m);
+                        }
+                    }
+                    let _ = ctx.db.save_group_blob(&group_id, &group.to_bytes());
+                    info!(
+                        "Joined group {:?} via sender key from {} ({} members)",
+                        &group_id[..4],
+                        source,
+                        group.member_count()
+                    );
+                    groups.insert(group_id, group);
+                }
+            }
+        }
+
+        // Reply with our key to anyone in the roster who has not got it.
+        Self::distribute_sender_key(ctx, group_id, &[]).await;
+    }
+
     pub async fn send_group_message(
         &self,
         group_id: [u8; 32],
@@ -880,8 +1137,16 @@ impl Node {
         envelope: Envelope,
         message_id: MessageId,
     ) -> Result<(), NodeError> {
+        Self::route_and_send(&self.send_ctx(), envelope, message_id).await
+    }
+
+    async fn route_and_send(
+        ctx: &SendCtx<'_>,
+        envelope: Envelope,
+        message_id: MessageId,
+    ) -> Result<(), NodeError> {
         let decision = {
-            let r = self.routing.read().await;
+            let r = ctx.routing.read().await;
             r.route_message(&envelope.destination)
         };
 
@@ -894,14 +1159,14 @@ impl Node {
 
         match decision {
             RoutingDecision::SendRealtime { next_hop } => {
-                match self.transport_manager.send(&next_hop, &serialized).await {
+                match ctx.transport_manager.send(&next_hop, &serialized).await {
                     Ok(()) => {
                         info!(
                             "route_and_send: sent {} bytes via transport to {}",
                             serialized.len(),
                             next_hop
                         );
-                        let _ = self.db.update_message_status(&message_id, "sent");
+                        let _ = ctx.db.update_message_status(&message_id, "sent");
                     }
                     Err(e) => {
                         info!("route_and_send: transport send failed: {}", e);
@@ -913,13 +1178,13 @@ impl Node {
                 let destination = envelope.destination;
                 // Initiate AODV discovery
                 let rreq = {
-                    let mut r = self.routing.write().await;
+                    let mut r = ctx.routing.write().await;
                     r.initiate_discovery(destination)
                 };
                 // Broadcast RREQ
-                self.broadcast_aodv_message(&rreq, self.node_id).await;
+                Self::broadcast_aodv_static(&rreq, ctx.local_id, ctx.transport_manager).await;
                 // Queue envelope for when route is found
-                let mut pr = self.pending_routes.write().await;
+                let mut pr = ctx.pending_routes.write().await;
                 pr.entry(destination).or_default().push(PendingRoute {
                     envelope_bytes: serialized,
                     message_id,
@@ -928,15 +1193,15 @@ impl Node {
                 });
             }
             RoutingDecision::EnterDtn => {
-                let mut r = self.routing.write().await;
-                if r.fallback_to_dtn(message_id, envelope.destination, self.node_id, serialized)
+                let mut r = ctx.routing.write().await;
+                if r.fallback_to_dtn(message_id, envelope.destination, ctx.local_id, serialized)
                     .is_ok()
                 {
                     if let Some(bundle) = r.dtn().get_bundle(&message_id) {
-                        persist_dtn_bundle(&self.db, bundle);
+                        persist_dtn_bundle(ctx.db, bundle);
                     }
                 }
-                let _ = self.db.update_message_status(&message_id, "dtn_pending");
+                let _ = ctx.db.update_message_status(&message_id, "dtn_pending");
             }
             RoutingDecision::DeliverLocal => {
                 return Err(NodeError::SendToSelf);
@@ -946,10 +1211,9 @@ impl Node {
         Ok(())
     }
 
-    /// Initiate a session and send SessionInit + first message.
     #[allow(clippy::too_many_arguments)]
-    async fn initiate_and_send_session(
-        &self,
+    async fn initiate_session_and_send(
+        ctx: &SendCtx<'_>,
         destination: NodeId,
         bundle: &PrekeyBundle,
         plaintext: &[u8],
@@ -958,24 +1222,24 @@ impl Node {
         clock_val: LamportClock,
         timestamp: u64,
     ) -> Result<(), NodeError> {
-        let identity = identity_clone_for_prekeys(&self.identity);
+        let identity = identity_clone_for_prekeys(ctx.identity);
         let init_result = {
-            let mut sm = self.session_manager.write().await;
+            let mut sm = ctx.session_manager.write().await;
             sm.initiate_session(&identity, destination, bundle)?
         };
 
         // Persist the new session
-        Self::persist_session(&self.session_manager, &self.db, &destination).await;
+        Self::persist_session(ctx.session_manager, ctx.db, &destination).await;
 
         // Encrypt the first message with the new session
-        let ad = build_ad(self.node_id, destination);
+        let ad = build_ad(ctx.local_id, destination);
         let (header, ciphertext) = {
-            let mut sm = self.session_manager.write().await;
+            let mut sm = ctx.session_manager.write().await;
             sm.encrypt_for(&destination, plaintext, &ad)?
         };
 
         // Persist session after encrypt
-        Self::persist_session(&self.session_manager, &self.db, &destination).await;
+        Self::persist_session(ctx.session_manager, ctx.db, &destination).await;
 
         // Build the encrypted payload part (without type byte prefix)
         let enc_payload = EncryptedPayload {
@@ -991,14 +1255,14 @@ impl Node {
 
         let session_init = SessionInitPayload {
             ephemeral_public: init_result.ephemeral_public,
-            identity_key: self.identity.public_key_bytes(),
+            identity_key: ctx.identity.public_key_bytes(),
             signed_prekey_id: init_result.used_signed_prekey_id,
             one_time_prekey_id: init_result.used_one_time_prekey_id,
             encrypted_payload: enc_bytes,
         };
 
         let envelope = Envelope {
-            source: self.node_id,
+            source: ctx.local_id,
             destination,
             message_id,
             ttl: 10,
@@ -1010,7 +1274,7 @@ impl Node {
             payload: session_init.serialize(),
         };
 
-        self.route_and_send_envelope(envelope, message_id).await
+        Self::route_and_send(ctx, envelope, message_id).await
     }
 
     /// Broadcast an AODV message to all known peers.
@@ -1105,7 +1369,22 @@ impl Node {
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
         seen_channel_messages: &RwLock<HashSet<MessageId>>,
         local_group_hash: Option<[u8; 8]>,
+        key_sent_to: &RwLock<HashMap<[u8; 32], HashSet<NodeId>>>,
     ) {
+        let ctx = SendCtx {
+            local_id,
+            identity,
+            db,
+            transport_manager,
+            routing,
+            session_manager,
+            prekey_cache,
+            pending_messages,
+            pending_routes,
+            lamport_clock,
+            groups,
+            key_sent_to,
+        };
         match event {
             TransportEvent::NeighborDiscovered { peer, transport } => {
                 info!("Neighbor discovered: {} via {}", peer, transport);
@@ -1121,8 +1400,18 @@ impl Node {
                             peer: target,
                             bundle,
                         } => {
-                            let payload =
-                                wire::serialize_dtn_relay(&bundle.message_id, &bundle.payload);
+                            let ttl_secs = bundle
+                                .expires_at
+                                .saturating_duration_since(Instant::now())
+                                .as_secs()
+                                .min(u32::MAX as u64)
+                                as u32;
+                            let payload = wire::serialize_dtn_relay(&wire::DtnRelayPayload {
+                                message_id: bundle.message_id,
+                                copies_remaining: bundle.copies_remaining.max(1),
+                                ttl_secs,
+                                payload: bundle.payload.clone(),
+                            });
                             let envelope = Envelope {
                                 source: bundle.source,
                                 destination: bundle.destination,
@@ -1176,14 +1465,7 @@ impl Node {
                         }
                         DtnAction::DeliverLocal { bundle } => {
                             debug!("DTN deliver local: bundle {}", bundle.message_id);
-                            Self::handle_dtn_local_delivery(
-                                &bundle,
-                                session_manager,
-                                db,
-                                local_id,
-                                lamport_clock,
-                            )
-                            .await;
+                            Self::handle_dtn_local_delivery(&bundle, event_tx, &ctx).await;
                             // Remove delivered bundle from DB
                             let _ = db.remove_dtn_bundle(&bundle.message_id);
                         }
@@ -1358,6 +1640,9 @@ impl Node {
                     && envelope.destination != local_id
                     // EncryptedMessage has its own forwarding logic
                     && payload_type != WirePayloadType::EncryptedMessage
+                    // DtnRelay for another node is store-and-carry: the relay
+                    // handler keeps the bundle when no route exists.
+                    && payload_type != WirePayloadType::DtnRelay
                 {
                     // Check battery policy
                     {
@@ -1375,9 +1660,17 @@ impl Node {
                         let r = routing.read().await;
                         r.route_message(&envelope.destination)
                     };
-                    // Opportunistically cache prekey responses passing through
+                    // Opportunistically cache prekey responses passing through,
+                    // but only when the bundle's identity key really belongs to
+                    // the claimed source (NodeId = SHA-256(identity key)).
                     if payload_type == WirePayloadType::PrekeyResponse {
-                        if let Ok(bp) = PrekeyBundlePayload::deserialize_body(body) {
+                        if let Some(bp) =
+                            PrekeyBundlePayload::deserialize_body(body)
+                                .ok()
+                                .filter(|bp| {
+                                    node_id_from_public_key(&bp.identity_key) == envelope.source
+                                })
+                        {
                             let bundle = PrekeyBundle {
                                 identity_key: bp.identity_key,
                                 signed_prekey: bp.signed_prekey,
@@ -1418,26 +1711,24 @@ impl Node {
                     return;
                 }
 
-                // Rate-limit user data messages based on sender trust distance
+                // Rate-limit user data messages based on the *originator's*
+                // trust distance. A direct neighbor was already counted by the
+                // previous-hop gate above, so do not charge it twice. DTN relay
+                // quota is enforced by handle_dtn_relay when a bundle is stored.
                 let is_user_data = matches!(
                     payload_type,
                     WirePayloadType::EncryptedMessage
                         | WirePayloadType::GroupMessage
                         | WirePayloadType::ChannelMessage
-                        | WirePayloadType::DtnRelay
                 );
-                if is_user_data {
+                if is_user_data && envelope.source != *peer {
                     let trust_hops = {
                         let tg = trust_graph.read().await;
                         tg.trust_score(&local_id, &envelope.source).hops
                     };
                     let allowed = {
                         let mut rl = rate_limiter.write().await;
-                        if payload_type == WirePayloadType::DtnRelay {
-                            rl.check_dtn_relay(&envelope.source, trust_hops, body.len())
-                        } else {
-                            rl.check_message(&envelope.source, trust_hops)
-                        }
+                        rl.check_message(&envelope.source, trust_hops)
                     };
                     if !allowed {
                         debug!(
@@ -1480,7 +1771,8 @@ impl Node {
                         .await;
                     }
                     WirePayloadType::AodvRerr => {
-                        Self::handle_aodv_rerr(body, routing, transport_manager, local_id).await;
+                        Self::handle_aodv_rerr(body, *peer, routing, transport_manager, local_id)
+                            .await;
                     }
                     WirePayloadType::EncryptedMessage => {
                         Self::handle_encrypted_message(
@@ -1494,6 +1786,7 @@ impl Node {
                             lamport_clock,
                             battery,
                             event_tx,
+                            &ctx,
                         )
                         .await;
                     }
@@ -1503,12 +1796,11 @@ impl Node {
                             body,
                             session_manager,
                             prekey_state,
-                            transport_manager,
-                            routing,
                             db,
                             local_id,
                             lamport_clock,
                             event_tx,
+                            &ctx,
                         )
                         .await;
                     }
@@ -1521,6 +1813,7 @@ impl Node {
                             identity,
                             local_id,
                             lamport_clock,
+                            db,
                         )
                         .await;
                     }
@@ -1554,12 +1847,14 @@ impl Node {
                             local_id,
                             lamport_clock,
                             event_tx,
+                            &ctx,
                         )
                         .await;
                     }
                     WirePayloadType::Beacon => {
                         Self::handle_beacon(
                             &envelope,
+                            *peer,
                             body,
                             db,
                             lamport_clock,
@@ -1577,12 +1872,18 @@ impl Node {
                         Self::handle_group_message(&envelope, body, groups, db, local_id).await;
                     }
                     WirePayloadType::SenderKeyDistribution => {
-                        Self::handle_sender_key_distribution(&envelope, body, groups, db, local_id)
-                            .await;
+                        // Sender keys only travel inside pairwise-encrypted
+                        // messages (see install_sender_key); a bare payload is
+                        // unauthenticated and ignored.
+                        debug!(
+                            "Ignoring top-level SenderKeyDistribution from {}",
+                            envelope.source
+                        );
                     }
                     WirePayloadType::ChannelMessage => {
                         Self::handle_channel_message(
                             &envelope,
+                            *peer,
                             body,
                             db,
                             transport_manager,
@@ -1603,6 +1904,7 @@ impl Node {
                     WirePayloadType::EmergencyBroadcast => {
                         Self::handle_emergency_broadcast(
                             &envelope,
+                            *peer,
                             body,
                             trust_graph,
                             transport_manager,
@@ -1699,6 +2001,7 @@ impl Node {
 
     async fn handle_aodv_rerr(
         body: &[u8],
+        received_from: NodeId,
         routing: &RwLock<RoutingCoordinator>,
         transport_manager: &TransportManager,
         local_id: NodeId,
@@ -1719,10 +2022,11 @@ impl Node {
 
         let action = {
             let mut r = routing.write().await;
-            r.handle_aodv_message(AodvMessage::RouteError(rerr), local_id)
+            r.handle_aodv_message(AodvMessage::RouteError(rerr), received_from)
         };
 
-        // For RERR, we only care about BroadcastRerr
+        // For RERR, we only care about BroadcastRerr. Never echo it back to
+        // the hop we got it from.
         if let AodvAction::BroadcastRerr(rerr) = action {
             let payload = wire::serialize_aodv_rerr(&rerr.unreachable, &rerr.source, rerr.dest_seq);
             let envelope = Envelope {
@@ -1740,6 +2044,9 @@ impl Node {
             let data = envelope.serialize();
             let peers = transport_manager.known_peers().await;
             for p in peers {
+                if p == received_from {
+                    continue;
+                }
                 let _ = transport_manager.send(&p, &data).await;
             }
         }
@@ -1863,10 +2170,30 @@ impl Node {
         _lamport_clock: &RwLock<LamportClock>,
         battery: &RwLock<BatteryManager>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+        ctx: &SendCtx<'_>,
     ) {
         let is_for_us = envelope.destination == local_id;
 
         if is_for_us {
+            // Duplicate delivery (DTN multi-copy, relay replay) must not touch
+            // the ratchet again; the receipt is re-sent so the sender learns
+            // its message arrived even if the first receipt was lost.
+            if db.get_message(&envelope.message_id).is_ok() {
+                debug!(
+                    "Duplicate message {} from {}, re-sending receipt",
+                    envelope.message_id, envelope.source
+                );
+                Self::send_delivery_receipt(
+                    envelope.message_id,
+                    envelope.source,
+                    local_id,
+                    transport_manager,
+                    routing,
+                )
+                .await;
+                return;
+            }
+
             // Decrypt locally
             let enc = match EncryptedPayload::deserialize_body(body) {
                 Ok(e) => e,
@@ -1908,29 +2235,11 @@ impl Node {
                 status: "received".to_string(),
                 is_incoming: true,
             };
-            let _ = db.insert_message(&record);
             debug!(
                 "Received message {} from {}",
                 envelope.message_id, envelope.source
             );
-
-            let _ = event_tx.send(NodeEvent::MessageReceived {
-                source: envelope.source,
-                message_id: envelope.message_id,
-                data: record.plaintext.clone(),
-                content_type: enc.content_type,
-                timestamp: envelope.device_timestamp,
-            });
-
-            // Send delivery receipt back to sender
-            Self::send_delivery_receipt(
-                envelope.message_id,
-                envelope.source,
-                local_id,
-                transport_manager,
-                routing,
-            )
-            .await;
+            Self::finalize_incoming_message(record, enc.content_type, event_tx, ctx).await;
         } else {
             // Forward — check battery policy first
             {
@@ -1976,18 +2285,63 @@ impl Node {
         }
     }
 
+    /// Store a decrypted incoming message, notify API clients, and send the
+    /// delivery receipt. Shared by the real-time, SessionInit and DTN paths so
+    /// every delivery behaves the same regardless of how it arrived.
+    async fn finalize_incoming_message(
+        record: MessageRecord,
+        content_type: u8,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+        ctx: &SendCtx<'_>,
+    ) {
+        let db = ctx.db;
+        let transport_manager = ctx.transport_manager;
+        let routing = ctx.routing;
+        let local_id = ctx.local_id;
+        // System messages carry protocol payloads (sender keys), not chat.
+        if content_type == content_type_to_byte(ContentType::System) {
+            if record.plaintext.first() == Some(&(WirePayloadType::SenderKeyDistribution as u8)) {
+                Self::install_sender_key(ctx, record.source, &record.plaintext[1..]).await;
+            } else {
+                debug!(
+                    "Ignoring system message from {} with unknown inner type",
+                    record.source
+                );
+            }
+            return;
+        }
+
+        let _ = db.insert_message(&record);
+
+        let _ = event_tx.send(NodeEvent::MessageReceived {
+            source: record.source,
+            message_id: record.message_id,
+            data: record.plaintext.clone(),
+            content_type,
+            timestamp: record.device_timestamp,
+        });
+
+        Self::send_delivery_receipt(
+            record.message_id,
+            record.source,
+            local_id,
+            transport_manager,
+            routing,
+        )
+        .await;
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn handle_session_init(
         envelope: &Envelope,
         body: &[u8],
         session_manager: &RwLock<SessionManager>,
         prekey_state: &RwLock<PrekeyState>,
-        transport_manager: &TransportManager,
-        routing: &RwLock<RoutingCoordinator>,
         db: &Database,
         local_id: NodeId,
         _lamport_clock: &RwLock<LamportClock>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+        ctx: &SendCtx<'_>,
     ) {
         if envelope.destination != local_id {
             debug!("SessionInit not for us, ignoring");
@@ -2002,9 +2356,42 @@ impl Node {
             }
         };
 
-        // Accept the session
+        // A replayed SessionInit (same message id) must not touch session state.
+        if db.get_message(&envelope.message_id).is_ok() {
+            debug!(
+                "Duplicate SessionInit {} from {}, ignoring",
+                envelope.message_id, envelope.source
+            );
+            return;
+        }
+
+        // Parse the enclosed first message, if any, before touching state.
+        let first_message = if !init.encrypted_payload.is_empty()
+            && init.encrypted_payload[0] == WirePayloadType::EncryptedMessage as u8
         {
+            match EncryptedPayload::deserialize_body(&init.encrypted_payload[1..]) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    debug!("Bad encrypted payload in SessionInit: {}", e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let Some(enc) = first_message else {
+            // Nothing to authenticate the initiator with. Only accept when we
+            // have no session to lose; otherwise a forged SessionInit could
+            // clobber a working session.
             let mut sm = session_manager.write().await;
+            if sm.has_session(&envelope.source) {
+                debug!(
+                    "Refusing unauthenticated SessionInit from {}: session already exists",
+                    envelope.source
+                );
+                return;
+            }
             let mut ps = prekey_state.write().await;
             match sm.accept_session(
                 &mut ps,
@@ -2018,89 +2405,119 @@ impl Node {
                         "Accepted session from {}, safety number: {}",
                         envelope.source, safety_number
                     );
-                    // Persist prekey state (a one-time prekey may have been consumed)
-                    let _ = db.save_prekey_state_blob(&ps.to_bytes());
                 }
                 Err(e) => {
                     debug!("Failed to accept session from {}: {}", envelope.source, e);
+                }
+            }
+            // Persist prekey state (a one-time prekey may have been consumed)
+            let _ = db.save_prekey_state_blob(&ps.to_bytes());
+            drop(ps);
+            drop(sm);
+            Self::persist_session(session_manager, db, &envelope.source).await;
+            return;
+        };
+
+        let ratchet_header = RatchetHeader {
+            dh_public: enc.header.dh_public,
+            previous_chain_length: enc.header.previous_chain_length,
+            message_number: enc.header.message_number,
+        };
+        let ad = build_ad(envelope.source, envelope.destination);
+
+        // Simultaneous initiation: if we also just initiated a session with
+        // this peer, exactly one side must give way or the two sessions end
+        // up mismatched. The lower NodeId keeps its own session and only
+        // decrypts the peer's first message; the peer replaces its session
+        // when our SessionInit arrives.
+        let keep_ours = {
+            let sm = session_manager.read().await;
+            sm.initiated_recently(&envelope.source, SIMULTANEOUS_INIT_WINDOW)
+                && local_id.as_bytes() < envelope.source.as_bytes()
+        };
+
+        // Build the candidate session and decrypt the first message with it;
+        // the session is only installed if the message authenticates.
+        let plaintext = {
+            let mut sm = session_manager.write().await;
+            let mut ps = prekey_state.write().await;
+            let result = if keep_ours {
+                SessionManager::decrypt_first_message_only(
+                    &mut ps,
+                    envelope.source,
+                    &init.identity_key,
+                    &init.ephemeral_public,
+                    init.one_time_prekey_id,
+                    &ratchet_header,
+                    &enc.ciphertext,
+                    &ad,
+                )
+                .map(|pt| (String::new(), pt))
+            } else {
+                sm.accept_session_with_first_message(
+                    &mut ps,
+                    envelope.source,
+                    &init.identity_key,
+                    &init.ephemeral_public,
+                    init.one_time_prekey_id,
+                    &ratchet_header,
+                    &enc.ciphertext,
+                    &ad,
+                )
+            };
+            // Persist prekey state (a one-time prekey may have been consumed
+            // even when the session was rejected)
+            let _ = db.save_prekey_state_blob(&ps.to_bytes());
+            match result {
+                Ok((safety_number, plaintext)) if keep_ours => {
+                    let _ = safety_number;
+                    info!(
+                        "Simultaneous session initiation with {}: keeping ours (lower id wins)",
+                        envelope.source
+                    );
+                    plaintext
+                }
+                Ok((safety_number, plaintext)) => {
+                    info!(
+                        "Accepted session from {}, safety number: {}",
+                        envelope.source, safety_number
+                    );
+                    plaintext
+                }
+                Err(e) => {
+                    debug!(
+                        "Rejected SessionInit from {}: {} (existing session untouched)",
+                        envelope.source, e
+                    );
                     return;
                 }
             }
+        };
+
+        // Persist the accepted session (unchanged when we kept ours)
+        if !keep_ours {
+            Self::persist_session(session_manager, db, &envelope.source).await;
         }
 
-        // Persist the accepted session
-        Self::persist_session(session_manager, db, &envelope.source).await;
-
-        // Decrypt the enclosed first message
-        if !init.encrypted_payload.is_empty()
-            && init.encrypted_payload[0] == WirePayloadType::EncryptedMessage as u8
-        {
-            let enc = match EncryptedPayload::deserialize_body(&init.encrypted_payload[1..]) {
-                Ok(e) => e,
-                Err(e) => {
-                    debug!("Bad encrypted payload in SessionInit: {}", e);
-                    return;
-                }
-            };
-
-            let ratchet_header = RatchetHeader {
-                dh_public: enc.header.dh_public,
-                previous_chain_length: enc.header.previous_chain_length,
-                message_number: enc.header.message_number,
-            };
-
-            let ad = build_ad(envelope.source, envelope.destination);
-            let plaintext = {
-                let mut sm = session_manager.write().await;
-                match sm.decrypt_from(&envelope.source, &ratchet_header, &enc.ciphertext, &ad) {
-                    Ok(pt) => pt,
-                    Err(e) => {
-                        debug!(
-                            "Failed to decrypt first message from {}: {}",
-                            envelope.source, e
-                        );
-                        return;
-                    }
-                }
-            };
-
-            let record = MessageRecord {
-                message_id: envelope.message_id,
-                source: envelope.source,
-                destination: local_id,
-                content_type: content_type_from_byte(enc.content_type),
-                plaintext,
-                lamport_clock: envelope.lamport_clock,
-                device_timestamp: envelope.device_timestamp,
-                status: "received".to_string(),
-                is_incoming: true,
-            };
-            let _ = db.insert_message(&record);
-            debug!(
-                "Received first message {} via SessionInit from {}",
-                envelope.message_id, envelope.source
-            );
-
-            let _ = event_tx.send(NodeEvent::MessageReceived {
-                source: envelope.source,
-                message_id: envelope.message_id,
-                data: record.plaintext.clone(),
-                content_type: enc.content_type,
-                timestamp: envelope.device_timestamp,
-            });
-
-            // Send delivery receipt
-            Self::send_delivery_receipt(
-                envelope.message_id,
-                envelope.source,
-                local_id,
-                transport_manager,
-                routing,
-            )
-            .await;
-        }
+        let record = MessageRecord {
+            message_id: envelope.message_id,
+            source: envelope.source,
+            destination: local_id,
+            content_type: content_type_from_byte(enc.content_type),
+            plaintext,
+            lamport_clock: envelope.lamport_clock,
+            device_timestamp: envelope.device_timestamp,
+            status: "received".to_string(),
+            is_incoming: true,
+        };
+        debug!(
+            "Received first message {} via SessionInit from {}",
+            envelope.message_id, envelope.source
+        );
+        Self::finalize_incoming_message(record, enc.content_type, event_tx, ctx).await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_prekey_request(
         envelope: &Envelope,
         prekey_state: &RwLock<PrekeyState>,
@@ -2109,14 +2526,19 @@ impl Node {
         _identity: &Identity,
         local_id: NodeId,
         lamport_clock: &RwLock<LamportClock>,
+        db: &Database,
     ) {
         if envelope.destination != local_id {
             return;
         }
 
+        // issue_bundle() reserves the one-time prekey so two initiators never
+        // receive the same OTP (the second X3DH would fail).
         let bundle = {
-            let ps = prekey_state.read().await;
-            ps.bundle()
+            let mut ps = prekey_state.write().await;
+            let b = ps.issue_bundle();
+            let _ = db.save_prekey_state_blob(&ps.to_bytes());
+            b
         };
 
         let bundle_payload = PrekeyBundlePayload {
@@ -2190,6 +2612,17 @@ impl Node {
 
         let peer_id = envelope.source;
 
+        // The bundle must belong to the node that claims to have sent it:
+        // NodeId is SHA-256 of the identity key, so this is a free check that
+        // stops a neighbor from answering a prekey request on someone's behalf.
+        if node_id_from_public_key(&bundle.identity_key) != peer_id {
+            warn!(
+                "Prekey response from {} carries an identity key for a different node, dropping",
+                peer_id
+            );
+            return;
+        }
+
         // Cache the bundle in memory and DB
         {
             let mut cache = prekey_cache.write().await;
@@ -2225,6 +2658,13 @@ impl Node {
                 Ok(r) => r,
                 Err(e) => {
                     debug!("Failed to initiate session with {}: {}", peer_id, e);
+                    // Keep the messages queued for the next prekey response.
+                    pending_messages
+                        .write()
+                        .await
+                        .entry(peer_id)
+                        .or_default()
+                        .extend(pending);
                     return;
                 }
             }
@@ -2234,7 +2674,8 @@ impl Node {
         Self::persist_session(session_manager, db, &peer_id).await;
 
         // Send first pending message as SessionInit, rest as EncryptedMessage
-        for (i, msg) in pending.into_iter().enumerate() {
+        let mut queue = pending.into_iter().enumerate();
+        while let Some((i, msg)) = queue.next() {
             let clock_val = {
                 let mut clock = lamport_clock.write().await;
                 clock.tick()
@@ -2252,6 +2693,17 @@ impl Node {
                     Ok(r) => r,
                     Err(e) => {
                         debug!("Failed to encrypt for {}: {}", peer_id, e);
+                        // Requeue this and every later message instead of
+                        // silently dropping them.
+                        let mut rest = vec![msg];
+                        rest.extend(queue.map(|(_, m)| m));
+                        drop(sm);
+                        pending_messages
+                            .write()
+                            .await
+                            .entry(peer_id)
+                            .or_default()
+                            .extend(rest);
                         return;
                     }
                 }
@@ -2332,20 +2784,42 @@ impl Node {
         local_id: NodeId,
         _lamport_clock: &RwLock<LamportClock>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+        ctx: &SendCtx<'_>,
     ) {
-        let (msg_id, payload) = match wire::deserialize_dtn_relay(body) {
+        let relay = match wire::deserialize_dtn_relay(body) {
             Ok(v) => v,
             Err(e) => {
                 debug!("Bad DTN relay payload: {}", e);
                 return;
             }
         };
+        let msg_id = relay.message_id;
+        let payload = relay.payload;
 
         if envelope.destination == local_id {
             // We are the final destination — deliver locally.
             // The payload is the original serialized Envelope; deserialize it
             // to recover the inner encrypted payload and original metadata.
             debug!("DTN relay delivered locally: {}", msg_id);
+
+            // Several copies of the same bundle may reach us; only the first
+            // touches the ratchet. Re-send the receipt so the carrier learns
+            // the bundle is delivered.
+            if db.get_message(&msg_id).is_ok() {
+                debug!(
+                    "DTN bundle {} already delivered, re-sending receipt",
+                    msg_id
+                );
+                Self::send_delivery_receipt(
+                    msg_id,
+                    envelope.source,
+                    local_id,
+                    transport_manager,
+                    routing,
+                )
+                .await;
+                return;
+            }
 
             let inner_envelope = match Envelope::deserialize(&payload) {
                 Ok(e) => e,
@@ -2406,7 +2880,7 @@ impl Node {
                     status: "received".to_string(),
                     is_incoming: true,
                 };
-                let _ = db.insert_message(&record);
+                Self::finalize_incoming_message(record, enc.content_type, event_tx, ctx).await;
             } else if payload_type == WirePayloadType::SessionInit as u8 {
                 // DTN-delivered SessionInit: create session and decrypt first message
                 debug!("DTN: processing SessionInit from {}", inner_envelope.source);
@@ -2415,12 +2889,11 @@ impl Node {
                     inner_body,
                     session_manager,
                     prekey_state,
-                    transport_manager,
-                    routing,
                     db,
                     local_id,
                     _lamport_clock,
                     event_tx,
+                    ctx,
                 )
                 .await;
             }
@@ -2447,15 +2920,18 @@ impl Node {
                 }
             }
 
-            // Store as relay
+            // Store as relay with the copies the spraying node handed us and
+            // the remaining lifetime it reported (bounded to the spec maximum
+            // so a peer cannot pin a bundle in our storage forever).
+            let ttl = Duration::from_secs(u64::from(relay.ttl_secs).min(72 * 3600));
             let mut r = routing.write().await;
             let bundle = DtnBundle {
                 message_id: msg_id,
                 destination: envelope.destination,
                 source: envelope.source,
                 payload,
-                copies_remaining: 1,
-                expires_at: Instant::now() + Duration::from_secs(72 * 3600),
+                copies_remaining: relay.copies_remaining.max(1),
+                expires_at: Instant::now() + ttl,
                 created_at: Instant::now(),
                 size: relay_size,
             };
@@ -2470,11 +2946,17 @@ impl Node {
 
     async fn handle_dtn_local_delivery(
         bundle: &DtnBundle,
-        session_manager: &RwLock<SessionManager>,
-        db: &Database,
-        local_id: NodeId,
-        _lamport_clock: &RwLock<LamportClock>,
+        event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
+        ctx: &SendCtx<'_>,
     ) {
+        let session_manager = ctx.session_manager;
+        let db = ctx.db;
+        let local_id = ctx.local_id;
+        if db.get_message(&bundle.message_id).is_ok() {
+            debug!("DTN bundle {} already delivered", bundle.message_id);
+            return;
+        }
+
         // The bundle payload is the full serialized Envelope; deserialize it
         // to recover the inner encrypted payload and original metadata.
         let inner_envelope = match Envelope::deserialize(&bundle.payload) {
@@ -2539,7 +3021,7 @@ impl Node {
                 status: "received".to_string(),
                 is_incoming: true,
             };
-            let _ = db.insert_message(&record);
+            Self::finalize_incoming_message(record, enc.content_type, event_tx, ctx).await;
         }
     }
 
@@ -2638,50 +3120,12 @@ impl Node {
         );
     }
 
-    async fn handle_sender_key_distribution(
-        envelope: &Envelope,
-        body: &[u8],
-        groups: &RwLock<HashMap<[u8; 32], SenderKeyGroup>>,
-        db: &Database,
-        local_id: NodeId,
-    ) {
-        if envelope.destination != local_id {
-            return;
-        }
-
-        let (group_id, chain_key, iteration) = match wire::deserialize_sender_key_distribution(body)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("Bad sender key distribution: {}", e);
-                return;
-            }
-        };
-
-        let sender_key = SenderKey {
-            chain_key,
-            iteration,
-        };
-
-        let mut grps = groups.write().await;
-        let group = grps
-            .entry(group_id)
-            .or_insert_with(|| SenderKeyGroup::new(group_id));
-        group.add_member(envelope.source, sender_key);
-        // Persist group state
-        let _ = db.save_group_blob(&group_id, &group.to_bytes());
-        debug!(
-            "Added sender key from {} for group {:?}",
-            envelope.source,
-            &group_id[..4]
-        );
-    }
-
     // --- Beacon handler ---
 
     #[allow(clippy::too_many_arguments)]
     async fn handle_beacon(
         envelope: &Envelope,
+        peer: NodeId,
         body: &[u8],
         db: &Database,
         lamport_clock: &RwLock<LamportClock>,
@@ -2701,6 +3145,17 @@ impl Node {
                 return;
             }
         };
+
+        // The beacon body names its node. It must be the node we actually
+        // heard it from; otherwise any neighbor could rename other contacts,
+        // register arbitrary nodes as supernodes or redirect the auto-vouch.
+        if beacon.node_id != peer || envelope.source != peer {
+            debug!(
+                "Beacon from {} claims node_id {} (envelope source {}), dropping",
+                peer, beacon.node_id, envelope.source
+            );
+            return;
+        }
 
         debug!(
             "Beacon from {} ({}): battery={}, neighbors={}",
@@ -2777,8 +3232,10 @@ impl Node {
     // --- Channel message handler ---
 
     /// Handle an incoming channel message: dedup, store if subscribed, flood to peers.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_channel_message(
         envelope: &Envelope,
+        peer: NodeId,
         body: &[u8],
         db: &Database,
         transport_manager: &TransportManager,
@@ -2840,14 +3297,15 @@ impl Node {
             });
         }
 
-        // Flood to all connected peers (except the one who sent it)
+        // Flood to all connected peers except the originator and the hop
+        // that just delivered it to us.
         if envelope.ttl > 0 {
             let mut fwd = envelope.clone();
             fwd.forward();
             let fwd_data = fwd.serialize();
             let peers = transport_manager.known_peers().await;
             for p in peers {
-                if p != envelope.source && p != local_id {
+                if p != envelope.source && p != local_id && p != peer {
                     let _ = transport_manager.send(&p, &fwd_data).await;
                 }
             }
@@ -2856,8 +3314,10 @@ impl Node {
 
     // --- Emergency broadcast handler ---
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_emergency_broadcast(
         envelope: &Envelope,
+        peer: NodeId,
         body: &[u8],
         trust_graph: &RwLock<TrustGraph>,
         transport_manager: &TransportManager,
@@ -2892,8 +3352,11 @@ impl Node {
         let tg = trust_graph.read().await;
         let sender_trust = tg.trust_score(&local_id, &envelope.source).value;
 
+        // Thresholds per spec §9.5: Priority > 0.3, Urgent > 0.6, Critical
+        // needs 3+ co-signers above 0.8. Co-signers are not yet signature-
+        // verified (see ROADMAP.md T-05).
         let accepted = match level {
-            wire::EmergencyLevel::Priority => sender_trust >= 0.0, // Allow all peers for Priority
+            wire::EmergencyLevel::Priority => sender_trust > 0.3,
             wire::EmergencyLevel::Urgent => sender_trust > 0.6,
             wire::EmergencyLevel::Critical => {
                 // Need 3+ cosigners each with trust > 0.8
@@ -2939,14 +3402,15 @@ impl Node {
             message: message_text,
         });
 
-        // Flood to all peers (bypass AODV routing for all emergency levels)
+        // Flood to all peers (bypass AODV routing for all emergency levels),
+        // never back to the hop it came from.
         if envelope.ttl > 0 {
             let mut fwd = envelope.clone();
             fwd.forward();
             let fwd_data = fwd.serialize();
             let peers = transport_manager.known_peers().await;
             for p in peers {
-                if p != envelope.source && p != local_id {
+                if p != envelope.source && p != local_id && p != peer {
                     let _ = transport_manager.send(&p, &fwd_data).await;
                 }
             }
@@ -2988,6 +3452,27 @@ impl Node {
             ReceiptType::Delivered => "delivered",
             ReceiptType::Read => "read",
         };
+
+        // Receipts are unauthenticated: accept one only from the node we sent
+        // that message to, and never for messages we received ourselves
+        // (otherwise a peer could mark our unread messages as read).
+        match db.get_message(&msg_id) {
+            Ok(msg) if !msg.is_incoming && msg.destination == envelope.source => {}
+            Ok(_) => {
+                debug!(
+                    "Receipt from {} for message {} it is not the recipient of, ignoring",
+                    envelope.source, msg_id
+                );
+                return;
+            }
+            Err(_) => {
+                debug!(
+                    "Receipt from {} for unknown message {}, ignoring",
+                    envelope.source, msg_id
+                );
+                return;
+            }
+        }
 
         match db.update_message_status(&msg_id, new_status) {
             Ok(()) => {

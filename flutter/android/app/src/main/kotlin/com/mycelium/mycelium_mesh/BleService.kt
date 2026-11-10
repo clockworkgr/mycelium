@@ -204,6 +204,23 @@ class BleService(private val context: Context) {
         processNextWrite()
     }
 
+    /**
+     * Drop queued writes for a link that just went away. Android never
+     * delivers onCharacteristicWrite/onNotificationSent for a dropped link, so
+     * without this the global writeInProgress flag would stay set forever and
+     * stall BLE sends to every peer.
+     */
+    private fun purgeWritesFor(address: String) {
+        synchronized(writeLock) {
+            val head = writeQueue.peek()
+            writeQueue.removeAll { it.address == address }
+            if (writeInProgress && head != null && head.address == address) {
+                writeInProgress = false
+            }
+        }
+        processNextWrite()
+    }
+
     private fun processNextWrite() {
         synchronized(writeLock) {
             if (writeInProgress) return
@@ -418,7 +435,12 @@ class BleService(private val context: Context) {
                 Log.d(TAG, "GATT server: device disconnected $address")
                 serverConnectedDevices.remove(address)
                 subscribedDevices.remove(address)
-                handlePeerDisconnected(address)
+                purgeWritesFor(address)
+                // Only report the peer lost when our own client link to it is
+                // gone too; both roles may be connected at the same time.
+                if (!connectedGatts.containsKey(address)) {
+                    handlePeerDisconnected(address)
+                }
             }
         }
 
@@ -453,9 +475,17 @@ class BleService(private val context: Context) {
                     // Client is identifying itself with its 32-byte node ID
                     if (value != null && value.size == 32) {
                         val address = device.address
+                        val wasKnown = peerNodeIds.containsKey(address)
                         peerNodeIds[address] = value
                         nodeIdToAddress[value.toHex()] = address
                         Log.i(TAG, "GATT server: client identified as ${value.toHex().take(16)}... at $address")
+                        // The remote connected to us as a client and we may never
+                        // connect back (the scanner skips server-side peers), so
+                        // Rust must learn about this peer here or the link stays
+                        // one-directional. Rust de-duplicates repeated discoveries.
+                        if (!wasKnown) {
+                            listener?.onPeerDiscovered(value)
+                        }
                     }
                     if (responseNeeded) {
                         gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
@@ -664,10 +694,14 @@ class BleService(private val context: Context) {
                 gatt.close()
                 connectedGatts.remove(address)
                 deviceMtus.remove(address)
+                purgeWritesFor(address)
 
-                // If the peer was already discovered, notify disconnect
+                // If the peer was already discovered, notify disconnect — unless
+                // it is still connected to our GATT server (dual-role link).
                 if (peerNodeIds.containsKey(address)) {
-                    handlePeerDisconnected(address)
+                    if (!serverConnectedDevices.containsKey(address)) {
+                        handlePeerDisconnected(address)
+                    }
                     pendingConnections.remove(address)
                     return
                 }
@@ -952,6 +986,7 @@ class BleService(private val context: Context) {
     // --- Helpers ---
 
     private fun handlePeerDisconnected(address: String) {
+        reassemblyBuffers.remove(address)
         val nodeId = peerNodeIds.remove(address) ?: return
         nodeIdToAddress.remove(nodeId.toHex())
         Log.i(TAG, "Peer lost: ${nodeId.toHex().take(16)}...")

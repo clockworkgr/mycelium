@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
 
+/// Maximum packets queued while the platform is not polling the outbox.
+const MAX_OUTBOX: usize = 512;
+
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
 use super::{Transport, TransportError, TransportEvent, TransportType};
@@ -173,6 +176,13 @@ impl Transport for WifiDirectTransport {
         } else {
             // Push to outbox for Dart to poll via mycelium_wifi_dequeue_send
             if let Ok(mut outbox) = self.outbox.lock() {
+                if outbox.len() >= MAX_OUTBOX {
+                    warn!(
+                        "WiFi Direct outbox full ({}), dropping oldest packet",
+                        MAX_OUTBOX
+                    );
+                    outbox.pop_front();
+                }
                 outbox.push_back((*peer, data.to_vec()));
                 debug!("WiFi Direct outbox: queued, depth now {}", outbox.len());
             }

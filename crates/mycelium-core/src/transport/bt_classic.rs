@@ -6,7 +6,10 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// Maximum packets queued while the platform is not polling the outbox.
+const MAX_OUTBOX: usize = 512;
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
@@ -140,6 +143,13 @@ impl Transport for BtClassicTransport {
         debug!("BT Classic send: {} bytes to {}", data.len(), peer);
 
         if let Ok(mut outbox) = self.outbox.lock() {
+            if outbox.len() >= MAX_OUTBOX {
+                warn!(
+                    "BT Classic outbox full ({}), dropping oldest packet",
+                    MAX_OUTBOX
+                );
+                outbox.pop_front();
+            }
             outbox.push_back((*peer, data.to_vec()));
         }
 

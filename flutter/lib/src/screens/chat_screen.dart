@@ -32,7 +32,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen> {
 
   @override
   void dispose() {
-    NotificationService.instance.activeChat = null;
+    // When navigating chat → chat the new screen's initState runs before this
+    // dispose; only clear the suppression if it is still ours.
+    if (NotificationService.instance.activeChat == widget.peerId.toHex()) {
+      NotificationService.instance.activeChat = null;
+    }
     super.dispose();
   }
 

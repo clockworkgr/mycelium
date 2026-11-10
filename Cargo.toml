@@ -7,6 +7,7 @@ members = [
     "crates/mycelium-storage",
     "crates/mycelium-node",
     "crates/mycelium-api",
+    "crates/mycelium-daemon",
     "crates/mycelium-ffi",
     "crates/mycelium-meshtastic",
     "crates/mycelium-reticulum",
@@ -16,7 +17,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
-rust-version = "1.75"
+rust-version = "1.82"
 
 [workspace.dependencies]
 # Serialization

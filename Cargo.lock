@@ -807,6 +807,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-util",
  "tower",
  "tower-http",
  "tracing",
@@ -845,6 +846,21 @@ dependencies = [
  "sha2",
  "thiserror",
  "x25519-dalek",
+]
+
+[[package]]
+name = "mycelium-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mycelium-api",
+ "mycelium-crypto",
+ "mycelium-node",
+ "mycelium-storage",
+ "sha2",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -890,6 +906,7 @@ dependencies = [
  "mycelium-crypto",
  "mycelium-protocol",
  "mycelium-storage",
+ "rand 0.8.5",
  "serde",
  "sha2",
  "thiserror",

@@ -211,8 +211,7 @@ impl Database {
                 ],
                 |row| {
                     let bytes: Vec<u8> = row.get(0)?;
-                    let mut arr = [0u8; 16];
-                    arr.copy_from_slice(&bytes[..16]);
+                    let arr: [u8; 16] = crate::db::blob_to_array(0, bytes)?;
                     Ok(MessageId::from_bytes(arr))
                 },
             )?

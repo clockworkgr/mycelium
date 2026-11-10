@@ -59,18 +59,32 @@ pub struct MeshtasticPacket {
 /// Meshtastic broadcast address.
 pub const MESHTASTIC_BROADCAST: u32 = 0xFFFFFFFF;
 
-/// Magic bytes for Meshtastic serial protocol.
-const SERIAL_MAGIC: [u8; 4] = [0x94, 0xC3, 0x00, 0x00];
+/// Start bytes of the Meshtastic serial "stream" protocol (START1, START2).
+/// A frame is `[0x94][0xC3][len MSB][len LSB][body]`.
+const SERIAL_MAGIC: [u8; 2] = [0x94, 0xC3];
+
+/// Serial frame prefix length: 2 magic bytes + 2 length bytes.
+const SERIAL_PREFIX_LEN: usize = 4;
+
+/// Maximum body length the Meshtastic firmware accepts on the serial link
+/// (MAX_TO_FROM_RADIO_SIZE).
+const SERIAL_MAX_BODY_LEN: usize = 512;
+
+/// Fixed header length inside the frame body.
+const PACKET_HEADER_LEN: usize = 15; // 4+4+4+1+1+1
 
 impl MeshtasticPacket {
-    /// Serialize to simplified binary frame for serial transport.
+    /// Serialize to a serial-stream frame.
     ///
-    /// Frame format: [4B magic][2B length][header][payload]
+    /// Frame format: [2B magic][2B length BE][header][payload]
     /// Header: [4B from][4B to][4B id][1B hop_limit][1B flags][1B channel]
+    ///
+    /// NOTE: the body layout is a Mycelium-specific simplification; real
+    /// Meshtastic firmware carries protobuf `ToRadio`/`FromRadio` messages
+    /// in the body. Only the stream framing (magic + length) matches upstream.
     pub fn serialize(&self) -> Vec<u8> {
-        let header_len = 15; // 4+4+4+1+1+1
-        let frame_len = header_len + self.payload.len();
-        let mut buf = Vec::with_capacity(6 + frame_len);
+        let frame_len = PACKET_HEADER_LEN + self.payload.len();
+        let mut buf = Vec::with_capacity(SERIAL_PREFIX_LEN + frame_len);
 
         // Magic
         buf.extend_from_slice(&SERIAL_MAGIC);
@@ -90,23 +104,26 @@ impl MeshtasticPacket {
         buf
     }
 
-    /// Deserialize from binary frame.
+    /// Deserialize from a serial-stream frame.
     pub fn deserialize(data: &[u8]) -> Result<Self, TransportError> {
-        if data.len() < 6 {
+        if data.len() < SERIAL_PREFIX_LEN {
             return Err(TransportError::Other("packet too short".into()));
         }
 
         // Check magic
-        if data[0..4] != SERIAL_MAGIC {
+        if data[0..2] != SERIAL_MAGIC {
             return Err(TransportError::Other("invalid magic".into()));
         }
 
-        let frame_len = ((data[4] as usize) << 8) | (data[5] as usize);
-        if data.len() < 6 + frame_len || frame_len < 15 {
+        let frame_len = ((data[2] as usize) << 8) | (data[3] as usize);
+        if frame_len > SERIAL_MAX_BODY_LEN {
+            return Err(TransportError::Other("frame length exceeds 512".into()));
+        }
+        if data.len() < SERIAL_PREFIX_LEN + frame_len || frame_len < PACKET_HEADER_LEN {
             return Err(TransportError::Other("incomplete frame".into()));
         }
 
-        let header = &data[6..];
+        let header = &data[SERIAL_PREFIX_LEN..SERIAL_PREFIX_LEN + frame_len];
         let from = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
         let to = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         let id = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
@@ -177,10 +194,15 @@ impl NodeIdBridge {
 
 // --- Channel Encryption ---
 
-/// Meshtastic channel key derived from a passphrase.
+/// Meshtastic channel key placeholder.
 ///
-/// Meshtastic uses AES-256-CTR with a key derived from the channel name.
-/// Default channel "LongFast" has a well-known key.
+/// NOTE: this is NOT how Meshtastic derives channel keys. Real Meshtastic
+/// channels carry an independent PSK (0/1/16/32 bytes; the default "LongFast"
+/// channel uses a well-known 16-byte AES-128 key) and a one-byte channel hash
+/// of `xor_fold(name) ^ xor_fold(psk)`; payloads are AES-CTR encrypted with a
+/// nonce of `packet_id (u64 LE) || from_node (u32 LE) || 0u32`. None of that is
+/// implemented yet (see ROADMAP.md T-16); this type only gives
+/// the adapter a stable per-channel identifier until real PSK support lands.
 #[derive(Debug, Clone)]
 pub struct ChannelKey {
     pub name: String,
@@ -188,7 +210,8 @@ pub struct ChannelKey {
 }
 
 impl ChannelKey {
-    /// Derive a channel key from a passphrase (Meshtastic convention).
+    /// Derive a placeholder 32-byte identifier from the channel name
+    /// (SHA-256 of the name). Not interoperable with Meshtastic PSKs.
     pub fn from_passphrase(name: &str) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(name.as_bytes());
@@ -201,7 +224,7 @@ impl ChannelKey {
         }
     }
 
-    /// The default "LongFast" channel key (well-known, not encrypted in practice).
+    /// Placeholder for the default "LongFast" channel.
     pub fn default_channel() -> Self {
         Self::from_passphrase("LongFast")
     }
@@ -349,6 +372,9 @@ impl Transport for MeshtasticTransport {
         *started = false;
         let mut peers = self.connected_peers.write().await;
         peers.clear();
+        if let Ok(mut outbox) = self.outbox.lock() {
+            outbox.clear();
+        }
         Ok(())
     }
 
@@ -358,13 +384,24 @@ impl Transport for MeshtasticTransport {
             return Err(TransportError::NotStarted);
         }
 
-        // Look up Meshtastic node number
+        if data.len() > self.mtu() {
+            return Err(TransportError::ExceedsMtu {
+                size: data.len(),
+                mtu: self.mtu(),
+            });
+        }
+
+        // Look up Meshtastic node number. An unknown peer must fail loudly:
+        // TransportManager treats Ok(()) as delivered, so silently
+        // broadcasting would mask undeliverable unicasts.
         let dest_node_num = {
             let bridge = self
                 .bridge
                 .lock()
                 .map_err(|_| TransportError::Other("bridge lock failed".into()))?;
-            bridge.to_meshtastic(peer).unwrap_or(MESHTASTIC_BROADCAST)
+            bridge
+                .to_meshtastic(peer)
+                .ok_or(TransportError::PeerNotConnected(*peer))?
         };
 
         // Wrap in Meshtastic packet
@@ -488,10 +525,38 @@ mod tests {
 
     #[test]
     fn test_packet_bad_magic() {
-        let mut bad = [0u8; 21];
-        bad[5] = 15; // frame_len = 15 but magic is wrong
+        let mut bad = [0u8; 19];
+        bad[3] = 15; // frame_len = 15 but magic is wrong
         let result = MeshtasticPacket::deserialize(&bad);
         assert!(result.is_err());
+    }
+
+    /// The stream framing must match the Meshtastic serial protocol:
+    /// START1=0x94, START2=0xC3, then a big-endian u16 body length.
+    #[test]
+    fn test_serial_frame_layout() {
+        let packet = MeshtasticPacket {
+            from: 1,
+            to: 2,
+            id: 3,
+            hop_limit: 3,
+            want_ack: false,
+            channel: 0,
+            payload: vec![0xAA; 5],
+        };
+        let bytes = packet.serialize();
+        assert_eq!(&bytes[0..2], &[0x94, 0xC3]);
+        let body_len = PACKET_HEADER_LEN + 5;
+        assert_eq!(bytes[2], (body_len >> 8) as u8);
+        assert_eq!(bytes[3], (body_len & 0xFF) as u8);
+        assert_eq!(bytes.len(), SERIAL_PREFIX_LEN + body_len);
+    }
+
+    #[test]
+    fn test_frame_length_over_512_rejected() {
+        let mut bad = vec![0x94, 0xC3, 0x02, 0x01]; // length 513
+        bad.extend(vec![0u8; 513]);
+        assert!(MeshtasticPacket::deserialize(&bad).is_err());
     }
 
     #[test]
@@ -598,6 +663,26 @@ mod tests {
         assert_eq!(outgoing.from, 0xAABBCCDD);
         assert_eq!(outgoing.to, 0x11223344);
         assert_eq!(outgoing.payload, b"response");
+    }
+
+    #[tokio::test]
+    async fn test_send_unknown_peer_fails() {
+        let transport = MeshtasticTransport::new(MeshtasticConfig::default());
+        transport.start().await.unwrap();
+        let peer = NodeId([0x42; 32]);
+        let result = transport.send(&peer, b"hi").await;
+        assert!(matches!(result, Err(TransportError::PeerNotConnected(_))));
+        assert_eq!(transport.outbox_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_send_exceeds_mtu() {
+        let transport = MeshtasticTransport::new(MeshtasticConfig::default());
+        transport.start().await.unwrap();
+        let peer = NodeId([0x42; 32]);
+        let too_large = vec![0u8; transport.mtu() + 1];
+        let result = transport.send(&peer, &too_large).await;
+        assert!(matches!(result, Err(TransportError::ExceedsMtu { .. })));
     }
 
     #[test]

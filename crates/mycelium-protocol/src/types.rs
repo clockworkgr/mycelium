@@ -77,13 +77,16 @@ impl LamportClock {
 
     /// Increment on local event (send).
     pub fn tick(&mut self) -> Self {
-        self.0 += 1;
+        self.0 = self.0.saturating_add(1);
         *self
     }
 
     /// Update on receiving a remote clock value.
+    ///
+    /// Saturates so a peer advertising `u64::MAX` cannot panic (debug) or
+    /// wrap the clock to zero (release).
     pub fn merge(&mut self, other: LamportClock) -> Self {
-        self.0 = self.0.max(other.0) + 1;
+        self.0 = self.0.max(other.0).saturating_add(1);
         *self
     }
 }

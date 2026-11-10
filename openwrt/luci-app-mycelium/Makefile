@@ -11,7 +11,7 @@ LUCI_DEPENDS:=+mycelium +luci-base +luci-compat
 LUCI_DESCRIPTION:=Web interface for the Mycelium mesh communications daemon. \
 	Shows node status, connected peers, DTN queue, and transport configuration.
 
-PKG_LICENSE:=MIT
+PKG_LICENSE:=GPL-3.0-or-later
 
 include $(TOPDIR)/feeds/luci/luci.mk
 

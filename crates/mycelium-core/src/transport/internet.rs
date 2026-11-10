@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -55,8 +55,15 @@ pub struct InternetTransport {
     event_tx: broadcast::Sender<TransportEvent>,
     connections: Arc<RwLock<HashMap<NodeId, Arc<Mutex<PeerConnection>>>>>,
     started: Arc<RwLock<bool>>,
-    cancel: tokio_util::sync::CancellationToken,
+    /// Replaced on every start() so the transport can be restarted after stop().
+    cancel: Arc<std::sync::Mutex<tokio_util::sync::CancellationToken>>,
 }
+
+/// Maximum wire message size accepted from a peer (also bounds the Hello).
+const MAX_WIRE_MESSAGE: usize = 1_048_576;
+
+/// How long to wait for a peer's Hello before giving up on the connection.
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl InternetTransport {
     /// Create a new Internet transport.
@@ -75,7 +82,9 @@ impl InternetTransport {
             event_tx,
             connections: Arc::new(RwLock::new(HashMap::new())),
             started: Arc::new(RwLock::new(false)),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            cancel: Arc::new(std::sync::Mutex::new(
+                tokio_util::sync::CancellationToken::new(),
+            )),
         }
     }
 
@@ -96,22 +105,36 @@ impl InternetTransport {
     ) {
         let (mut reader, writer) = tokio::io::split(stream);
 
-        // Read hello message to learn peer's node ID
-        let peer_id = match Self::read_message(&mut reader).await {
-            Ok(InternetWireMessage::Hello { node_id, .. }) => node_id,
-            Ok(_) => {
-                debug!("Expected Hello from {}, got other message", addr);
-                return;
-            }
-            Err(e) => {
-                debug!("Failed to read Hello from {}: {}", addr, e);
-                return;
-            }
-        };
+        // Read hello message to learn peer's node ID (bounded wait so an idle
+        // connection cannot hold a task and socket forever).
+        let peer_id =
+            match tokio::time::timeout(HELLO_TIMEOUT, Self::read_message(&mut reader)).await {
+                Ok(Ok(InternetWireMessage::Hello { node_id, .. })) => node_id,
+                Ok(Ok(_)) => {
+                    debug!("Expected Hello from {}, got other message", addr);
+                    return;
+                }
+                Ok(Err(e)) => {
+                    debug!("Failed to read Hello from {}: {}", addr, e);
+                    return;
+                }
+                Err(_) => {
+                    debug!("Timed out waiting for Hello from {}", addr);
+                    return;
+                }
+            };
 
-        info!("Internet: peer {} connected from {}", peer_id, addr);
+        if peer_id == _local_id {
+            debug!(
+                "Internet: rejecting connection from {} claiming our own id",
+                addr
+            );
+            return;
+        }
 
-        // Store connection
+        // Store connection. A second connection claiming an already-connected
+        // node id is refused: accepting it would overwrite the live entry and
+        // its later teardown would evict the real peer.
         let conn = Arc::new(Mutex::new(PeerConnection {
             _addr: addr,
             writer,
@@ -119,8 +142,17 @@ impl InternetTransport {
         }));
         {
             let mut conns = connections.write().await;
+            if conns.contains_key(&peer_id) {
+                debug!(
+                    "Internet: {} already connected, refusing duplicate from {}",
+                    peer_id, addr
+                );
+                return;
+            }
             conns.insert(peer_id, conn.clone());
         }
+
+        info!("Internet: peer {} connected from {}", peer_id, addr);
 
         // Add to DHT
         dht.add_peer(PeerInfo {
@@ -192,7 +224,7 @@ impl InternetTransport {
             .map_err(|e| TransportError::Other(e.to_string()))?;
         let len = u32::from_be_bytes(len_buf) as usize;
 
-        if len > 1_048_576 {
+        if len > MAX_WIRE_MESSAGE {
             return Err(TransportError::Other("Message too large".to_string()));
         }
 
@@ -223,23 +255,26 @@ impl InternetTransport {
             .await
             .map_err(|e| TransportError::SendFailed(e.to_string()))?;
 
-        // Read their Hello
-        let mut len_buf = [0u8; 4];
-        reader
-            .read_exact(&mut len_buf)
+        // Read their Hello (same size cap and timeout as the accept path, so a
+        // malicious peer cannot make us allocate an attacker-chosen buffer).
+        let peer_id = match tokio::time::timeout(HELLO_TIMEOUT, Self::read_message(&mut reader))
             .await
-            .map_err(|e| TransportError::Other(e.to_string()))?;
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut data = vec![0u8; len];
-        reader
-            .read_exact(&mut data)
-            .await
-            .map_err(|e| TransportError::Other(e.to_string()))?;
-
-        let peer_id = match deserialize_wire_message(&data) {
-            Ok(InternetWireMessage::Hello { node_id, .. }) => node_id,
-            _ => return Err(TransportError::Other("Expected Hello response".to_string())),
+        {
+            Ok(Ok(InternetWireMessage::Hello { node_id, .. })) => node_id,
+            Ok(Ok(_)) => return Err(TransportError::Other("Expected Hello response".to_string())),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(TransportError::Other(
+                    "Timed out waiting for Hello".to_string(),
+                ))
+            }
         };
+
+        if peer_id == self.local_id {
+            return Err(TransportError::Other(
+                "Peer claims our own node id".to_string(),
+            ));
+        }
 
         // Store connection
         let conn = Arc::new(Mutex::new(PeerConnection {
@@ -250,6 +285,12 @@ impl InternetTransport {
 
         {
             let mut conns = self.connections.write().await;
+            if conns.contains_key(&peer_id) {
+                return Err(TransportError::Other(format!(
+                    "Already connected to {}",
+                    peer_id
+                )));
+            }
             conns.insert(peer_id, conn.clone());
         }
 
@@ -272,7 +313,7 @@ impl InternetTransport {
         let dht = self.dht.clone();
         let event_tx = self.event_tx.clone();
         let connections = self.connections.clone();
-        let cancel = self.cancel.clone();
+        let cancel = self.cancel.lock().map(|c| c.clone()).unwrap_or_default();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -323,12 +364,11 @@ impl Transport for InternetTransport {
     }
 
     async fn start(&self) -> Result<(), TransportError> {
-        {
-            let mut s = self.started.write().await;
-            if *s {
-                return Err(TransportError::AlreadyStarted);
-            }
-            *s = true;
+        // Hold the started lock across bind so a bind failure leaves the
+        // transport stopped (and restartable) instead of stuck "started".
+        let mut started = self.started.write().await;
+        if *started {
+            return Err(TransportError::AlreadyStarted);
         }
 
         let listen_addr = self.config.listen_addr;
@@ -336,7 +376,12 @@ impl Transport for InternetTransport {
         let dht = self.dht.clone();
         let event_tx = self.event_tx.clone();
         let connections = self.connections.clone();
-        let cancel = self.cancel.clone();
+        // Fresh token per start: a cancelled token from a previous stop()
+        // would make the new accept loop exit immediately.
+        let cancel = tokio_util::sync::CancellationToken::new();
+        if let Ok(mut guard) = self.cancel.lock() {
+            *guard = cancel.clone();
+        }
 
         // Start TCP listener
         let listener = TcpListener::bind(listen_addr)
@@ -344,11 +389,16 @@ impl Transport for InternetTransport {
             .map_err(|e| TransportError::Other(format!("Bind {}: {}", listen_addr, e)))?;
         info!("Internet transport listening on {}", listen_addr);
 
+        *started = true;
+        drop(started);
+
         // Store our address in DHT
         self.dht.store_self(listen_addr).await;
 
         // Accept loop
+        let accept_cancel = cancel.clone();
         tokio::spawn(async move {
+            let cancel = accept_cancel;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
@@ -397,7 +447,7 @@ impl Transport for InternetTransport {
             let this_dht = self.dht.clone();
             let this_event_tx = self.event_tx.clone();
             let this_connections = self.connections.clone();
-            let this_cancel = self.cancel.clone();
+            let this_cancel = cancel.clone();
             let this_local_id = self.local_id;
             let this_listen_addr = self.config.listen_addr;
 
@@ -437,11 +487,16 @@ impl Transport for InternetTransport {
         Ok(())
     }
 
+    /// Stop listening and drop all connections. Idempotent: outbound
+    /// connections made via `connect_to` work without `start()`, so stop must
+    /// clean them up even when the listener was never started.
     async fn stop(&self) -> Result<(), TransportError> {
-        self.cancel.cancel();
+        let mut s = self.started.write().await;
+        if let Ok(guard) = self.cancel.lock() {
+            guard.cancel();
+        }
         let mut conns = self.connections.write().await;
         conns.clear();
-        let mut s = self.started.write().await;
         *s = false;
         info!("Internet transport stopped");
         Ok(())

@@ -21,8 +21,11 @@
 # Targets:
 #   aarch64   ARM64 routers (GL.iNet GL-MT6000, NanoPi R4S, etc.)
 #   mipsel    MIPS little-endian (classic OpenWRT devices: Linksys, TP-Link)
+#             NOTE: mipsel-unknown-linux-musl is a Tier 3 Rust target since
+#             1.72 — rustup ships no std for it. Requires a nightly toolchain
+#             with `-Zbuild-std`; it is therefore NOT part of `all`.
 #   x86_64    x86_64 VMs and x86 routers
-#   all       Build all targets (default)
+#   all       Build aarch64 + x86_64 (default)
 #
 # Output:
 #   target/<triple>/{debug,release}/mycelium-node
@@ -75,7 +78,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-CARGO_FLAGS="-p mycelium-node"
+CARGO_FLAGS="-p mycelium-daemon"
 if [ "$PROFILE" = "release" ]; then
     CARGO_FLAGS="$CARGO_FLAGS --release"
 fi
@@ -103,6 +106,12 @@ build_target() {
 
     # Check if target is installed
     if ! rustup target list --installed | grep -q "$triple"; then
+        if ! rustup target list | grep -q "^$triple"; then
+            echo "ERROR: $triple is not available via rustup (Tier 3 target)."
+            echo "  Build it with a nightly toolchain and -Zbuild-std, e.g.:"
+            echo "  cargo +nightly build -Zbuild-std $CARGO_FLAGS --target $triple"
+            return 1
+        fi
         echo "Installing Rust target: $triple"
         rustup target add "$triple"
     fi
@@ -148,7 +157,8 @@ echo ""
 mkdir -p "$OUTPUT_DIR"
 
 if [ "$TARGET" = "all" ]; then
-    for arch in aarch64 mipsel x86_64; do
+    # mipsel is excluded: Tier 3 target with no rustup-provided std.
+    for arch in aarch64 x86_64; do
         build_target "$arch"
     done
 elif [[ -v "TARGETS[$TARGET]" ]]; then

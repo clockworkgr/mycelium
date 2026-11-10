@@ -3,10 +3,12 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../models/node_id.dart';
 import '../service/notification_service.dart';
 import '../service/ws_service.dart';
 import 'contacts_provider.dart';
 import 'conversations_provider.dart';
+import 'messages_provider.dart';
 import 'service_provider.dart';
 import 'unread_provider.dart';
 import 'network_status_provider.dart';
@@ -19,40 +21,36 @@ import 'network_status_provider.dart';
 final wsEventBridgeProvider = Provider<void>((ref) {
   final service = ref.watch(myceliumServiceProvider);
   final ws = service.wsService;
-  if (ws == null) return; // WS not connected yet
+  if (ws == null) {
+    // WS not connected yet (e.g. onboarding has not started the node). Rebuild
+    // this provider once the service opens its WebSocket so the bridge is not
+    // dead for the rest of the session.
+    final pending = service.onWsStarted.listen((_) => ref.invalidateSelf());
+    ref.onDispose(pending.cancel);
+    return;
+  }
 
   StreamSubscription<WsEvent>? sub;
 
   sub = ws.events.listen((event) async {
     switch (event) {
       case WsMessageEvent():
-        // New message received — refresh conversations, messages, and unread count
+        // New message received — refresh conversations, the open chat (if
+        // any), and unread count. The notification itself is raised by
+        // MyceliumService so it is not shown twice.
         ref.invalidate(conversationListProvider);
         ref.invalidate(totalUnreadProvider);
+        try {
+          ref.invalidate(chatMessagesProvider(NodeId.fromHex(event.source)));
+        } catch (_) {}
         debugPrint('WS: message from ${event.source.substring(0, 8)}...');
-
-        // Show notification if not viewing this chat
-        if (NotificationService.instance.activeChat != event.source) {
-          // Look up sender display name from contacts
-          String senderName = '${event.source.substring(0, 8)}...';
-          try {
-            final contacts = await ref.read(myceliumServiceProvider).getContacts();
-            final match = contacts.where((c) => c.nodeId.toHex() == event.source);
-            if (match.isNotEmpty) {
-              senderName = match.first.displayName;
-            }
-          } catch (_) {}
-
-          NotificationService.instance.showMessageNotification(
-            senderName: senderName,
-            messageText: event.data,
-            peerHex: event.source,
-          );
-        }
       case WsReceiptEvent():
         // Receipt updated — refresh conversations to show status change
         ref.invalidate(conversationListProvider);
         debugPrint('WS: receipt ${event.messageId.substring(0, 8)}... -> ${event.status}');
+      case WsChannelMessageEvent():
+        // Channel screens poll; nothing to invalidate yet.
+        debugPrint('WS: channel message in ${event.channelId.substring(0, 8)}...');
       case WsPeerEvent():
         // Peer discovered/lost — refresh network status and contacts
         ref.invalidate(networkStatusProvider);

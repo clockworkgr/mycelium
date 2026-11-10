@@ -1,0 +1,22 @@
+[package]
+name = "mycelium-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone Mycelium mesh daemon: node + local REST/WebSocket API"
+
+# The binary keeps the historical name used by scripts, packaging and docs.
+[[bin]]
+name = "mycelium-node"
+path = "src/main.rs"
+
+[dependencies]
+mycelium-node = { workspace = true }
+mycelium-api = { workspace = true }
+mycelium-crypto = { workspace = true }
+mycelium-storage = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }

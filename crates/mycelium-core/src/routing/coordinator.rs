@@ -88,7 +88,7 @@ impl RoutingCoordinator {
         match msg {
             AodvMessage::RouteRequest(rreq) => self.aodv.handle_rreq(rreq, received_from),
             AodvMessage::RouteReply(rrep) => self.aodv.handle_rrep(rrep, received_from),
-            AodvMessage::RouteError(rerr) => self.aodv.handle_rerr(rerr),
+            AodvMessage::RouteError(rerr) => self.aodv.handle_rerr(rerr, received_from),
         }
     }
 

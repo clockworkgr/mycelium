@@ -281,7 +281,8 @@ int32_t mycelium_wifi_on_data_received(
 
 /* --- BLE Outbox (Rust → Platform polling) --- */
 
-/** Dequeue one pending BLE send. Returns 1 if dequeued, 0 if empty, -1 on error. */
+/** Dequeue one pending BLE send. Returns 1 if dequeued, 0 if empty, -1 on error,
+ *  -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len). */
 int32_t mycelium_ble_dequeue_send(
     MyceliumNode *handle,
     uint8_t out_peer_id[32],
@@ -291,7 +292,8 @@ int32_t mycelium_ble_dequeue_send(
 
 /* --- Wi-Fi Direct Outbox (Rust → Platform polling) --- */
 
-/** Dequeue one pending Wi-Fi Direct send. Returns 1 if dequeued, 0 if empty, -1 on error. */
+/** Dequeue one pending Wi-Fi Direct send. Returns 1 if dequeued, 0 if empty, -1 on error,
+ *  -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len). */
 int32_t mycelium_wifi_dequeue_send(
     MyceliumNode *handle,
     uint8_t out_peer_id[32],
@@ -357,7 +359,8 @@ int32_t mycelium_lora_on_data_received(
 
 /* --- LoRa Outbox (Rust → Platform polling) --- */
 
-/** Dequeue one pending LoRa send. Returns 1 if dequeued, 0 if empty, -1 on error. */
+/** Dequeue one pending LoRa send. Returns 1 if dequeued, 0 if empty, -1 on error,
+ *  -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len). */
 int32_t mycelium_lora_dequeue_send(
     MyceliumNode *handle,
     uint8_t out_peer_id[32],
@@ -390,7 +393,8 @@ int32_t mycelium_bt_classic_on_data_received(
 
 /* --- BT Classic Outbox (Rust → Platform polling) --- */
 
-/** Dequeue one pending BT Classic send. Returns 1 if dequeued, 0 if empty, -1 on error. */
+/** Dequeue one pending BT Classic send. Returns 1 if dequeued, 0 if empty, -1 on error,
+ *  -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len). */
 int32_t mycelium_bt_classic_dequeue_send(
     MyceliumNode *handle,
     uint8_t out_peer_id[32],

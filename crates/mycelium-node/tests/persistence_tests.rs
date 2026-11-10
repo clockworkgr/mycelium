@@ -2,18 +2,9 @@
 //! conversation listing, and group serialization roundtrips.
 
 use mycelium_crypto::group::{SenderKey, SenderKeyGroup};
-use mycelium_crypto::identity::Identity;
-use mycelium_node::config::NodeConfig;
-use mycelium_node::node::Node;
 use mycelium_protocol::types::{MessageId, NodeId};
 use mycelium_storage::db::Database;
 use mycelium_storage::dtn::DtnBundleRecord;
-
-fn make_node(identity: Identity) -> Node {
-    let config = NodeConfig::default();
-    let db = Database::open_in_memory().expect("in-memory DB");
-    Node::new(config, db, identity)
-}
 
 // --- DTN Persistence Tests ---
 

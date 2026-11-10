@@ -54,10 +54,8 @@ impl Database {
                 let name: String = row.get(1)?;
                 let creator: Vec<u8> = row.get(2)?;
                 let created_at: u64 = row.get(3)?;
-                let mut channel_id = [0u8; 32];
-                channel_id.copy_from_slice(&cid);
-                let mut creator_bytes = [0u8; 32];
-                creator_bytes.copy_from_slice(&creator);
+                let channel_id: [u8; 32] = crate::db::blob_to_array(0, cid)?;
+                let creator_bytes: [u8; 32] = crate::db::blob_to_array(2, creator)?;
                 Ok(ChannelInfo {
                     channel_id,
                     name,
@@ -80,10 +78,8 @@ impl Database {
             let name: String = row.get(1)?;
             let creator: Vec<u8> = row.get(2)?;
             let created_at: u64 = row.get(3)?;
-            let mut channel_id = [0u8; 32];
-            channel_id.copy_from_slice(&cid);
-            let mut creator_bytes = [0u8; 32];
-            creator_bytes.copy_from_slice(&creator);
+            let channel_id: [u8; 32] = crate::db::blob_to_array(0, cid)?;
+            let creator_bytes: [u8; 32] = crate::db::blob_to_array(2, creator)?;
             Ok(ChannelInfo {
                 channel_id,
                 name,
@@ -133,8 +129,7 @@ impl Database {
         let mut stmt = conn.prepare("SELECT channel_id FROM channel_subscriptions")?;
         let rows = stmt.query_map([], |row| {
             let cid: Vec<u8> = row.get(0)?;
-            let mut channel_id = [0u8; 32];
-            channel_id.copy_from_slice(&cid);
+            let channel_id: [u8; 32] = crate::db::blob_to_array(0, cid)?;
             Ok(channel_id)
         })?;
         let mut result = Vec::new();
@@ -190,12 +185,9 @@ impl Database {
             let data: Vec<u8> = row.get(3)?;
             let ct: i64 = row.get(4)?;
             let ts: u64 = row.get(5)?;
-            let mut message_id = [0u8; 16];
-            message_id.copy_from_slice(&mid);
-            let mut channel_id = [0u8; 32];
-            channel_id.copy_from_slice(&cid);
-            let mut source_bytes = [0u8; 32];
-            source_bytes.copy_from_slice(&src);
+            let message_id: [u8; 16] = crate::db::blob_to_array(0, mid)?;
+            let channel_id: [u8; 32] = crate::db::blob_to_array(1, cid)?;
+            let source_bytes: [u8; 32] = crate::db::blob_to_array(2, src)?;
             Ok(ChannelMessageInfo {
                 message_id,
                 channel_id,

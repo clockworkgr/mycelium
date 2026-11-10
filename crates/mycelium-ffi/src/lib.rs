@@ -13,7 +13,6 @@ use std::sync::{Arc, OnceLock};
 
 use std::sync::Once;
 use tokio::runtime::Runtime;
-use tokio::task::JoinHandle;
 use tracing::info;
 
 use mycelium_core::transport::internet::{InternetConfig, InternetTransport};
@@ -97,8 +96,11 @@ pub extern "C" fn mycelium_clear_error() {
 /// Opaque handle to a MyceliumNode.
 pub struct MyceliumNode {
     node: Arc<Node>,
-    /// Handle to the API server task (started with the node).
-    api_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// Handle to the API server (started with the node).
+    api_handle: std::sync::Mutex<Option<mycelium_api::ApiServerHandle>>,
+    /// Guards against a second `mycelium_node_start`, which would spawn a
+    /// duplicate event loop and fail to rebind the API port.
+    started: std::sync::atomic::AtomicBool,
 }
 
 /// Data record returned to FFI callers.
@@ -202,6 +204,11 @@ pub unsafe extern "C" fn mycelium_node_new(
         }
     });
 
+    if data_dir.is_null() || display_name.is_null() {
+        set_last_error("data_dir and display_name must not be NULL");
+        return std::ptr::null_mut();
+    }
+
     let data_dir = match CStr::from_ptr(data_dir).to_str() {
         Ok(s) => s.to_string(),
         Err(_) => {
@@ -217,7 +224,7 @@ pub unsafe extern "C" fn mycelium_node_new(
         }
     };
 
-    let config = NodeConfig {
+    let mut config = NodeConfig {
         data_dir: data_dir.clone(),
         display_name,
         ..NodeConfig::default()
@@ -226,6 +233,16 @@ pub unsafe extern "C" fn mycelium_node_new(
     if let Err(e) = std::fs::create_dir_all(&data_dir) {
         set_last_error(format!("create_dir_all({}): {}", data_dir, e));
         return std::ptr::null_mut();
+    }
+
+    // The API server requires a bearer token; the app reads it back from
+    // <data_dir>/api.token (owner-only file).
+    match mycelium_api::load_or_create_api_token(&data_dir) {
+        Ok(token) => config.api.auth_token = Some(token),
+        Err(e) => {
+            set_last_error(format!("api token ({}): {}", data_dir, e));
+            return std::ptr::null_mut();
+        }
     }
 
     // Load or generate identity
@@ -275,6 +292,7 @@ pub unsafe extern "C" fn mycelium_node_new(
     let ptr = Box::into_raw(Box::new(MyceliumNode {
         node,
         api_handle: std::sync::Mutex::new(None),
+        started: std::sync::atomic::AtomicBool::new(false),
     }));
     ACTIVE_NODE.store(ptr, Ordering::Release);
     ptr
@@ -286,7 +304,15 @@ pub unsafe extern "C" fn mycelium_node_new(
 /// `handle` must be a valid pointer from `mycelium_node_new`.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_node_start(handle: *mut MyceliumNode) -> bool {
+    if handle.is_null() {
+        set_last_error("handle must not be NULL");
+        return false;
+    }
     let mycelium = &(*handle);
+    if mycelium.started.swap(true, Ordering::AcqRel) {
+        info!("Node already started, ignoring duplicate start");
+        return true;
+    }
     let node = &mycelium.node;
     let start_result = runtime().block_on(async { node.start().await });
 
@@ -298,6 +324,7 @@ pub unsafe extern "C" fn mycelium_node_start(handle: *mut MyceliumNode) -> bool 
             let msg = format!("Node start failed: {}", e);
             info!("{}", msg);
             set_last_error(&msg);
+            mycelium.started.store(false, Ordering::Release);
             return false;
         }
     }
@@ -336,17 +363,21 @@ pub unsafe extern "C" fn mycelium_node_start(handle: *mut MyceliumNode) -> bool 
 /// `handle` must be a valid pointer from `mycelium_node_new`.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_node_stop(handle: *mut MyceliumNode) {
+    if handle.is_null() {
+        return;
+    }
     let mycelium = &(*handle);
 
-    // Abort the API server
+    // Stop the API server and every task it spawned
     if let Ok(mut guard) = mycelium.api_handle.lock() {
-        if let Some(api_task) = guard.take() {
-            api_task.abort();
+        if let Some(api) = guard.take() {
+            api.shutdown();
         }
     }
 
     let node = &mycelium.node;
     runtime().block_on(async { node.stop().await });
+    mycelium.started.store(false, Ordering::Release);
 }
 
 /// Get the node ID as a 32-byte array.
@@ -355,6 +386,9 @@ pub unsafe extern "C" fn mycelium_node_stop(handle: *mut MyceliumNode) {
 /// `handle` must be a valid pointer, `out` must point to 32 bytes.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_node_id(handle: *const MyceliumNode, out: *mut [u8; 32]) {
+    if handle.is_null() || out.is_null() {
+        return;
+    }
     let node = &(*handle).node;
     (*out) = *node.node_id.as_bytes();
 }
@@ -587,9 +621,13 @@ pub unsafe extern "C" fn mycelium_get_contacts(
         info.last_seen = contact.last_seen.unwrap_or(0);
 
         let name_bytes = contact.display_name.as_bytes();
-        let name_len = name_bytes
+        let mut name_len = name_bytes
             .len()
             .min((names_capacity - name_offset) as usize);
+        // Never cut a multi-byte UTF-8 sequence in half.
+        while name_len > 0 && !contact.display_name.is_char_boundary(name_len) {
+            name_len -= 1;
+        }
         info.display_name_len = name_len as u32;
 
         if !out_names.is_null() && name_len > 0 {
@@ -673,7 +711,9 @@ pub unsafe extern "C" fn mycelium_network_status(
         bm.battery_level().unwrap_or(100)
     });
     status.battery_level = battery_level;
-    status.dtn_queue_size = node.db.dtn_storage_used().unwrap_or(0) as u32;
+    // Number of queued bundles (not bytes), matching /v1/network/status.
+    status.dtn_queue_size =
+        runtime().block_on(async { node.routing.read().await.dtn().bundle_count() as u32 });
 
     0
 }
@@ -886,7 +926,7 @@ pub unsafe extern "C" fn mycelium_update_battery(
     let level = if battery_level < 0 {
         None
     } else {
-        Some(battery_level as u8)
+        Some(battery_level.min(100) as u8)
     };
 
     runtime().block_on(async {
@@ -916,23 +956,17 @@ pub unsafe extern "C" fn mycelium_create_group(
         return -1;
     }
 
-    use mycelium_crypto::group::SenderKeyGroup;
-
     let node = &(*handle).node;
-    let mut group_id = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut group_id);
-
-    let group = SenderKeyGroup::new(group_id);
-    let blob = group.to_bytes();
-
-    runtime().block_on(async {
-        let mut groups = node.groups.write().await;
-        groups.insert(group_id, group);
-    });
-
-    let _ = node.db.save_group_blob(&group_id, &blob);
-    (*out_group_id) = group_id;
-    0
+    match runtime().block_on(node.create_group()) {
+        Ok(group_id) => {
+            (*out_group_id) = group_id;
+            0
+        }
+        Err(e) => {
+            set_last_error(format!("create_group: {}", e));
+            -2
+        }
+    }
 }
 
 /// Add a member to a group.
@@ -953,27 +987,18 @@ pub unsafe extern "C" fn mycelium_add_group_member(
         return -1;
     }
 
-    use mycelium_crypto::group::SenderKey;
-
     let node = &(*handle).node;
     let gid = *group_id;
     let mid = NodeId::from_bytes(*member_id);
 
-    let result = runtime().block_on(async {
-        let mut groups = node.groups.write().await;
-        match groups.get_mut(&gid) {
-            Some(group) => {
-                // Generate a sender key for the new member placeholder
-                // In practice, their real sender key comes via SenderKeyDistribution message
-                group.add_member(mid, SenderKey::generate());
-                let _ = node.db.save_group_blob(&gid, &group.to_bytes());
-                0i32
-            }
-            None => -2,
+    // Adds the member and distributes sender keys over pairwise sessions.
+    match runtime().block_on(node.add_group_member(gid, mid)) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(format!("add_group_member: {}", e));
+            -2
         }
-    });
-
-    result
+    }
 }
 
 // --- Message Receive Callback API ---
@@ -1096,7 +1121,7 @@ pub unsafe extern "C" fn mycelium_register_wifi_direct_transport(handle: *mut My
     let wifi =
         Arc::new(mycelium_core::transport::wifi_direct::WifiDirectTransport::new(node.node_id));
     runtime().block_on(async {
-        node.transport_manager.add_transport(wifi.clone()).await;
+        node.transport_manager.replace_transport(wifi.clone()).await;
         *node.wifi_transport.write().await = Some(wifi);
     });
     0
@@ -1314,10 +1339,20 @@ pub unsafe extern "C" fn mycelium_ble_dequeue_send(
 
     match result {
         Some((peer, data)) => {
-            let copy_len = data.len().min(data_capacity as usize);
+            if data.len() > data_capacity as usize {
+                // A truncated frame would corrupt the peer's reassembly; drop it
+                // and report the problem instead of handing out garbage.
+                set_last_error(format!(
+                    "outbox packet of {} bytes exceeds caller buffer of {} bytes; dropped",
+                    data.len(),
+                    data_capacity
+                ));
+                (*out_data_len) = data.len() as u32;
+                return -3;
+            }
             (*out_peer_id) = *peer.as_bytes();
-            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, copy_len);
-            (*out_data_len) = copy_len as u32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, data.len());
+            (*out_data_len) = data.len() as u32;
             1
         }
         None => 0,
@@ -1354,10 +1389,20 @@ pub unsafe extern "C" fn mycelium_wifi_dequeue_send(
 
     match result {
         Some((peer, data)) => {
-            let copy_len = data.len().min(data_capacity as usize);
+            if data.len() > data_capacity as usize {
+                // A truncated frame would corrupt the peer's reassembly; drop it
+                // and report the problem instead of handing out garbage.
+                set_last_error(format!(
+                    "outbox packet of {} bytes exceeds caller buffer of {} bytes; dropped",
+                    data.len(),
+                    data_capacity
+                ));
+                (*out_data_len) = data.len() as u32;
+                return -3;
+            }
             (*out_peer_id) = *peer.as_bytes();
-            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, copy_len);
-            (*out_data_len) = copy_len as u32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, data.len());
+            (*out_data_len) = data.len() as u32;
             1
         }
         None => 0,
@@ -1689,17 +1734,14 @@ pub unsafe extern "C" fn mycelium_remove_group_member(
     let gid = *group_id;
     let mid = NodeId::from_bytes(*member_id);
 
-    runtime().block_on(async {
-        let mut groups = node.groups.write().await;
-        match groups.get_mut(&gid) {
-            Some(group) => {
-                group.remove_member(&mid);
-                let _ = node.db.save_group_blob(&gid, &group.to_bytes());
-                0i32
-            }
-            None => -2,
+    // Rotates our sender key and redistributes it to the remaining members.
+    match runtime().block_on(node.remove_group_member(gid, mid)) {
+        Ok(()) => 0,
+        Err(e) => {
+            set_last_error(format!("remove_group_member: {}", e));
+            -2
         }
-    })
+    }
 }
 
 // --- Display Name ---
@@ -1758,7 +1800,7 @@ pub unsafe extern "C" fn mycelium_register_lora_transport(handle: *mut MyceliumN
         mycelium_core::transport::lora::LoraConfig::default(),
     ));
     runtime().block_on(async {
-        node.transport_manager.add_transport(lora.clone()).await;
+        node.transport_manager.replace_transport(lora.clone()).await;
         *node.lora_transport.write().await = Some(lora);
     });
     0
@@ -1796,7 +1838,7 @@ pub unsafe extern "C" fn mycelium_register_lora_transport_configured(
     let node = &(*handle).node;
     let lora = Arc::new(mycelium_core::transport::lora::LoraTransport::new(config));
     runtime().block_on(async {
-        node.transport_manager.add_transport(lora.clone()).await;
+        node.transport_manager.replace_transport(lora.clone()).await;
         *node.lora_transport.write().await = Some(lora);
     });
     0
@@ -1920,10 +1962,20 @@ pub unsafe extern "C" fn mycelium_lora_dequeue_send(
 
     match result {
         Some((peer, data)) => {
-            let copy_len = data.len().min(data_capacity as usize);
+            if data.len() > data_capacity as usize {
+                // A truncated frame would corrupt the peer's reassembly; drop it
+                // and report the problem instead of handing out garbage.
+                set_last_error(format!(
+                    "outbox packet of {} bytes exceeds caller buffer of {} bytes; dropped",
+                    data.len(),
+                    data_capacity
+                ));
+                (*out_data_len) = data.len() as u32;
+                return -3;
+            }
             (*out_peer_id) = *peer.as_bytes();
-            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, copy_len);
-            (*out_data_len) = copy_len as u32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, data.len());
+            (*out_data_len) = data.len() as u32;
             1
         }
         None => 0,
@@ -2003,7 +2055,7 @@ pub unsafe extern "C" fn mycelium_register_bt_classic_transport(handle: *mut Myc
     let node = &(*handle).node;
     let bt = Arc::new(mycelium_core::transport::bt_classic::BtClassicTransport::new());
     runtime().block_on(async {
-        node.transport_manager.add_transport(bt.clone()).await;
+        node.transport_manager.replace_transport(bt.clone()).await;
         *node.bt_classic_transport.write().await = Some(bt);
     });
     0
@@ -2127,10 +2179,20 @@ pub unsafe extern "C" fn mycelium_bt_classic_dequeue_send(
 
     match result {
         Some((peer, data)) => {
-            let copy_len = data.len().min(data_capacity as usize);
+            if data.len() > data_capacity as usize {
+                // A truncated frame would corrupt the peer's reassembly; drop it
+                // and report the problem instead of handing out garbage.
+                set_last_error(format!(
+                    "outbox packet of {} bytes exceeds caller buffer of {} bytes; dropped",
+                    data.len(),
+                    data_capacity
+                ));
+                (*out_data_len) = data.len() as u32;
+                return -3;
+            }
             (*out_peer_id) = *peer.as_bytes();
-            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, copy_len);
-            (*out_data_len) = copy_len as u32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, data.len());
+            (*out_data_len) = data.len() as u32;
             1
         }
         None => 0,

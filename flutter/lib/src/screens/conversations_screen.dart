@@ -97,8 +97,8 @@ class ConversationsScreen extends ConsumerWidget {
           ),
           FilledButton(
             onPressed: () {
-              final hex = controller.text.trim();
-              if (hex.length == 64) {
+              final hex = controller.text.trim().toLowerCase();
+              if (RegExp(r'^[0-9a-f]{64}$').hasMatch(hex)) {
                 Navigator.pop(ctx);
                 context.go('/conversations/chat/$hex');
               }

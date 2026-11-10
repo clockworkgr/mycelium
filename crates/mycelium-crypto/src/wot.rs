@@ -4,7 +4,7 @@ use ed25519_dalek::Signature;
 
 use mycelium_protocol::types::NodeId;
 
-use crate::identity::{verify_signature, Identity};
+use crate::identity::{node_id_from_public_key, verify_signature, Identity};
 
 /// A signed vouching statement: "I vouch for <vouchee> as <display_name>".
 #[derive(Debug, Clone)]
@@ -40,8 +40,13 @@ impl Vouch {
         }
     }
 
-    /// Verify the vouch signature.
+    /// Verify the vouch signature and that the signing key belongs to `voucher_id`.
     pub fn verify(&self) -> bool {
+        // Without this binding anyone could sign a vouch with their own key
+        // while claiming a trusted node's id as the voucher.
+        if node_id_from_public_key(&self.voucher_public_key) != self.voucher_id {
+            return false;
+        }
         let message = Self::signing_message(
             &self.voucher_id,
             &self.vouchee_id,
@@ -181,7 +186,7 @@ impl TrustGraph {
                 for neighbor in neighbors {
                     if !visited.contains(neighbor) {
                         visited.insert(*neighbor);
-                        queue.push_back((*neighbor, hops + 1));
+                        queue.push_back((*neighbor, hops.saturating_add(1)));
                     }
                 }
             }
@@ -247,7 +252,7 @@ impl TrustGraph {
                 for neighbor in neighbors {
                     if !visited.contains_key(neighbor) {
                         visited.insert(*neighbor, current);
-                        queue.push_back((*neighbor, hops + 1));
+                        queue.push_back((*neighbor, hops.saturating_add(1)));
                     }
                 }
             }
@@ -297,6 +302,25 @@ mod tests {
             1000,
         );
         vouch.display_name = "Eve".to_string(); // tamper
+        assert!(!vouch.verify());
+    }
+
+    /// A vouch signed by Mallory but claiming a trusted node as the voucher
+    /// must not verify.
+    #[test]
+    fn test_vouch_voucher_id_must_match_key() {
+        let mallory = Identity::generate();
+        let trusted = Identity::generate();
+        let vouchee = Identity::generate();
+        let mut vouch = Vouch::create(
+            &mallory,
+            vouchee.node_id(),
+            &vouchee.public_key_bytes(),
+            "Bob",
+            1000,
+        );
+        assert!(vouch.verify());
+        vouch.voucher_id = trusted.node_id();
         assert!(!vouch.verify());
     }
 

@@ -323,6 +323,13 @@ pub enum WsServerMessage {
         level: u8,
         message: String,
     },
+    /// Reply to a client's `send` frame (sent only to that client).
+    #[serde(rename = "send_result")]
+    SendResult {
+        destination: String,
+        message_id: Option<String>,
+        error: Option<String>,
+    },
 }
 
 // --- Emergency ---

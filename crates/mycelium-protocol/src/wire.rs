@@ -124,7 +124,7 @@ impl EncryptedPayload {
         let content_type = data[0];
         let header = WireRatchetHeader::deserialize(&data[1..1 + WireRatchetHeader::SIZE])?;
         let ct_len = u32::from_le_bytes(data[41..45].try_into().unwrap()) as usize;
-        if data.len() < 45 + ct_len {
+        if data.len() - 45 < ct_len {
             return Err(CodecError::PayloadLengthMismatch {
                 header: ct_len,
                 actual: data.len() - 45,
@@ -225,7 +225,7 @@ impl SessionInitPayload {
         let payload_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        if data.len() < offset + payload_len {
+        if data.len() - offset < payload_len {
             return Err(CodecError::PayloadLengthMismatch {
                 header: payload_len,
                 actual: data.len() - offset,
@@ -485,36 +485,64 @@ pub fn deserialize_aodv_rerr(data: &[u8]) -> Result<(NodeId, NodeId, u32), Codec
     ))
 }
 
+/// A DTN bundle handed to a relay (spray-and-wait).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtnRelayPayload {
+    pub message_id: MessageId,
+    /// Spray copies the relay now owns (binary spray gives away half).
+    pub copies_remaining: u8,
+    /// Seconds until the bundle expires, from the sender's point of view.
+    pub ttl_secs: u32,
+    /// The opaque, end-to-end encrypted inner payload.
+    pub payload: Vec<u8>,
+}
+
+impl DtnRelayPayload {
+    /// Fixed body size before the variable payload.
+    pub const HEADER_SIZE: usize = 16 + 1 + 4 + 4;
+}
+
 /// Serialize a DTN relay payload.
-/// Layout: type(1=0x40) + message_id(16) + payload_len(4) + payload
-pub fn serialize_dtn_relay(message_id: &MessageId, payload: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(1 + 16 + 4 + payload.len());
+/// Layout: type(1=0x40) + message_id(16) + copies_remaining(1) + ttl_secs(4)
+///       + payload_len(4) + payload
+pub fn serialize_dtn_relay(relay: &DtnRelayPayload) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + DtnRelayPayload::HEADER_SIZE + relay.payload.len());
     buf.push(WirePayloadType::DtnRelay as u8);
-    buf.extend_from_slice(message_id.as_bytes());
-    buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    buf.extend_from_slice(payload);
+    buf.extend_from_slice(relay.message_id.as_bytes());
+    buf.push(relay.copies_remaining);
+    buf.extend_from_slice(&relay.ttl_secs.to_le_bytes());
+    buf.extend_from_slice(&(relay.payload.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&relay.payload);
     buf
 }
 
 /// Deserialize DTN relay body (after type byte).
-pub fn deserialize_dtn_relay(data: &[u8]) -> Result<(MessageId, Vec<u8>), CodecError> {
-    if data.len() < 20 {
+pub fn deserialize_dtn_relay(data: &[u8]) -> Result<DtnRelayPayload, CodecError> {
+    const H: usize = DtnRelayPayload::HEADER_SIZE;
+    if data.len() < H {
         return Err(CodecError::BufferTooShort {
-            expected: 20,
+            expected: H,
             actual: data.len(),
         });
     }
     let mut msg_id = [0u8; 16];
     msg_id.copy_from_slice(&data[0..16]);
-    let payload_len = u32::from_le_bytes(data[16..20].try_into().unwrap()) as usize;
-    if data.len() < 20 + payload_len {
+    let copies_remaining = data[16];
+    let ttl_secs = u32::from_le_bytes(data[17..21].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(data[21..25].try_into().unwrap()) as usize;
+    if data.len() - H < payload_len {
         return Err(CodecError::PayloadLengthMismatch {
             header: payload_len,
-            actual: data.len() - 20,
+            actual: data.len() - H,
         });
     }
-    let payload = data[20..20 + payload_len].to_vec();
-    Ok((MessageId::from_bytes(msg_id), payload))
+    let payload = data[H..H + payload_len].to_vec();
+    Ok(DtnRelayPayload {
+        message_id: MessageId::from_bytes(msg_id),
+        copies_remaining,
+        ttl_secs,
+        payload,
+    })
 }
 
 // --- Group message serialization ---
@@ -553,26 +581,78 @@ pub fn deserialize_group_message(data: &[u8]) -> Result<([u8; 32], u32, u8, Vec<
     Ok((group_id, iteration, content_type, ciphertext))
 }
 
-/// Serialize a sender key distribution payload.
+/// A member's sender key plus the sender's view of the group roster.
+///
+/// Carried only as the plaintext of a pairwise `EncryptedMessage` (content
+/// type System); a top-level 0x71 envelope is ignored because it would be
+/// unauthenticated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderKeyDistributionPayload {
+    pub group_id: [u8; 32],
+    pub chain_key: [u8; 32],
+    pub iteration: u32,
+    /// Group members as known by the sender (may include the recipient).
+    /// Rosters only ever add members on the receiving side.
+    pub members: Vec<NodeId>,
+    /// Members the sender has removed from the group (explicit, because a
+    /// stale roster must never be mistaken for a removal).
+    pub removed: Vec<NodeId>,
+}
+
+/// Maximum members carried in one distribution (spec targets groups < 20).
+pub const MAX_DISTRIBUTION_MEMBERS: usize = 255;
+
+/// Serialize a sender key distribution.
 /// Layout: type(1=0x71) + group_id(32) + chain_key(32) + iteration(4)
-pub fn serialize_sender_key_distribution(
-    group_id: &[u8; 32],
-    chain_key: &[u8; 32],
-    iteration: u32,
-) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(69);
+///       + member_count(1) + members(32 each) + removed_count(1) + removed(32 each)
+pub fn serialize_sender_key_distribution(payload: &SenderKeyDistributionPayload) -> Vec<u8> {
+    let count = payload.members.len().min(MAX_DISTRIBUTION_MEMBERS);
+    let removed = payload.removed.len().min(MAX_DISTRIBUTION_MEMBERS);
+    let mut buf = Vec::with_capacity(71 + (count + removed) * 32);
     buf.push(WirePayloadType::SenderKeyDistribution as u8);
-    buf.extend_from_slice(group_id);
-    buf.extend_from_slice(chain_key);
-    buf.extend_from_slice(&iteration.to_le_bytes());
+    buf.extend_from_slice(&payload.group_id);
+    buf.extend_from_slice(&payload.chain_key);
+    buf.extend_from_slice(&payload.iteration.to_le_bytes());
+    buf.push(count as u8);
+    for member in payload.members.iter().take(count) {
+        buf.extend_from_slice(member.as_bytes());
+    }
+    buf.push(removed as u8);
+    for member in payload.removed.iter().take(removed) {
+        buf.extend_from_slice(member.as_bytes());
+    }
     buf
 }
 
-/// Deserialize sender key distribution body (after type byte).
-/// Returns: (group_id, chain_key, iteration)
+/// Parse `count(1) + count * NodeId(32)` at `offset`; returns the ids and
+/// the offset just past them. Absent section (offset == len) is empty.
+fn parse_node_list(data: &[u8], offset: usize) -> Result<(Vec<NodeId>, usize), CodecError> {
+    if offset >= data.len() {
+        return Ok((Vec::new(), offset));
+    }
+    let count = data[offset] as usize;
+    let start = offset + 1;
+    if (data.len() - start) / 32 < count {
+        return Err(CodecError::BufferTooShort {
+            expected: start + count * 32,
+            actual: data.len(),
+        });
+    }
+    let mut ids = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = start + i * 32;
+        let mut id = [0u8; 32];
+        id.copy_from_slice(&data[at..at + 32]);
+        ids.push(NodeId::from_bytes(id));
+    }
+    Ok((ids, start + count * 32))
+}
+
+/// Deserialize a sender key distribution body (after type byte). A body
+/// without the member section (68 bytes) is accepted with an empty roster.
 pub fn deserialize_sender_key_distribution(
     data: &[u8],
-) -> Result<([u8; 32], [u8; 32], u32), CodecError> {
+) -> Result<SenderKeyDistributionPayload, CodecError> {
     if data.len() < 68 {
         return Err(CodecError::BufferTooShort {
             expected: 68,
@@ -584,7 +664,17 @@ pub fn deserialize_sender_key_distribution(
     let mut chain_key = [0u8; 32];
     chain_key.copy_from_slice(&data[32..64]);
     let iteration = u32::from_le_bytes(data[64..68].try_into().unwrap());
-    Ok((group_id, chain_key, iteration))
+
+    let (members, offset) = parse_node_list(data, 68)?;
+    let (removed, _) = parse_node_list(data, offset)?;
+
+    Ok(SenderKeyDistributionPayload {
+        group_id,
+        chain_key,
+        iteration,
+        members,
+        removed,
+    })
 }
 
 /// Receipt type for delivery/read receipts.
@@ -820,9 +910,10 @@ pub fn deserialize_emergency_broadcast(
         actual: 0,
     })?;
     let msg_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-    if data.len() < 5 + msg_len + 1 {
+    // Need msg_len bytes of message plus one cosigner-count byte after offset 5.
+    if data.len() - 5 <= msg_len {
         return Err(CodecError::BufferTooShort {
-            expected: 5 + msg_len + 1,
+            expected: msg_len.saturating_add(6),
             actual: data.len(),
         });
     }
@@ -983,13 +1074,26 @@ mod tests {
 
     #[test]
     fn test_dtn_relay_roundtrip() {
-        let msg_id = MessageId::from_bytes([99u8; 16]);
-        let payload = b"dtn bundle data";
-        let bytes = serialize_dtn_relay(&msg_id, payload);
+        let relay = DtnRelayPayload {
+            message_id: MessageId::from_bytes([99u8; 16]),
+            copies_remaining: 4,
+            ttl_secs: 3600,
+            payload: b"dtn bundle data".to_vec(),
+        };
+        let bytes = serialize_dtn_relay(&relay);
         assert_eq!(bytes[0], WirePayloadType::DtnRelay as u8);
-        let (decoded_id, decoded_payload) = deserialize_dtn_relay(&bytes[1..]).unwrap();
-        assert_eq!(*decoded_id.as_bytes(), [99u8; 16]);
-        assert_eq!(decoded_payload, payload);
+        assert_eq!(
+            bytes.len(),
+            1 + DtnRelayPayload::HEADER_SIZE + relay.payload.len()
+        );
+        let decoded = deserialize_dtn_relay(&bytes[1..]).unwrap();
+        assert_eq!(decoded, relay);
+
+        // Truncated body and inconsistent length prefix are rejected.
+        assert!(deserialize_dtn_relay(&bytes[1..DtnRelayPayload::HEADER_SIZE]).is_err());
+        let mut bad = bytes[1..].to_vec();
+        bad[21..25].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(deserialize_dtn_relay(&bad).is_err());
     }
 
     #[test]
@@ -1021,14 +1125,33 @@ mod tests {
 
     #[test]
     fn test_sender_key_distribution_roundtrip() {
-        let group_id = [0xBB; 32];
-        let chain_key = [0xCC; 32];
-        let bytes = serialize_sender_key_distribution(&group_id, &chain_key, 7);
+        let payload = SenderKeyDistributionPayload {
+            group_id: [0xBB; 32],
+            chain_key: [0xCC; 32],
+            iteration: 7,
+            members: vec![NodeId([1u8; 32]), NodeId([2u8; 32])],
+            removed: vec![NodeId([3u8; 32])],
+        };
+        let bytes = serialize_sender_key_distribution(&payload);
         assert_eq!(bytes[0], WirePayloadType::SenderKeyDistribution as u8);
-        let (gid, ck, iter) = deserialize_sender_key_distribution(&bytes[1..]).unwrap();
-        assert_eq!(gid, group_id);
-        assert_eq!(ck, chain_key);
-        assert_eq!(iter, 7);
+        assert_eq!(bytes.len(), 1 + 68 + 1 + 64 + 1 + 32);
+        let decoded = deserialize_sender_key_distribution(&bytes[1..]).unwrap();
+        assert_eq!(decoded, payload);
+
+        // Members without a removed section → empty removals
+        let no_removed = deserialize_sender_key_distribution(&bytes[1..1 + 68 + 1 + 64]).unwrap();
+        assert_eq!(no_removed.members, payload.members);
+        assert!(no_removed.removed.is_empty());
+
+        // Legacy body without roster is accepted with no members
+        let legacy = deserialize_sender_key_distribution(&bytes[1..69]).unwrap();
+        assert!(legacy.members.is_empty());
+        assert_eq!(legacy.iteration, 7);
+
+        // Roster count larger than the data is rejected
+        let mut bad = bytes[1..].to_vec();
+        bad[68] = 9;
+        assert!(deserialize_sender_key_distribution(&bad).is_err());
     }
 
     #[test]

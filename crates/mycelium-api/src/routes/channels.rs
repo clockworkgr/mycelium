@@ -15,6 +15,28 @@ use crate::types::{
 };
 
 /// Helper: parse a hex-encoded 32-byte channel ID.
+/// Reject operations on channels this node has never heard of, instead of
+/// creating orphan subscriptions/messages for an id nobody created.
+fn ensure_channel_exists(
+    state: &AppState,
+    channel_id: &[u8; 32],
+) -> Result<(), (StatusCode, Json<ApiError>)> {
+    state
+        .node
+        .db
+        .get_channel(channel_id)
+        .map(|_| ())
+        .map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError {
+                    error: "channel not found".to_string(),
+                    code: 404,
+                }),
+            )
+        })
+}
+
 fn parse_channel_id(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
     let bytes = hex::decode(hex_str).map_err(|_| {
         (
@@ -114,6 +136,7 @@ pub async fn subscribe(
     Path(channel_id_hex): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     let channel_id = parse_channel_id(&channel_id_hex)?;
+    ensure_channel_exists(&state, &channel_id)?;
 
     state.node.db.subscribe_channel(&channel_id).map_err(|e| {
         (
@@ -196,6 +219,7 @@ pub async fn post_message(
     Json(req): Json<PostChannelMessageRequest>,
 ) -> Result<(StatusCode, Json<SendMessageResponse>), (StatusCode, Json<ApiError>)> {
     let channel_id = parse_channel_id(&channel_id_hex)?;
+    ensure_channel_exists(&state, &channel_id)?;
 
     let message_id = MessageId::random();
     let timestamp = SystemTime::now()

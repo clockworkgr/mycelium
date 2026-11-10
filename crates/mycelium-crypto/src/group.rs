@@ -7,6 +7,13 @@ use std::collections::HashMap;
 
 use mycelium_protocol::types::NodeId;
 
+/// Maximum number of chain iterations a single incoming group message may
+/// skip ahead. Bounds CPU spent on a forged `iteration` (each step is a hash).
+pub const MAX_GROUP_SKIP: u32 = 1000;
+
+/// Maximum skipped message keys retained per sender for out-of-order delivery.
+const MAX_GROUP_SKIPPED_KEYS: usize = 2000;
+
 /// A sender key for group messaging.
 /// Each group member generates their own sender key and distributes it
 /// to all other members via pairwise Double Ratchet sessions.
@@ -16,6 +23,9 @@ pub struct SenderKey {
     pub chain_key: [u8; 32],
     /// Current iteration in the chain.
     pub iteration: u32,
+    /// Message keys for iterations that were skipped (message arrived out of
+    /// order or was lost). Not persisted: lost on restart.
+    skipped_keys: HashMap<u32, [u8; 32]>,
 }
 
 impl SenderKey {
@@ -23,37 +33,63 @@ impl SenderKey {
     pub fn generate() -> Self {
         let mut chain_key = [0u8; 32];
         rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut chain_key);
+        Self::from_parts(chain_key, 0)
+    }
+
+    /// Build a sender key from a distributed chain key and iteration.
+    pub fn from_parts(chain_key: [u8; 32], iteration: u32) -> Self {
         Self {
             chain_key,
-            iteration: 0,
+            iteration,
+            skipped_keys: HashMap::new(),
         }
     }
 
     /// Derive the message key for the current iteration and advance the chain.
-    pub fn next_message_key(&mut self) -> (u32, [u8; 32]) {
+    ///
+    /// Fails once the 32-bit chain is exhausted rather than wrapping, since a
+    /// repeated iteration would reuse an AEAD nonce.
+    pub fn next_message_key(&mut self) -> Result<(u32, [u8; 32]), GroupError> {
         let iteration = self.iteration;
+        let next = iteration.checked_add(1).ok_or(GroupError::ChainExhausted)?;
         let message_key = derive_message_key(&self.chain_key, iteration);
         self.chain_key = derive_next_chain_key(&self.chain_key);
-        self.iteration += 1;
-        (iteration, message_key)
+        self.iteration = next;
+        Ok((iteration, message_key))
     }
 
     /// Derive the message key for a specific iteration (for decryption).
-    /// Advances the chain if needed.
+    ///
+    /// Advances the chain if needed, retaining the keys of skipped iterations
+    /// so messages that arrive later (out of order) can still be decrypted.
     pub fn message_key_for_iteration(&mut self, target: u32) -> Result<[u8; 32], GroupError> {
         if target < self.iteration {
-            return Err(GroupError::IterationAlreadyUsed);
+            return self
+                .skipped_keys
+                .remove(&target)
+                .ok_or(GroupError::IterationAlreadyUsed);
         }
 
-        // Advance chain to target iteration
+        let gap = target - self.iteration;
+        if gap > MAX_GROUP_SKIP {
+            return Err(GroupError::TooManySkippedKeys);
+        }
+        if self.skipped_keys.len().saturating_add(gap as usize) > MAX_GROUP_SKIPPED_KEYS {
+            return Err(GroupError::TooManySkippedKeys);
+        }
+        let next = target.checked_add(1).ok_or(GroupError::ChainExhausted)?;
+
+        // Advance chain to target iteration, keeping skipped keys
         while self.iteration < target {
+            let skipped = derive_message_key(&self.chain_key, self.iteration);
+            self.skipped_keys.insert(self.iteration, skipped);
             self.chain_key = derive_next_chain_key(&self.chain_key);
             self.iteration += 1;
         }
 
         let message_key = derive_message_key(&self.chain_key, self.iteration);
         self.chain_key = derive_next_chain_key(&self.chain_key);
-        self.iteration += 1;
+        self.iteration = next;
 
         Ok(message_key)
     }
@@ -90,6 +126,26 @@ impl SenderKeyGroup {
         }
     }
 
+    /// Add a member whose sender key has not arrived yet. Their messages
+    /// fail with `UnknownSender` until `add_member` installs the real key.
+    pub fn add_pending_member(&mut self, member: NodeId) {
+        if !self.members.contains(&member) {
+            self.members.push(member);
+        }
+    }
+
+    /// Whether `node` is on the member list (with or without a key).
+    pub fn is_member(&self, node: &NodeId) -> bool {
+        self.members.contains(node)
+    }
+
+    /// Drop a member without rotating our key (used when another member's
+    /// roster tells us someone left).
+    pub fn forget_member(&mut self, member: &NodeId) {
+        self.member_keys.remove(member);
+        self.members.retain(|m| m != member);
+    }
+
     /// Remove a member and rotate our sender key.
     pub fn remove_member(&mut self, member: &NodeId) {
         self.member_keys.remove(member);
@@ -100,7 +156,7 @@ impl SenderKeyGroup {
 
     /// Encrypt a message for the group using our sender key.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<GroupMessage, GroupError> {
-        let (iteration, message_key) = self.our_sender_key.next_message_key();
+        let (iteration, message_key) = self.our_sender_key.next_message_key()?;
 
         let ciphertext = encrypt_group_aead(&message_key, plaintext, &self.group_id)?;
 
@@ -112,6 +168,9 @@ impl SenderKeyGroup {
     }
 
     /// Decrypt a group message from a specific sender.
+    ///
+    /// The sender's chain state is committed only if the ciphertext
+    /// authenticates, so a forged message cannot advance or corrupt it.
     pub fn decrypt(
         &mut self,
         sender: &NodeId,
@@ -122,17 +181,16 @@ impl SenderKeyGroup {
             .get_mut(sender)
             .ok_or(GroupError::UnknownSender)?;
 
-        let message_key = sender_key.message_key_for_iteration(message.iteration)?;
-
-        decrypt_group_aead(&message_key, &message.ciphertext, &self.group_id)
+        let mut candidate = sender_key.clone();
+        let message_key = candidate.message_key_for_iteration(message.iteration)?;
+        let plaintext = decrypt_group_aead(&message_key, &message.ciphertext, &self.group_id)?;
+        *sender_key = candidate;
+        Ok(plaintext)
     }
 
     /// Get our sender key for distribution to other members.
     pub fn our_sender_key_for_distribution(&self) -> SenderKey {
-        SenderKey {
-            chain_key: self.our_sender_key.chain_key,
-            iteration: self.our_sender_key.iteration,
-        }
+        SenderKey::from_parts(self.our_sender_key.chain_key, self.our_sender_key.iteration)
     }
 
     /// Number of members.
@@ -186,7 +244,8 @@ impl SenderKeyGroup {
         let num_members = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
         offset += 4;
 
-        if data.len() < offset + num_members * 68 {
+        // Overflow-safe on 32-bit targets: compare against the remaining length.
+        if (data.len() - offset) / 68 < num_members {
             return None;
         }
 
@@ -207,21 +266,18 @@ impl SenderKeyGroup {
 
             let node_id = NodeId(node_id_bytes);
             members.push(node_id);
-            member_keys.insert(
-                node_id,
-                SenderKey {
-                    chain_key,
-                    iteration,
-                },
-            );
+            // An all-zero chain key at iteration 0 is the placeholder written
+            // for members whose sender key has not been received yet; restore
+            // them as key-less so decryption reports UnknownSender, not a
+            // spurious AEAD failure.
+            if chain_key != [0u8; 32] || iteration != 0 {
+                member_keys.insert(node_id, SenderKey::from_parts(chain_key, iteration));
+            }
         }
 
         Some(Self {
             group_id,
-            our_sender_key: SenderKey {
-                chain_key: our_chain_key,
-                iteration: our_iteration,
-            },
+            our_sender_key: SenderKey::from_parts(our_chain_key, our_iteration),
             member_keys,
             members,
         })
@@ -311,6 +367,10 @@ pub enum GroupError {
     UnknownSender,
     #[error("message iteration already used")]
     IterationAlreadyUsed,
+    #[error("message skips too many chain iterations")]
+    TooManySkippedKeys,
+    #[error("sender key chain exhausted")]
+    ChainExhausted,
     #[error("crypto error")]
     CryptoError,
     #[error("encryption failed")]
@@ -332,11 +392,85 @@ mod tests {
     #[test]
     fn test_sender_key_chain() {
         let mut sk = SenderKey::generate();
-        let (iter0, key0) = sk.next_message_key();
-        let (iter1, key1) = sk.next_message_key();
+        let (iter0, key0) = sk.next_message_key().unwrap();
+        let (iter1, key1) = sk.next_message_key().unwrap();
         assert_eq!(iter0, 0);
         assert_eq!(iter1, 1);
         assert_ne!(key0, key1); // Different message keys
+    }
+
+    /// Messages from one sender may arrive in any order over a DTN mesh.
+    #[test]
+    fn test_group_out_of_order_decrypt() {
+        let group_id = make_group_id();
+        let alice_id = NodeId([1u8; 32]);
+        let mut alice_group = SenderKeyGroup::new(group_id);
+        let mut bob_group = SenderKeyGroup::new(group_id);
+        bob_group.add_member(alice_id, alice_group.our_sender_key_for_distribution());
+
+        let m0 = alice_group.encrypt(b"zero").unwrap();
+        let m1 = alice_group.encrypt(b"one").unwrap();
+        let m2 = alice_group.encrypt(b"two").unwrap();
+
+        assert_eq!(bob_group.decrypt(&alice_id, &m2).unwrap(), b"two");
+        assert_eq!(bob_group.decrypt(&alice_id, &m0).unwrap(), b"zero");
+        assert_eq!(bob_group.decrypt(&alice_id, &m1).unwrap(), b"one");
+        // Replay of an already-used iteration is rejected.
+        assert!(matches!(
+            bob_group.decrypt(&alice_id, &m1),
+            Err(GroupError::IterationAlreadyUsed)
+        ));
+    }
+
+    /// A forged message must neither hang the CPU (huge iteration) nor
+    /// advance the sender's chain past the real messages.
+    #[test]
+    fn test_group_forged_iteration_does_not_corrupt_chain() {
+        let group_id = make_group_id();
+        let alice_id = NodeId([1u8; 32]);
+        let mut alice_group = SenderKeyGroup::new(group_id);
+        let mut bob_group = SenderKeyGroup::new(group_id);
+        bob_group.add_member(alice_id, alice_group.our_sender_key_for_distribution());
+
+        let forged_far = GroupMessage {
+            group_id,
+            iteration: u32::MAX,
+            ciphertext: vec![0u8; 32],
+        };
+        assert!(matches!(
+            bob_group.decrypt(&alice_id, &forged_far),
+            Err(GroupError::TooManySkippedKeys)
+        ));
+
+        let forged_near = GroupMessage {
+            group_id,
+            iteration: 5,
+            ciphertext: vec![0u8; 32],
+        };
+        assert!(matches!(
+            bob_group.decrypt(&alice_id, &forged_near),
+            Err(GroupError::DecryptionFailed)
+        ));
+
+        // Real traffic still decrypts from iteration 0.
+        let m0 = alice_group.encrypt(b"zero").unwrap();
+        assert_eq!(bob_group.decrypt(&alice_id, &m0).unwrap(), b"zero");
+    }
+
+    /// Persisted groups restore key-less members as key-less.
+    #[test]
+    fn test_group_serialization_preserves_missing_keys() {
+        let group_id = make_group_id();
+        let mut group = SenderKeyGroup::new(group_id);
+        let keyed = NodeId([1u8; 32]);
+        let placeholder = NodeId([2u8; 32]);
+        group.add_member(keyed, SenderKey::generate());
+        group.members.push(placeholder);
+
+        let restored = SenderKeyGroup::from_bytes(&group.to_bytes()).unwrap();
+        assert_eq!(restored.member_count(), 2);
+        assert!(restored.member_keys.contains_key(&keyed));
+        assert!(!restored.member_keys.contains_key(&placeholder));
     }
 
     #[test]
@@ -370,7 +504,6 @@ mod tests {
     fn test_group_multiple_messages() {
         let group_id = make_group_id();
         let alice_id = NodeId([1u8; 32]);
-        let bob_id = NodeId([2u8; 32]);
 
         let mut alice_group = SenderKeyGroup::new(group_id);
         let mut bob_group = SenderKeyGroup::new(group_id);

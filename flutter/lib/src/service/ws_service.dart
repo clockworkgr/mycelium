@@ -4,6 +4,8 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'api_client.dart';
+
 /// Event types received from the Mycelium WebSocket API.
 sealed class WsEvent {}
 
@@ -56,6 +58,24 @@ class WsEmergencyEvent extends WsEvent {
   });
 }
 
+class WsChannelMessageEvent extends WsEvent {
+  final String channelId;
+  final String source;
+  final String messageId;
+  final String data;
+  final int contentType;
+  final int timestamp;
+
+  WsChannelMessageEvent({
+    required this.channelId,
+    required this.source,
+    required this.messageId,
+    required this.data,
+    required this.contentType,
+    required this.timestamp,
+  });
+}
+
 class WsNetworkEvent extends WsEvent {
   final int neighborCount;
   final bool isConnected;
@@ -91,11 +111,20 @@ class WsService {
     _doConnect();
   }
 
+  /// WebSocket URL carrying the bearer token as a query parameter (the
+  /// server accepts it there because browser clients cannot set headers).
+  Uri _wsUri() {
+    final uri = Uri.parse(_wsUrl);
+    final token = ApiClient.authToken;
+    if (token == null || token.isEmpty) return uri;
+    return uri.replace(queryParameters: {'token': token});
+  }
+
   void _doConnect() {
     if (_stopped) return;
 
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
+      _channel = WebSocketChannel.connect(_wsUri());
       _subscription = _channel!.stream.listen(
         _onData,
         onError: (error) {
@@ -151,6 +180,15 @@ class WsService {
             neighborCount: json['neighbor_count'] as int? ?? 0,
             isConnected: json['is_connected'] as bool? ?? false,
             dtnQueueSize: json['dtn_queue_size'] as int? ?? 0,
+          ));
+        case 'channel_message':
+          _eventController.add(WsChannelMessageEvent(
+            channelId: json['channel_id'] as String? ?? '',
+            source: json['source'] as String? ?? '',
+            messageId: json['message_id'] as String? ?? '',
+            data: json['data'] as String? ?? '',
+            contentType: json['content_type'] as int? ?? 0,
+            timestamp: json['timestamp'] as int? ?? 0,
           ));
         case 'emergency':
           _eventController.add(WsEmergencyEvent(

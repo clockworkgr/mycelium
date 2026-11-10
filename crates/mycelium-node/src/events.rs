@@ -6,7 +6,6 @@ use mycelium_protocol::types::{MessageId, NodeId};
 ///
 /// These are consumed by the API server and broadcast to WebSocket clients.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum NodeEvent {
     /// A new message was received and stored.
     MessageReceived {

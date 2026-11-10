@@ -25,8 +25,12 @@ pub struct PrekeyState {
     pub identity: Identity,
     pub signed_prekey_secret: X25519Secret,
     pub signed_prekey_id: u32,
-    /// One-time prekeys: (id, secret)
+    /// One-time prekeys not yet handed out in any bundle: (id, secret)
     pub one_time_prekeys: Vec<(u32, X25519Secret)>,
+    /// One-time prekeys already included in an issued bundle but not yet
+    /// consumed by an incoming `SessionInit`. Kept so the responder can still
+    /// complete X3DH, but never re-issued to another initiator.
+    issued_one_time_prekeys: Vec<(u32, X25519Secret)>,
     next_otp_id: u32,
     next_spk_id: u32,
 }
@@ -39,6 +43,7 @@ impl PrekeyState {
             signed_prekey_secret,
             signed_prekey_id: 1,
             one_time_prekeys: Vec::new(),
+            issued_one_time_prekeys: Vec::new(),
             next_otp_id: 1,
             next_spk_id: 2,
         }
@@ -60,15 +65,40 @@ impl PrekeyState {
         self.next_spk_id += 1;
     }
 
-    /// Build a prekey bundle to publish.
+    /// Build a prekey bundle without reserving the one-time prekey.
+    ///
+    /// Peeks at the most recent unissued OTP. Use [`issue_bundle`](Self::issue_bundle)
+    /// when actually answering a prekey request so that no two initiators are
+    /// handed the same one-time prekey.
     pub fn bundle(&self) -> PrekeyBundle {
+        let otp = self.one_time_prekeys.last();
+        self.build_bundle(otp)
+    }
+
+    /// Build a prekey bundle and reserve its one-time prekey.
+    ///
+    /// The OTP is moved out of the unissued pool so a subsequent call hands out
+    /// a different key; it stays available for [`consume_one_time_prekey`]
+    /// until an initiator uses it. Returns a bundle without an OTP when the
+    /// pool is empty.
+    pub fn issue_bundle(&mut self) -> PrekeyBundle {
+        match self.one_time_prekeys.pop() {
+            Some(entry) => {
+                let bundle = self.build_bundle(Some(&entry));
+                self.issued_one_time_prekeys.push(entry);
+                bundle
+            }
+            None => self.build_bundle(None),
+        }
+    }
+
+    fn build_bundle(&self, otp: Option<&(u32, X25519Secret)>) -> PrekeyBundle {
         let spk_public = X25519Public::from(&self.signed_prekey_secret);
         let signature = self.identity.sign(spk_public.as_bytes());
 
-        let (otp, otp_id) = if let Some((id, secret)) = self.one_time_prekeys.last() {
-            (Some(*X25519Public::from(secret).as_bytes()), Some(*id))
-        } else {
-            (None, None)
+        let (otp, otp_id) = match otp {
+            Some((id, secret)) => (Some(*X25519Public::from(secret).as_bytes()), Some(*id)),
+            None => (None, None),
         };
 
         PrekeyBundle {
@@ -81,8 +111,20 @@ impl PrekeyState {
         }
     }
 
+    /// Number of one-time prekeys that can still be issued in new bundles.
+    pub fn available_one_time_prekeys(&self) -> usize {
+        self.one_time_prekeys.len()
+    }
+
     /// Consume a one-time prekey by ID (marks it as used).
     pub fn consume_one_time_prekey(&mut self, id: u32) -> Option<X25519Secret> {
+        if let Some(pos) = self
+            .issued_one_time_prekeys
+            .iter()
+            .position(|(pid, _)| *pid == id)
+        {
+            return Some(self.issued_one_time_prekeys.remove(pos).1);
+        }
         if let Some(pos) = self.one_time_prekeys.iter().position(|(pid, _)| *pid == id) {
             let (_, secret) = self.one_time_prekeys.remove(pos);
             Some(secret)
@@ -96,7 +138,9 @@ impl PrekeyState {
     /// Format: signed_prekey_secret(32) + signed_prekey_id(4) + next_otp_id(4)
     ///       + next_spk_id(4) + num_otps(4) + [otp_id(4) + otp_secret(32)]*
     pub fn to_bytes(&self) -> Vec<u8> {
-        let num_otps = self.one_time_prekeys.len();
+        // Issued-but-unconsumed OTPs are persisted alongside the unissued pool;
+        // after a restart they become issuable again, which is harmless.
+        let num_otps = self.one_time_prekeys.len() + self.issued_one_time_prekeys.len();
         let mut buf = Vec::with_capacity(48 + num_otps * 36);
 
         buf.extend_from_slice(&self.signed_prekey_secret.to_bytes());
@@ -105,7 +149,11 @@ impl PrekeyState {
         buf.extend_from_slice(&self.next_spk_id.to_le_bytes());
         buf.extend_from_slice(&(num_otps as u32).to_le_bytes());
 
-        for (id, secret) in &self.one_time_prekeys {
+        for (id, secret) in self
+            .issued_one_time_prekeys
+            .iter()
+            .chain(self.one_time_prekeys.iter())
+        {
             buf.extend_from_slice(&id.to_le_bytes());
             buf.extend_from_slice(&secret.to_bytes());
         }
@@ -138,7 +186,8 @@ impl PrekeyState {
         let num_otps = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
         offset += 4;
 
-        if data.len() < offset + num_otps * 36 {
+        // Overflow-safe on 32-bit targets: compare against the remaining length.
+        if (data.len() - offset) / 36 < num_otps {
             return None;
         }
 
@@ -160,6 +209,7 @@ impl PrekeyState {
             signed_prekey_secret,
             signed_prekey_id,
             one_time_prekeys,
+            issued_one_time_prekeys: Vec::new(),
             next_otp_id,
             next_spk_id,
         })
@@ -218,7 +268,7 @@ pub fn x3dh_initiate(
     let ephemeral_public = X25519Public::from(&ephemeral_secret);
 
     let their_signed_prekey = X25519Public::from(their_bundle.signed_prekey);
-    let their_identity_x25519 = ed25519_public_to_x25519(&their_bundle.identity_key);
+    let their_identity_x25519 = ed25519_public_to_x25519(&their_bundle.identity_key)?;
 
     // DH operations
     let dh1 = our_identity_x25519.diffie_hellman(&their_signed_prekey);
@@ -257,7 +307,7 @@ pub fn x3dh_respond(
     their_ephemeral_key: &[u8; 32],
     used_otp_id: Option<u32>,
 ) -> Result<X3dhResponseResult, X3dhError> {
-    let their_identity_x25519 = ed25519_public_to_x25519(their_identity_key);
+    let their_identity_x25519 = ed25519_public_to_x25519(their_identity_key)?;
     let their_ephemeral = X25519Public::from(*their_ephemeral_key);
 
     // Convert our Ed25519 identity to X25519
@@ -312,13 +362,16 @@ fn ed25519_to_x25519_secret(signing_key: &SigningKey) -> X25519Secret {
 }
 
 /// Convert Ed25519 public key to X25519 public key (Edwards -> Montgomery).
-fn ed25519_public_to_x25519(ed25519_pubkey: &[u8; 32]) -> X25519Public {
-    use curve25519_dalek::edwards::CompressedEdwardsY;
-    let compressed =
-        CompressedEdwardsY::from_slice(ed25519_pubkey).expect("invalid Ed25519 public key length");
-    let point = compressed.decompress().expect("invalid Ed25519 point");
-    let montgomery = point.to_montgomery();
-    X25519Public::from(*montgomery.as_bytes())
+///
+/// Returns `InvalidIdentityKey` for byte strings that are not a valid
+/// Ed25519 point (roughly half of all random 32-byte values). This must never
+/// panic: `x3dh_respond` receives the key straight from a network peer.
+fn ed25519_public_to_x25519(ed25519_pubkey: &[u8; 32]) -> Result<X25519Public, X3dhError> {
+    // VerifyingKey::from_bytes rejects non-canonical / non-decompressible points.
+    let verifying =
+        VerifyingKey::from_bytes(ed25519_pubkey).map_err(|_| X3dhError::InvalidIdentityKey)?;
+    let montgomery = verifying.to_montgomery();
+    Ok(X25519Public::from(montgomery.to_bytes()))
 }
 
 /// KDF for X3DH: HKDF-SHA256 with protocol-specific info.
@@ -344,6 +397,63 @@ pub enum X3dhError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A non-decompressible Ed25519 encoding (y = 2 has no valid x) must be
+    /// rejected, not panic, on the responder side.
+    #[test]
+    fn test_x3dh_respond_rejects_invalid_identity_key() {
+        let mut bob_state = PrekeyState::new(Identity::generate());
+        let mut bad_key = [0u8; 32];
+        bad_key[0] = 0x02;
+        let result = x3dh_respond(&mut bob_state, &bad_key, &[7u8; 32], None);
+        assert!(matches!(result, Err(X3dhError::InvalidIdentityKey)));
+    }
+
+    /// Two initiators must never be handed the same one-time prekey.
+    #[test]
+    fn test_issue_bundle_reserves_one_time_prekey() {
+        let mut bob_state = PrekeyState::new(Identity::generate());
+        bob_state.generate_one_time_prekeys(3);
+
+        let b1 = bob_state.issue_bundle();
+        let b2 = bob_state.issue_bundle();
+        assert_ne!(b1.one_time_prekey_id, b2.one_time_prekey_id);
+        assert_eq!(bob_state.available_one_time_prekeys(), 1);
+
+        // Both initiators can still complete X3DH with their issued OTP.
+        let alice = Identity::generate();
+        let carol = Identity::generate();
+        let a = x3dh_initiate(&alice, &b1).unwrap();
+        let c = x3dh_initiate(&carol, &b2).unwrap();
+        let ra = x3dh_respond(
+            &mut bob_state,
+            &alice.public_key_bytes(),
+            &a.ephemeral_public,
+            b1.one_time_prekey_id,
+        )
+        .unwrap();
+        let rc = x3dh_respond(
+            &mut bob_state,
+            &carol.public_key_bytes(),
+            &c.ephemeral_public,
+            b2.one_time_prekey_id,
+        )
+        .unwrap();
+        assert_eq!(a.shared_secret, ra.shared_secret);
+        assert_eq!(c.shared_secret, rc.shared_secret);
+
+        // Issued OTPs survive a persistence round-trip.
+        let mut state2 = PrekeyState::new(Identity::generate());
+        state2.generate_one_time_prekeys(2);
+        let issued = state2.issue_bundle();
+        let restored =
+            PrekeyState::from_bytes_with_identity(&state2.to_bytes(), Identity::generate())
+                .unwrap();
+        assert!(restored
+            .one_time_prekeys
+            .iter()
+            .any(|(id, _)| Some(*id) == issued.one_time_prekey_id));
+    }
 
     #[test]
     fn test_x3dh_roundtrip_with_otp() {

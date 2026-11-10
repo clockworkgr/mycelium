@@ -6,11 +6,9 @@ use axum::response::IntoResponse;
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
 
-use mycelium_protocol::types::ContentType;
-
 use crate::state::AppState;
 use crate::types::{WsClientMessage, WsServerMessage};
-use crate::util::parse_node_id;
+use crate::util::{parse_content_type, parse_node_id};
 
 /// GET /v1/ws — WebSocket upgrade handler
 pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
@@ -25,6 +23,13 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
 
     loop {
         tokio::select! {
+            // Server shutting down: close the session so it does not outlive
+            // the node.
+            _ = state.shutdown.cancelled() => {
+                let _ = socket.send(Message::Close(None)).await;
+                return;
+            }
+
             // Receive messages from the client
             msg = socket.recv() => {
                 match msg {
@@ -40,18 +45,29 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
                                 protocol_id: _,
                                 content_type,
                             }) => {
-                                if let Ok(dest) = parse_node_id(&destination) {
-                                    let ct = match content_type.as_str() {
-                                        "text" => ContentType::Text,
-                                        "image" => ContentType::Image,
-                                        "file" => ContentType::File,
-                                        _ => ContentType::Text,
-                                    };
-                                    if let Err(e) = state.node.send_message(dest, data.as_bytes(), ct).await {
-                                        warn!("WebSocket send_message failed: {}", e);
+                                // Tell this client what happened to its send:
+                                // the message id on success, the error otherwise.
+                                let result = match parse_node_id(&destination) {
+                                    Ok(dest) => state
+                                        .node
+                                        .send_message(dest, data.as_bytes(), parse_content_type(&content_type))
+                                        .await
+                                        .map(|id| hex::encode(id.as_bytes()))
+                                        .map_err(|e| e.to_string()),
+                                    Err((_, err)) => Err(err.error.clone()),
+                                };
+                                if let Err(e) = &result {
+                                    warn!("WebSocket send_message failed: {}", e);
+                                }
+                                let frame = WsServerMessage::SendResult {
+                                    destination,
+                                    message_id: result.as_ref().ok().cloned(),
+                                    error: result.err(),
+                                };
+                                if let Ok(json) = serde_json::to_string(&frame) {
+                                    if socket.send(Message::Text(json.into())).await.is_err() {
+                                        return;
                                     }
-                                } else {
-                                    warn!("WebSocket: invalid destination node ID");
                                 }
                             }
                             Err(e) => {

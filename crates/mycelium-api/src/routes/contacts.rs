@@ -45,13 +45,21 @@ pub async fn add_contact(
 ) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
     let node_id = parse_node_id(&req.node_id)?;
 
-    let contact = ContactRecord {
-        node_id,
-        display_name: req.display_name,
-        public_key: Vec::new(),
-        trust_score: 0.0,
-        is_verified: false,
-        last_seen: None,
+    // Renaming an existing contact must not erase its public key,
+    // verification state, trust score or last-seen time.
+    let contact = match state.node.db.get_contact(&node_id) {
+        Ok(mut existing) => {
+            existing.display_name = req.display_name;
+            existing
+        }
+        Err(_) => ContactRecord {
+            node_id,
+            display_name: req.display_name,
+            public_key: Vec::new(),
+            trust_score: 0.0,
+            is_verified: false,
+            last_seen: None,
+        },
     };
 
     state.node.db.save_contact(&contact).map_err(|e| {

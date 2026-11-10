@@ -163,14 +163,14 @@ class LoraManager {
     }
   }
 
-  /// Forward received LoRa data to Rust.
+  /// Forward one received radio frame to Rust.
   ///
-  /// For LoRa, the peer identity is embedded in the packet header (source
-  /// node ID). The Rust LoRa transport parses the compact frame to extract
-  /// the source. We pass a zero peer ID here; the transport layer handles
-  /// peer identification from the frame.
+  /// LoRa is a broadcast medium with no link-layer address, so the peer id
+  /// is passed as all zeros. The Rust transport reassembles the fragments
+  /// and takes the peer from the envelope's source field, announcing new
+  /// peers as neighbours.
   void _forwardDataReceived(Uint8List data) {
-    // Use all-zeros peer ID — Rust extracts source from compact frame header
+    // All-zeros peer ID: Rust derives the source from the reassembled envelope
     final peerPtr = calloc<Uint8>(32);
     final dataPtr = toNativeBytes(data);
     try {

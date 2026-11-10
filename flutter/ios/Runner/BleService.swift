@@ -68,6 +68,10 @@ class BleService: NSObject {
     // Central role
     private var centralManager: CBCentralManager?
     private var connectedPeripherals: [UUID: CBPeripheral] = [:]
+    /// Peripherals we have asked CoreBluetooth to connect to but that have not
+    /// connected yet. CoreBluetooth only keeps a weak reference, so without a
+    /// strong one here the connection is cancelled ("unused peripheral").
+    private var pendingPeripherals: [UUID: CBPeripheral] = [:]
     private var peerNodeIds: [UUID: Data] = [:]        // peripheral UUID -> node ID
     private var nodeIdToUUID: [String: UUID] = [:]      // hex node ID -> peripheral UUID
     private var pendingConnections: Set<UUID> = []
@@ -152,6 +156,7 @@ class BleService: NSObject {
         serverPeerNodeIds.removeAll()
         serverNodeIdToIdentifier.removeAll()
         connectedPeripherals.removeAll()
+        pendingPeripherals.removeAll()
         subscribedCentrals.removeAll()
         reassemblyBuffers.removeAll()
         connectRetryCounts.removeAll()
@@ -274,7 +279,12 @@ class BleService: NSObject {
                 processNextWrite()
                 writeLock.lock()
             } else {
-                // peripheralManagerIsReady(toUpdateSubscribers:) will call processNextWrite
+                // Transmit queue full: this fragment was NOT sent. Rewind so it is
+                // retried when peripheralManagerIsReady(toUpdateSubscribers:) fires,
+                // otherwise the peer's reassembly would be missing a fragment.
+                if !writeQueue.isEmpty {
+                    writeQueue[0].currentIndex -= 1
+                }
             }
         }
     }
@@ -410,6 +420,7 @@ class BleService: NSObject {
     }
 
     private func connectToPeripheral(_ peripheral: CBPeripheral, attempt: Int) {
+        pendingPeripherals[peripheral.identifier] = peripheral
         guard running else {
             pendingConnections.remove(peripheral.identifier)
             return
@@ -602,6 +613,7 @@ extension BleService: CBCentralManagerDelegate {
         let uuid = peripheral.identifier
         log.debug("GATT client connected to \(uuid)")
         pendingConnections.remove(uuid)
+        pendingPeripherals.removeValue(forKey: uuid)
         connectRetryCounts.removeValue(forKey: uuid)
         connectedPeripherals[uuid] = peripheral
         peripheral.delegate = self
@@ -612,6 +624,7 @@ extension BleService: CBCentralManagerDelegate {
         let uuid = peripheral.identifier
         log.warning("GATT client failed to connect to \(uuid): \(error?.localizedDescription ?? "unknown")")
         connectedPeripherals.removeValue(forKey: uuid)
+        pendingPeripherals.removeValue(forKey: uuid)
         deviceMtus.removeValue(forKey: uuid)
 
         let attempt = connectRetryCounts[uuid] ?? 0
@@ -726,8 +739,11 @@ extension BleService: CBPeripheralDelegate {
             nodeIdToUUID[value.hexString] = uuid
             log.info("Peer discovered: \(value.hexString.prefix(16))... at \(uuid)")
 
-            // Store MTU
-            let mtu = peripheral.maximumWriteValueLength(for: .withResponse)
+            // Store MTU. `.withResponse` always reports 512 (long writes are
+            // split into prepare/execute, which the Android GATT server does
+            // not reassemble); `.withoutResponse` reports the negotiated ATT
+            // MTU minus the 3-byte header, which is the real single-packet size.
+            let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
             if mtu > 0 {
                 deviceMtus[uuid] = mtu + 3  // maximumWriteValueLength already subtracts ATT header
             }

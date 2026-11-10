@@ -172,6 +172,14 @@ impl ReticulumPacket {
             return Err(TransportError::Other("packet too short".into()));
         }
 
+        // Bit 7 is the IFAC flag: such packets carry an interface access
+        // code between the header and the addresses, which we do not parse.
+        if data[0] & 0x80 != 0 {
+            return Err(TransportError::Other(
+                "IFAC-protected packets are not supported".into(),
+            ));
+        }
+
         let flags = HeaderFlags::decode(data[0]);
         let hops = data[1];
 
@@ -553,6 +561,9 @@ impl Transport for ReticulumTransport {
         *started = false;
         let mut peers = self.connected_peers.write().await;
         peers.clear();
+        if let Ok(mut outbox) = self.outbox.lock() {
+            outbox.clear();
+        }
         Ok(())
     }
 
@@ -578,19 +589,16 @@ impl Transport for ReticulumTransport {
             bridge.to_reticulum(peer)
         };
 
-        let packet = match dest_hash {
-            Some(dest) => ReticulumPacket::data_packet(dest, data.to_vec()),
-            None => {
-                // Unknown destination — use zero hash (will be handled by Reticulum routing)
-                ReticulumPacket::data_packet([0u8; ADDRESS_LENGTH], data.to_vec())
-            }
-        };
+        // An unknown peer must fail loudly: TransportManager treats Ok(())
+        // as delivered, and a zero destination hash is not routable.
+        let dest = dest_hash.ok_or(TransportError::PeerNotConnected(*peer))?;
+        let packet = ReticulumPacket::data_packet(dest, data.to_vec());
 
         let serialized = packet.serialize();
         debug!(
             "Reticulum send: {} bytes to dest {}",
             data.len(),
-            dest_hash.map_or_else(|| "unknown".to_string(), |d| hex_short(&d))
+            hex_short(&dest)
         );
 
         if let Ok(mut outbox) = self.outbox.lock() {
@@ -896,6 +904,24 @@ mod tests {
         let outgoing = ReticulumPacket::deserialize(&serialized).unwrap();
         assert_eq!(outgoing.destination, dest);
         assert_eq!(outgoing.data, b"response");
+    }
+
+    #[tokio::test]
+    async fn test_send_unknown_peer_fails() {
+        let transport = ReticulumTransport::new(ReticulumConfig::default());
+        transport.start().await.unwrap();
+        let peer = NodeId([0x42; 32]);
+        let result = transport.send(&peer, b"hi").await;
+        assert!(matches!(result, Err(TransportError::PeerNotConnected(_))));
+        assert_eq!(transport.outbox_len(), 0);
+    }
+
+    #[test]
+    fn test_ifac_packet_rejected() {
+        let dest = [0x56; ADDRESS_LENGTH];
+        let mut bytes = ReticulumPacket::data_packet(dest, vec![1, 2, 3]).serialize();
+        bytes[0] |= 0x80; // set IFAC flag
+        assert!(ReticulumPacket::deserialize(&bytes).is_err());
     }
 
     #[tokio::test]

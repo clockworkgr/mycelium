@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:typed_data';
 
@@ -11,7 +12,7 @@ String getLastError() {
   try {
     final len = bindings.mycelium_last_error(buf, 1024);
     if (len <= 0) return 'Unknown error';
-    return String.fromCharCodes(buf.asTypedList(len));
+    return utf8.decode(buf.asTypedList(len), allowMalformed: true);
   } finally {
     calloc.free(buf);
   }

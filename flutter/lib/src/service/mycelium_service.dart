@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:ffi';
+import 'dart:io';
 
 import 'package:ffi/ffi.dart';
 import 'package:flutter/foundation.dart';
@@ -16,7 +17,9 @@ import '../models/network_status.dart';
 import '../models/enums.dart';
 import 'api_client.dart';
 import 'ble_manager.dart';
+import 'bt_classic_manager.dart';
 import 'ffi_helpers.dart';
+import 'lora_manager.dart';
 import 'mycelium_exception.dart';
 import 'notification_service.dart';
 import 'wifi_direct_manager.dart';
@@ -36,8 +39,12 @@ class MyceliumService {
   final ApiClient _api = ApiClient();
   BleManager? _bleManager;
   WifiDirectManager? _wifiDirectManager;
+  LoraManager? _loraManager;
+  BtClassicManager? _btClassicManager;
   WsService? _wsService;
   StreamSubscription? _wsEventSub;
+  final StreamController<WsService> _wsStartedController =
+      StreamController<WsService>.broadcast();
   NodeId? _cachedNodeId;
   bool _reconnected = false;
 
@@ -55,9 +62,16 @@ class MyceliumService {
   /// Access the WebSocket service (available after start).
   WsService? get wsService => _wsService;
 
+  /// Fires each time a WebSocket service is (re)created by [start], so
+  /// listeners created before the node started can attach to it.
+  Stream<WsService> get onWsStarted => _wsStartedController.stream;
+
   /// Initialize the node. If the daemon is already running (API reachable),
   /// reconnect without creating a new node.
   Future<void> initialize(String dataDir, String displayName) async {
+    // The API requires the bearer token stored next to the identity.
+    _loadApiToken(dataDir);
+
     // Check if the API server is already running (daemon survived app kill)
     if (await _api.isAvailable()) {
       debugPrint('Mycelium: API server already running, reconnecting');
@@ -80,6 +94,25 @@ class MyceliumService {
       calloc.free(dataDirNative);
       calloc.free(nameNative);
     }
+
+    // mycelium_node_new creates the token on first run; pick it up now.
+    _loadApiToken(dataDir);
+  }
+
+  /// Read `<dataDir>/api.token` (written by the Rust side, owner-only) so
+  /// [ApiClient] and [WsService] can authenticate.
+  void _loadApiToken(String dataDir) {
+    try {
+      final file = File('$dataDir/api.token');
+      if (file.existsSync()) {
+        final token = file.readAsStringSync().trim();
+        if (token.isNotEmpty) {
+          ApiClient.authToken = token;
+        }
+      }
+    } catch (e) {
+      debugPrint('Mycelium: could not read API token: $e');
+    }
   }
 
   /// Last error from FFI init/start, if any. Visible in debug screen + banner.
@@ -89,12 +122,15 @@ class MyceliumService {
   Future<bool> start() async {
     lastStartError = null;
 
-    // If reconnecting to existing daemon, just start WS + BLE + WiFi Direct + Internet
+    // If reconnecting to an existing daemon, just start WS + BLE + WiFi Direct.
+    // The internet transport is already running inside the daemon; registering
+    // a second one would fail to bind the port and shadow the live one.
     if (_reconnected) {
       _startWebSocket();
       await _startBle();
       await _startWifiDirect();
-      await _startInternet();
+      await _startLora();
+      await _startBtClassic();
       await _startDaemonService();
       return true;
     }
@@ -122,6 +158,8 @@ class MyceliumService {
     _startWebSocket();
     await _startBle();
     await _startWifiDirect();
+    await _startLora();
+    await _startBtClassic();
     await _startInternet();
     await _startDaemonService();
     return true;
@@ -177,6 +215,7 @@ class MyceliumService {
     _wsService = WsService();
     _wsService!.connect();
     _wsEventSub = _wsService!.events.listen(_onWsEvent);
+    _wsStartedController.add(_wsService!);
   }
 
   void _onWsEvent(WsEvent event) {
@@ -236,6 +275,38 @@ class MyceliumService {
     }
   }
 
+  /// LoRa external radio (BLE GATT module on both platforms, USB serial on
+  /// Android). The platform side scans for a module; without one the
+  /// transport simply never hears anything.
+  Future<void> _startLora() async {
+    if (_handle == null) return;
+    if (defaultTargetPlatform != TargetPlatform.android &&
+        defaultTargetPlatform != TargetPlatform.iOS) {
+      return;
+    }
+    try {
+      bindings.mycelium_register_lora_transport(_handle!);
+      _loraManager = LoraManager(_handle!.cast());
+      await _loraManager!.start();
+    } catch (e) {
+      debugPrint('LoRa init failed: $e');
+    }
+  }
+
+  /// Bluetooth Classic SPP (Android only; iOS has no public SPP API).
+  Future<void> _startBtClassic() async {
+    if (defaultTargetPlatform != TargetPlatform.android) return;
+    if (_handle == null) return;
+    try {
+      bindings.mycelium_register_bt_classic_transport(_handle!);
+      final nodeId = getNodeId();
+      _btClassicManager = BtClassicManager(_handle!.cast());
+      await _btClassicManager!.start(nodeId.bytes);
+    } catch (e) {
+      debugPrint('BT Classic init failed: $e');
+    }
+  }
+
   Future<void> _startInternet() async {
     if (_handle == null) return;
     try {
@@ -276,6 +347,10 @@ class MyceliumService {
     _bleManager = null;
     await _wifiDirectManager?.stop();
     _wifiDirectManager = null;
+    await _loraManager?.stop();
+    _loraManager = null;
+    await _btClassicManager?.stop();
+    _btClassicManager = null;
     if (_handle != null) {
       bindings.mycelium_node_stop(_handle!);
     }
