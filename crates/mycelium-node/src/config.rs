@@ -99,6 +99,14 @@ pub struct InternetTransportConfig {
     pub listen_port: u16,
     /// Bootstrap node addresses to connect to on startup.
     pub bootstrap_nodes: Vec<String>,
+    /// Cap on simultaneous TCP connections, inbound and outbound, counted
+    /// from the moment a socket is accepted or dialled.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
+}
+
+fn default_max_connections() -> usize {
+    64
 }
 
 impl Default for InternetTransportConfig {
@@ -106,6 +114,7 @@ impl Default for InternetTransportConfig {
         Self {
             listen_port: 9736,
             bootstrap_nodes: Vec::new(),
+            max_connections: default_max_connections(),
         }
     }
 }

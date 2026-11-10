@@ -852,11 +852,11 @@ impl Node {
                 .filter_map(|s| s.parse().ok())
                 .collect();
             let internet = Arc::new(InternetTransport::new(
-                self.node_id,
+                self.identity_handle(),
                 InternetConfig {
                     listen_addr: format!("0.0.0.0:{}", inet_cfg.listen_port).parse().unwrap(),
                     bootstrap_nodes: bootstrap,
-                    max_connections: 64,
+                    max_connections: inet_cfg.max_connections,
                 },
             ));
             self.transport_manager.add_transport(internet.clone()).await;
@@ -866,6 +866,15 @@ impl Node {
                 inet_cfg.listen_port
             );
         }
+    }
+
+    /// A clone of this node's identity behind an `Arc`.
+    ///
+    /// The internet transport has to sign its handshake with the identity key,
+    /// and deriving its NodeId from the same key is what keeps the two from
+    /// disagreeing (spec §14.3).
+    pub fn identity_handle(&self) -> Arc<Identity> {
+        Arc::new(identity_clone_for_prekeys(&self.identity))
     }
 
     /// Stop the node gracefully.

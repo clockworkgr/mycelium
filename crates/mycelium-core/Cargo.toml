@@ -19,3 +19,5 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# `test-util` gives the paused clock the DHT lookup-deadline test needs.
+tokio = { workspace = true, features = ["test-util"] }

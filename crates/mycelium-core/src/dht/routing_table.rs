@@ -8,7 +8,8 @@ use mycelium_protocol::types::NodeId;
 use super::PeerInfo;
 
 /// XOR distance between two node IDs, returned as an array for comparison.
-fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; 32] {
+/// Big-endian byte order, so the arrays compare in distance order directly.
+pub fn xor_distance(a: &NodeId, b: &NodeId) -> [u8; 32] {
     let a_bytes = a.as_bytes();
     let b_bytes = b.as_bytes();
     let mut result = [0u8; 32];

@@ -13,7 +13,7 @@
 This is the single normative document for Mycelium. It specifies the wire
 protocol and cryptography, and describes the architecture as built. The
 companion document is [`ROADMAP.md`](ROADMAP.md), which tracks the open work.
-Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/) (ADR-001 … ADR-010);
+Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/) (ADR-001 … ADR-011);
 build and contribution mechanics live in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### Status legend
@@ -483,7 +483,7 @@ and confirm; verified status is local and surfaced in the UI.
 
 ### 5.6 HKDF info strings
 
-Eight info strings provide domain separation. Reusing one across contexts would
+Nine info strings provide domain separation. Reusing one across contexts would
 let a key derived for one purpose be substituted for another.
 
 | Info string | Purpose |
@@ -496,6 +496,7 @@ let a key derived for one purpose be substituted for another.
 | `b"MyceliumGroupCK"` | Group chain key advancement |
 | `b"MyceliumGroupAEAD"` | Group AEAD key + nonce |
 | `b"MyceliumGroupDiscovery"` | Group discovery key from a passphrase (§10.2) |
+| `b"frame:" ‖ ephemeral_public` | Internet channel frame keys, one per direction. Separated additionally by the HKDF salt, which is the channel transcript and carries its own context tag (§8.4, ADR-011) |
 
 ### 5.7 Security properties
 
@@ -723,7 +724,7 @@ than a seamless migration (ROADMAP T-03).
 | **Wi-Fi Direct** | 65 KB | ~50 Mbps | 50–200 m | **Implemented** — Android only (iOS does not expose it) |
 | **BT Classic (SPP)** | 16 KB | ~2 Mbps | 10–100 m | **Implemented, untested on hardware** — Android only |
 | **LoRa** | 2 KB message / 51–222 B frame | 0.25–37 kbps | 1–15 km | **Implemented, untested on hardware** — bridges on Android (BLE + USB) and iOS (BLE) |
-| **Internet tunnel** | 1 MiB (see §8.4) | varies | global | **Partial** — peer identity unauthenticated (ROADMAP T-09) |
+| **Internet tunnel** | 1 MiB − 53 B (see §8.4) | varies | global | **Implemented** — keyed authenticated channel, binary framed (ADR-011) |
 | **Plugins** | per plugin | — | — | **Partial** — API complete, adapters not wired (§18) |
 | **Wi-Fi Aware (NAN)** | — | — | — | **Planned (v0.4)** |
 | **Ultrasonic audio** | — | — | — | **Planned (future)** — last-resort bootstrap when all radios are blocked |
@@ -773,18 +774,99 @@ Adaptive data rate negotiates spreading factor per peer: start at the
 configured SF, lower after 10 consecutive successes, raise after 2 consecutive
 failures. Broadcasts use the discovery SF (SF12) for maximum range.
 
-**Internet tunnel.** TCP overlay, default listen port 9736, with a
+**Internet tunnel (ADR-011).** TCP overlay, default listen port 9736, with a
 configurable bootstrap node list and a Kademlia DHT (256 k-buckets, k = 20,
-XOR distance, Ping/FindNode/FindValue/Store) for peer discovery. Peer-to-peer
-TCP works; the Hello handshake is bounded and timed out, duplicates and
-self-connections are refused, and the transport is restartable.
+XOR distance, Ping/FindNode/FindValue/Store) for peer discovery.
 
-**Known gaps:** the Hello is unsigned, so the peer identity is unverified, and
-`max_connections` is configured but never enforced. Framing is JSON, which
-encodes a byte array as a decimal list and expands payloads 5×; since both
-`mtu()` and the receiver's frame cap are 1 MiB, a send at the advertised MTU is
-rejected and the real ceiling is about 210 KB. The DHT has no iterative lookup,
-no record TTL or cap, and no record signatures. See ROADMAP T-09.
+Every connection is a **keyed, mutually authenticated channel**, established
+before any state exists for the peer. Each side signs a fresh X25519 ephemeral
+public key, both derive directional AES-256-GCM keys from the shared secret,
+and each proves possession of its key before the peer is installed:
+
+```
+→ Hello { identity_key, ephemeral_public, listen_port, signature }   (cleartext)
+← Hello { identity_key, ephemeral_public, listen_port, signature }
+→ Confirm { transcript }                                             (sealed)
+← Confirm { transcript }
+
+signature  = Ed25519( b"mycelium-internet-hello-v2:"
+                    ‖ ephemeral_public(32) ‖ identity_key(32)
+                    ‖ listen_port(2 LE) )
+shared     = X25519(my_ephemeral_secret, peer_ephemeral_public)
+transcript = SHA-256( b"mycelium-internet-channel-v1:"
+                    ‖ min(eph)‖max(eph) ‖ min(id)‖max(id) )
+prk        = HKDF-Extract(salt = transcript, ikm = shared)
+k_send     = HKDF-Expand(prk, b"frame:" ‖ my_ephemeral_public)
+k_recv     = HKDF-Expand(prk, b"frame:" ‖ peer_ephemeral_public)
+```
+
+Signing the **ephemeral key** rather than exchanged nonces is what makes the
+handshake unrelayable. An attacker can forward a victim's signed `Hello` and
+the signature still verifies, but the channel key comes from an ephemeral
+secret the attacker does not hold, so it cannot send the `Confirm` frame or
+read anything. A nonce-based signature cannot achieve this at any field
+ordering, because the attacker always chooses its own nonce last — ADR-011
+records the attack in full.
+
+Every frame after the two `Hello`s is sealed under the sending direction's key
+with the frame counter as the nonce. Counters are per direction and advance
+only on a successful open, so injected, altered, replayed and reordered frames
+are all refused and cannot desynchronise the channel. A peer that echoes our
+ephemeral key, or offers one yielding an all-zero shared secret, is refused.
+
+The peer's NodeId is **derived** from the `identity_key` in its `Hello` and
+never carried on the wire, so the §14.3 binding holds by construction. The
+`listen_port` is signed because it becomes the peer's dialable address in the
+DHT — an inbound peer's address is its socket IP with that signed port, since
+the socket's source port is ephemeral. A handshake that does not complete
+closes the socket and installs nothing: no connection, no DHT contact, no
+`NeighborDiscovered`, so no route. The whole exchange is bounded by a 10 s
+timeout; duplicates and self-connections are refused; the transport is
+restartable, and `stop()` waits for the listener to close and for every
+connection slot to come back.
+
+`max_connections` (default 64) is enforced as semaphore permits, taken *before*
+the handshake and held for the connection's lifetime, inbound and outbound, so
+a peer that opens sockets and stalls still counts against the limit. Over the
+limit, the socket is closed without a hello.
+
+Framing is binary, little-endian, a 4-byte body length then a 1-byte tag:
+`MeshData 0x01`, `Dht 0x02`, `DhtReply 0x03`, `Hello 0x05`, `Confirm 0x06`.
+The wire frame cap is 1 MiB including the 16-byte AEAD tag; a cleartext
+handshake frame is capped at 1 KiB so an unproven peer cannot make the node
+allocate more. `mtu()` is the frame cap minus the tag and the 37 bytes
+`MeshData` framing costs, so a send at the advertised MTU is exactly one
+acceptable frame; anything larger is refused with `ExceedsMtu` rather than
+transmitted.
+
+**DHT records are signed.** A record is a node's claim about its own address —
+`public_key(32) ‖ addr ‖ published_at(8) ‖ signature(64)`, signed over
+`b"mycelium-dht-record-v1:" ‖ public_key ‖ addr ‖ published_at` and keyed under
+`SHA-256(public_key)`. A record is refused if the signature fails, if it is
+dated more than 300 s ahead, if it is older than the 3600 s TTL, if it is no
+newer than one already held (so a replayed older record cannot roll an address
+back), or if the store is full. The store is capped at 4096 records, swept of
+expired entries before each insert, and evicts the entry closest to expiry when
+at capacity. A record found over the network is subjected to the same checks
+and returned only if they pass. A DHT request carries no sender identity: the
+sender is whoever holds that channel's key, and in-flight requests are tracked
+per connection so no peer can answer another's. A node offers its own record to
+every peer it authenticates, and re-signs and re-offers it every TTL/3.
+
+Lookups are iterative and bounded: α = 3 parallel `FindValue` rounds, replies
+correlated by request id, terminating at the first of — record found, every one
+of the k closest known nodes queried, 16 rounds, or a 10 s deadline that bounds
+the requests in flight (2 s each). A visited set means a referral cycle costs
+each peer one query. A `FoundValue` counts only if its derived NodeId is the
+target and the record is acceptable, so a peer cannot answer with someone
+else's record.
+
+**Known gaps:** a node listening on a wildcard address (the `0.0.0.0` default)
+neither stores nor publishes a record, because signing `0.0.0.0` would be valid
+and useless — external address discovery is ROADMAP T-31. Nothing prunes a DHT
+contact whose peer is gone for good, so a k-bucket can fill with dead entries
+(ROADMAP T-32). The channel gives authentication and integrity, not a forward
+secrecy claim; message confidentiality is the Double Ratchet's job (§5.3).
 
 **Outbox pattern.** BLE, Wi-Fi Direct, BT Classic and LoRa all follow the same
 Rust↔platform shape: `send()` pushes to a bounded `VecDeque` (512 packets;
@@ -1207,6 +1289,12 @@ pub struct NodeConfig {
     pub group_seed: Option<String>,        // group discovery key (hex)
     pub plugins: Vec<PluginConfigEntry>,   // not yet read — ROADMAP T-13
 }
+
+pub struct InternetTransportConfig {     // transports.internet
+    pub listen_port: u16,                // 9736
+    pub bootstrap_nodes: Vec<String>,    // "ip:port" entries
+    pub max_connections: usize,          // 64, enforced (§8.4, ADR-011)
+}
 ```
 
 CLI and environment (flags win over environment):
@@ -1596,7 +1684,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 8.1 | Wi-Fi Direct | **Implemented** | ADR-003, Android only |
 | 8.1 | BT Classic | **Implemented, untested** | Rust + Kotlin SPP + Dart bridge; no hardware test (T-15) |
 | 8.1 | LoRa | **Implemented, untested** | Fragmentation, ADR, duty cycle, broadcast beacons (ADR-008); no hardware test (T-15) |
-| 8.1 | Internet tunnel | **Partial** | TCP + DHT + FFI + UI. Unsigned Hello, JSON framing, no connection cap (T-09) |
+| 8.1 | Internet tunnel | **Implemented** | Keyed mutually authenticated channel with per-frame AEAD, binary framing, enforced connection cap, signed and expiring DHT records, bounded iterative lookup (ADR-011) |
 | 8.2 | Transport handoff | **Partial** | First-available selection; no session migration (T-03) |
 | 8.5 | Plugin API | **Implemented** | Trait, registry, config, distinct `TransportType` per adapter. Nothing instantiates plugins (T-13) |
 | 8.6 | iOS strategy | **Implemented** | Dual-role CoreBluetooth, background restoration, LoRa bridge |

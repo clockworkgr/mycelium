@@ -44,7 +44,7 @@ Every message is end-to-end encrypted using the Signal Protocol (X3DH key exchan
 - SQLCipher encrypted database
 
 **Platform**
-- Rust core (10 crates, 308 tests)
+- Rust core (10 crates, 360 tests)
 - Local REST API (38 endpoints) + WebSocket server, bearer-token authenticated (ADR-006)
 - Flutter mobile app for Android and iOS (14 screens, 49 Dart files)
 - Onboarding with seed phrase groups or QR code scanning
@@ -87,7 +87,7 @@ The Rust daemon exposes a local API on `127.0.0.1:9735`. The Flutter app (and an
 ```bash
 # Rust workspace
 make build    # Debug build
-make test     # Run all 308 tests
+make test     # Run all 360 tests
 make lint     # cargo fmt --check + cargo clippy
 
 # Flutter app
@@ -236,7 +236,7 @@ The `TransportPlugin` trait allows third-party transports to integrate as plugin
 | [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md) | The spec: wire protocol, cryptography, architecture as built, compliance matrix |
 | [`ROADMAP.md`](ROADMAP.md) | The plan: everything still open, prioritised, with acceptance criteria |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build setup, test commands, conventions |
-| [`docs/adr/`](docs/adr/) | Architecture Decision Records (ADR-001 … ADR-008) |
+| [`docs/adr/`](docs/adr/) | Architecture Decision Records (ADR-001 … ADR-011) |
 | [`docs/plugin-api.md`](docs/plugin-api.md) | Transport plugin development guide |
 | `CLAUDE.md` | AI assistant instructions |
 

@@ -1,3 +1,4 @@
+pub mod channel;
 pub mod discovery;
 pub mod double_ratchet;
 pub mod emergency;

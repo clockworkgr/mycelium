@@ -2215,7 +2215,7 @@ pub unsafe extern "C" fn mycelium_register_internet_transport(handle: *mut Mycel
 
     let node = &(*handle).node;
     let internet = Arc::new(InternetTransport::new(
-        node.node_id,
+        node.identity_handle(),
         InternetConfig::default(),
     ));
     runtime().block_on(async {
@@ -2265,7 +2265,7 @@ pub unsafe extern "C" fn mycelium_register_internet_transport_configured(
     };
 
     let node = &(*handle).node;
-    let internet = Arc::new(InternetTransport::new(node.node_id, config));
+    let internet = Arc::new(InternetTransport::new(node.identity_handle(), config));
     runtime().block_on(async {
         node.transport_manager
             .replace_transport(internet.clone())

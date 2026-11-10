@@ -114,6 +114,18 @@ pub fn verify_signature(
         .map_err(|_| IdentityError::InvalidSignature)
 }
 
+/// Verify a detached signature given both as raw bytes.
+///
+/// Lets crates that only ever handle serialized keys and signatures stay off a
+/// direct `ed25519-dalek` dependency.
+pub fn verify_signature_bytes(
+    public_key: &[u8; 32],
+    message: &[u8],
+    signature: &[u8; 64],
+) -> Result<(), IdentityError> {
+    verify_signature(public_key, message, &Signature::from_bytes(signature))
+}
+
 /// Compute a NodeId from a raw Ed25519 public key.
 pub fn node_id_from_public_key(public_key: &[u8; 32]) -> NodeId {
     let hash = Sha256::digest(public_key);

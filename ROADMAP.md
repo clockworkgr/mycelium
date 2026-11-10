@@ -9,11 +9,12 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-10 against the working tree, after the T-06/07/10/11 work:
+Verified on 2026-11-10 against the working tree, after the T-06/07/09/10/11
+work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **308 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **360 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -46,9 +47,11 @@ These are the gate on v0.1. Each one is a defect in a feature that is already
 shipped and claimed to work.
 
 **Landed 2026-11-10:** T-06 (signed-prekey retention + session rejection,
-ADR-009), T-07 (ratchet/chain durability + zeroization), T-10 (discovery
-timeout on its own sweep, one attempt per destination), T-11 (origin-aware DTN
-eviction, persisted origin + spray history). Five tasks remain below.
+ADR-009), T-07 (ratchet/chain durability + zeroization), T-09 (authenticated
+internet transport, binary framing, signed DHT records, ADR-011), T-10
+(discovery timeout on its own sweep, one attempt per destination), T-11
+(origin-aware DTN eviction, persisted origin + spray history). Four tasks
+remain below.
 
 ### T-01 · FFI robustness
 
@@ -147,35 +150,6 @@ protects against nothing an attacker with filesystem access cannot bypass.
 - The database key is derived through a KDF that does not expose the identity
   key if the database key leaks.
 - A migration moves existing plaintext identities without data loss.
-
-### T-09 · Internet transport authentication and framing
-
-**Area:** `mycelium-core` · **Spec:** §8.4
-
-Three problems in one transport:
-
-1. The Hello handshake is unsigned. A node claims a NodeId and is believed, so
-   any internet peer can impersonate any node — and `TransportManager` will
-   then route that node's traffic to the impostor.
-2. `max_connections` is configured but not enforced; an attacker opens
-   connections until the node runs out of descriptors.
-3. Frames are JSON with byte arrays as decimal number lists. Measured
-   expansion is 5.0x, and both `mtu()` and the receiver's `MAX_WIRE_MESSAGE`
-   are 1 MiB, so a send at the advertised MTU is rejected and the real ceiling
-   is about 210 KB. (The previous text here said "a tenth of the advertised
-   65 KB MTU"; both figures were wrong — `mtu()` returns 1 MiB.)
-
-The DHT underneath has matching gaps: no iterative lookup with termination and
-timeouts, no TTL or cap on stored records, no record signatures.
-
-**Acceptance:**
-- The Hello carries an Ed25519 signature over a server-provided nonce; an
-  unverified peer is refused and no route is installed for it.
-- `max_connections` is enforced, with the limit covered by a test.
-- Framing is binary (length-prefixed), and a payload up to the advertised MTU
-  round-trips. `mtu()` and `MAX_WIRE_MESSAGE` must agree after the change.
-- DHT lookups terminate deterministically; stored records carry a TTL, a total
-  cap and a signature.
 
 ---
 
@@ -297,6 +271,39 @@ only two of them change anything.
 
 **Acceptance:** each of the four confirmed on a device or emulator; (4) either
 closed with a verification note or fixed.
+
+### T-31 · External address discovery for DHT records
+
+**Area:** `mycelium-core` · **Spec:** §8.4 · **ADR-011**
+
+A DHT record is a node's signed claim about its own address. A node listening
+on the `0.0.0.0:9736` default has no address worth signing, so it publishes
+nothing — which is honest, but means the record store only ever holds entries
+for nodes configured with a concrete address. Nothing learns the address a peer
+actually sees us on.
+
+**Acceptance:**
+- A peer reports the socket address it observed us on, and that observation
+  feeds the published record.
+- Agreement between two or more independent peers is required before an
+  observed address is published, so one peer cannot steer our record.
+- Test: a node on a wildcard listen address publishes a record carrying the
+  address its peers observed, and publishes nothing when the observations
+  disagree.
+
+### T-32 · DHT bucket liveness
+
+**Area:** `mycelium-core` · **Spec:** §8.4 · **ADR-011**
+
+Contacts are deliberately kept after a disconnect, because the stored address
+is what lets a peer be dialled again. Nothing prunes a contact whose peer is
+gone for good, and a full k-bucket drops new entries, so dead contacts can
+permanently crowd out live ones.
+
+**Acceptance:**
+- A full bucket pings its least-recently-seen contact before refusing a new
+  one, and replaces it if it does not answer (standard Kademlia eviction).
+- Test: a bucket filled with unresponsive contacts admits a live one.
 
 ### T-14 · Channel events and flood dedup expiry
 
