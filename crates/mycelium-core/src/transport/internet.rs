@@ -197,8 +197,11 @@ struct PeerConnection {
     /// useless for dialling back.
     dialable_addr: SocketAddr,
     connected_at: Instant,
+    /// This channel's transcript, used to order two connections to the same
+    /// peer identically at both ends.
+    transcript: [u8; 32],
     /// Cancels just this connection, without stopping the transport. A child
-    /// of the transport's token, so `stop()` still reaches it.
+    /// of the transport's lifetime token, so `stop()` still reaches it.
     cancel: CancellationToken,
     /// Queue into the connection's writer task.
     outbox: mpsc::Sender<InternetWireMessage>,
@@ -287,8 +290,14 @@ pub struct InternetTransport {
     shared: Arc<Shared>,
     config: InternetConfig,
     started: RwLock<bool>,
-    /// Replaced on every start() so the transport can be restarted after stop().
-    cancel: std::sync::Mutex<CancellationToken>,
+    /// Parent of every connection's and task's token.
+    ///
+    /// Replaced — not just cancelled — by `stop()`, so the transport can be
+    /// restarted. Everything takes a child or clone of whatever this holds at
+    /// the time, including connections opened by `connect_to` before `start()`:
+    /// those used to attach to a token `start()` then replaced without
+    /// cancelling, so a later `stop()` never reached them.
+    lifetime: std::sync::Mutex<CancellationToken>,
     /// Background tasks, so `stop()` can wait for the listener to close and
     /// for every connection to release its slot.
     tasks: Mutex<JoinSet<()>>,
@@ -344,44 +353,13 @@ async fn write_framed<W: AsyncWrite + Unpin>(
         .map_err(|e| TransportError::SendFailed(e.to_string()))
 }
 
-/// Which end opened a connection. Decides a simultaneous-dial tie the same
-/// way at both ends.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    /// We dialled the peer.
-    Outbound,
-    /// The peer dialled us.
-    Inbound,
-}
-
-impl Direction {
-    /// The node that opened this connection.
-    fn initiator(self, local: &NodeId, peer: &NodeId) -> NodeId {
-        match self {
-            Direction::Outbound => *local,
-            Direction::Inbound => *peer,
-        }
-    }
-
-    /// Whether this connection beats one already installed for the peer.
-    ///
-    /// "The lower NodeId's connection wins" is computed identically at both
-    /// ends from values both ends know, which is the whole point: a rule that
-    /// depended on local timing would have the two nodes keep different
-    /// connections and lose both.
-    fn initiator_wins(self, local: &NodeId, peer: &NodeId) -> bool {
-        let initiator = self.initiator(local, peer);
-        let responder = match self {
-            Direction::Outbound => *peer,
-            Direction::Inbound => *local,
-        };
-        initiator.as_bytes() < responder.as_bytes()
-    }
-}
-
 /// The result of a completed handshake: who the peer is, and the channel.
 pub struct Channel {
     pub peer: AuthenticatedPeer,
+    /// Identifies this channel. Both ends derive the same value, and it
+    /// differs per connection, which is what makes it a usable tie-break when
+    /// two connections to one peer exist at once.
+    pub transcript: [u8; 32],
     send: FrameCipher,
     recv: FrameCipher,
 }
@@ -490,6 +468,7 @@ where
             identity_key: peer_identity_key,
             listen_port: peer_port,
         },
+        transcript: keys.transcript,
         send: keys.send,
         recv: keys.recv,
     })
@@ -524,7 +503,6 @@ impl Shared {
         stream: TcpStream,
         socket_addr: SocketAddr,
         cancel: &CancellationToken,
-        direction: Direction,
         expected: Option<NodeId>,
         permit: Arc<OwnedSemaphorePermit>,
     ) -> Result<(NodeId, Arc<PeerConnection>, SealedReader, CancellationToken), TransportError>
@@ -569,6 +547,7 @@ impl Shared {
             socket_addr,
             dialable_addr,
             connected_at: Instant::now(),
+            transcript: channel.transcript,
             cancel: conn_cancel.clone(),
             outbox,
             pending: std::sync::Mutex::new(HashMap::new()),
@@ -604,15 +583,21 @@ impl Shared {
             let mut conns = self.connections.write().await;
             match conns.get(&peer_id) {
                 Some(existing) => {
-                    // Two nodes that dial each other at the same time each end
-                    // up with two connections, and must agree on which to
-                    // keep: if they choose differently, each closes the one
-                    // the other kept and both are lost. The rule is the same
-                    // on both sides — the connection opened by the lower
-                    // NodeId wins — and depends only on values both ends have.
-                    if !direction.initiator_wins(&self.local_id, &peer_id) {
+                    // Two connections to one peer exist whenever both ends
+                    // dial at once, or two lookups dial the same peer. Both
+                    // ends must pick the *same* one: if they pick differently,
+                    // each closes the one the other kept and both are lost.
+                    //
+                    // The transcript is the only value that orders them
+                    // correctly. It is identical at both ends of a given
+                    // connection and different between connections, so
+                    // "keep the lower transcript" is a total order both ends
+                    // compute without reference to local arrival order or to
+                    // who dialled — neither of which distinguishes two
+                    // connections opened by the same node.
+                    if conn.transcript >= existing.transcript {
                         return Err(TransportError::Other(format!(
-                            "{} is already connected",
+                            "{} is already connected on a channel that wins the tie",
                             peer_id
                         )));
                     }
@@ -628,9 +613,8 @@ impl Shared {
         };
         if let Some(displaced) = displaced {
             debug!(
-                "Internet: replacing the connection to {} with the one {} opened",
-                peer_id,
-                direction.initiator(&self.local_id, &peer_id)
+                "Internet: replacing the connection to {} with a lower-transcript channel",
+                peer_id
             );
             displaced.cancel();
         }
@@ -750,7 +734,7 @@ impl Shared {
         // Takes the writer task down with us, so its permit share is released
         // and the socket closes instead of lingering.
         cancel.cancel();
-        {
+        let was_current = {
             // Only remove the entry if it is still ours: a reconnect that
             // replaced it must not be torn down by this task's exit.
             let mut conns = self.connections.write().await;
@@ -759,16 +743,29 @@ impl Shared {
                 .is_some_and(|existing| Arc::ptr_eq(existing, &conn))
             {
                 conns.remove(&peer_id);
+                true
+            } else {
+                false
             }
-        }
+        };
         // The DHT contact is deliberately kept: its address is what lets this
         // peer be dialled again. Pruning contacts that have gone for good
         // needs bucket liveness checks (ROADMAP T-32).
-        let _ = self.event_tx.send(TransportEvent::NeighborLost {
-            peer: peer_id,
-            transport: TransportType::InternetTunnel,
-        });
-        info!("Internet: peer {} disconnected", peer_id);
+        if was_current {
+            let _ = self.event_tx.send(TransportEvent::NeighborLost {
+                peer: peer_id,
+                transport: TransportType::InternetTunnel,
+            });
+            info!("Internet: peer {} disconnected", peer_id);
+        } else {
+            // A displaced connection must stay silent. Reporting a loss here
+            // would make the routing layer drop the peer and its routes while
+            // the replacement connection is live.
+            debug!(
+                "Internet: a displaced connection to {} closed; the peer is still connected",
+                peer_id
+            );
+        }
     }
 }
 
@@ -805,7 +802,7 @@ impl InternetTransport {
             }),
             config,
             started: RwLock::new(false),
-            cancel: std::sync::Mutex::new(CancellationToken::new()),
+            lifetime: std::sync::Mutex::new(CancellationToken::new()),
             tasks: Mutex::new(JoinSet::new()),
         }
     }
@@ -825,8 +822,9 @@ impl InternetTransport {
         self.shared.slots.available_permits()
     }
 
-    fn current_cancel(&self) -> CancellationToken {
-        self.cancel.lock().map(|c| c.clone()).unwrap_or_default()
+    /// The token everything spawned right now should hang off.
+    fn lifetime_token(&self) -> CancellationToken {
+        self.lifetime.lock().map(|c| c.clone()).unwrap_or_default()
     }
 
     /// Re-sign our address record and offer it to every connected peer.
@@ -856,7 +854,7 @@ impl InternetTransport {
         // Captured *before* the dial: a connect that outlives a stop() must
         // not pick up the token of a later start() and install itself on a
         // restarted transport.
-        let cancel = self.current_cancel();
+        let cancel = self.lifetime_token();
         let stream = tokio::select! {
             _ = cancel.cancelled() => {
                 return Err(TransportError::Other("transport stopped".to_string()));
@@ -876,14 +874,7 @@ impl InternetTransport {
 
         let (peer_id, conn, reader, conn_cancel) = self
             .shared
-            .establish(
-                stream,
-                addr,
-                &cancel,
-                Direction::Outbound,
-                expected,
-                permit.clone(),
-            )
+            .establish(stream, addr, &cancel, expected, permit.clone())
             .await?;
         tokio::spawn(
             self.shared
@@ -972,12 +963,9 @@ impl Transport for InternetTransport {
             return Err(TransportError::AlreadyStarted);
         }
 
-        // Fresh token per start: a cancelled token from a previous stop()
-        // would make the new accept loop exit immediately.
-        let cancel = CancellationToken::new();
-        if let Ok(mut guard) = self.cancel.lock() {
-            *guard = cancel.clone();
-        }
+        // `stop()` leaves a fresh, uncancelled lifetime token behind, so the
+        // accept loop can simply hang off whatever is current.
+        let cancel = self.lifetime_token();
 
         let listen_addr = self.config.listen_addr;
         let listener = TcpListener::bind(listen_addr)
@@ -1024,14 +1012,7 @@ impl Transport for InternetTransport {
                                 let permit = Arc::new(permit);
                                 tokio::spawn(async move {
                                     match shared
-                                        .establish(
-                                            stream,
-                                            addr,
-                                            &cancel,
-                                            Direction::Inbound,
-                                            None,
-                                            permit.clone(),
-                                        )
+                                        .establish(stream, addr, &cancel, None, permit.clone())
                                         .await
                                     {
                                         Ok((peer_id, conn, reader, conn_cancel)) => {
@@ -1086,14 +1067,7 @@ impl Transport for InternetTransport {
                 let permit = Arc::new(permit);
                 match connected {
                     Ok(stream) => match shared
-                        .establish(
-                            stream,
-                            addr,
-                            &cancel,
-                            Direction::Outbound,
-                            None,
-                            permit.clone(),
-                        )
+                        .establish(stream, addr, &cancel, None, permit.clone())
                         .await
                     {
                         Ok((peer_id, conn, reader, conn_cancel)) => {
@@ -1144,9 +1118,15 @@ impl Transport for InternetTransport {
     /// failed to bind, and a stalled handshake kept its slot.
     async fn stop(&self) -> Result<(), TransportError> {
         let mut started = self.started.write().await;
-        if let Ok(guard) = self.cancel.lock() {
-            guard.cancel();
-        }
+        // Swap in a fresh token before cancelling the old one: everything
+        // currently alive is a child or clone of the old token, including
+        // connections made before `start()`, and a later `start()` needs an
+        // uncancelled parent.
+        let previous = match self.lifetime.lock() {
+            Ok(mut guard) => std::mem::replace(&mut *guard, CancellationToken::new()),
+            Err(_) => CancellationToken::new(),
+        };
+        previous.cancel();
         {
             // The listener lives in the accept task, so a restart cannot bind
             // until that task has dropped it. Bounded: a task that ignores
@@ -1561,6 +1541,7 @@ mod tests {
             socket_addr: "127.0.0.1:1".parse().unwrap(),
             dialable_addr: "127.0.0.1:1".parse().unwrap(),
             connected_at: Instant::now(),
+            transcript: [0u8; 32],
             cancel: CancellationToken::new(),
             outbox,
             pending: std::sync::Mutex::new(HashMap::new()),
@@ -1636,26 +1617,127 @@ mod tests {
         b.stop().await.unwrap();
     }
 
-    #[test]
-    fn test_both_ends_pick_the_same_connection_in_a_simultaneous_dial() {
-        let low = NodeId::from_bytes([0x01; 32]);
-        let high = NodeId::from_bytes([0xFE; 32]);
+    /// Two connections to one peer must be ordered by something both ends
+    /// compute the same way. Who dialled does not distinguish them when the
+    /// same node opened both, and local arrival order can differ at the two
+    /// ends — either way each side keeps a different connection and both are
+    /// lost. The transcript is identical at both ends of a connection and
+    /// differs between connections, which is exactly what is needed.
+    #[tokio::test]
+    async fn test_a_duplicate_connection_is_resolved_by_transcript() {
+        let port = free_port().await;
+        let (_, a) = transport(port);
+        a.start().await.unwrap();
 
-        // The low-id node dialled out; the high-id node received that dial.
-        // Both must reach the same verdict about which connection to keep, or
-        // each closes the one the other kept and both are lost.
+        // Two connections from the same identity, so the peer id and the
+        // direction are identical and only the transcript separates them.
+        let peer = Identity::generate();
+        let first = raw_client(port, &peer, true, false).await;
+        assert!(wait_for_peer(&a, &peer.node_id()).await);
+        let first_transcript = {
+            let conns = a.shared.connections.read().await;
+            conns.get(&peer.node_id()).unwrap().transcript
+        };
+
+        let second = raw_client(port, &peer, true, false).await;
+        sleep(Duration::from_millis(300)).await;
+
+        let kept = {
+            let conns = a.shared.connections.read().await;
+            conns.get(&peer.node_id()).map(|c| c.transcript)
+        };
+        let kept = kept.expect("the peer must still be connected");
         assert!(
-            Direction::Outbound.initiator_wins(&low, &high),
-            "the low id's outbound connection wins at its own end"
-        );
-        assert!(
-            Direction::Inbound.initiator_wins(&high, &low),
-            "and the same connection wins at the high id's end"
+            kept <= first_transcript,
+            "the lower transcript must win, whichever connection arrived first"
         );
 
-        // The mirror-image connection must lose at both ends.
-        assert!(!Direction::Outbound.initiator_wins(&high, &low));
-        assert!(!Direction::Inbound.initiator_wins(&low, &high));
+        drop(first);
+        drop(second);
+        a.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_displaced_connection_does_not_report_the_peer_lost() {
+        // A replaced connection closing must stay silent: a NeighborLost here
+        // makes the routing layer drop the peer and its routes while the
+        // replacement is live.
+        let port = free_port().await;
+        let (_, a) = transport(port);
+        a.start().await.unwrap();
+
+        // An identity whose second connection displaces its first.
+        let (peer, _first) = loop {
+            let candidate = Identity::generate();
+            let socket = raw_client(port, &candidate, true, false).await;
+            if !wait_for_peer(&a, &candidate.node_id()).await {
+                continue;
+            }
+            break (candidate, socket);
+        };
+
+        let mut events = a.events();
+        let _second = raw_client(port, &peer, true, false).await;
+        sleep(Duration::from_millis(400)).await;
+
+        assert!(
+            a.connected_peers().contains(&peer.node_id()),
+            "one of the two connections must survive"
+        );
+        let mut lost = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if let TransportEvent::NeighborLost { peer, .. } = event {
+                lost.push(peer);
+            }
+        }
+        assert!(
+            !lost.contains(&peer.node_id()),
+            "a peer that is still connected must not be reported lost"
+        );
+
+        a.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_connection_made_before_start_is_still_stopped() {
+        // Those connections used to attach to a token that start() replaced
+        // without cancelling, so stop() never reached them: the socket and its
+        // slot survived shutdown.
+        let port = free_port().await;
+        let (server_identity, server) = transport(port);
+        server.start().await.unwrap();
+
+        let client = InternetTransport::new(
+            Arc::new(Identity::generate()),
+            InternetConfig {
+                listen_addr: format!("127.0.0.1:{}", free_port().await).parse().unwrap(),
+                bootstrap_nodes: Vec::new(),
+                max_connections: 4,
+            },
+        );
+        client
+            .connect_to(format!("127.0.0.1:{}", port).parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(client.available_slots(), 3);
+
+        client.start().await.unwrap();
+        assert!(
+            client
+                .connected_peers()
+                .contains(&server_identity.node_id()),
+            "starting must not drop a connection made before it"
+        );
+
+        client.stop().await.unwrap();
+        assert_eq!(
+            client.available_slots(),
+            4,
+            "stop() must reclaim the slot of a connection made before start()"
+        );
+        assert!(client.connected_peers().is_empty());
+
+        server.stop().await.unwrap();
     }
 
     #[tokio::test]

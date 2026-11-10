@@ -14,7 +14,7 @@ work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **368 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **370 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |

@@ -159,6 +159,13 @@ the read loop with it rather than leaving an entry that can never be written to
 and blocks a reconnect, and the permit is shared between both tasks so the slot
 returns only when both are gone.
 
+The transport's own token is **replaced, not just cancelled**, by `stop()`:
+everything alive is a child or clone of whatever the token was when it was
+created, and a later `start()` needs an uncancelled parent. `start()` used to
+install a fresh token instead, which silently orphaned any connection made by
+`connect_to` before it — a supported case — so a later `stop()` never reached
+those sockets or their permits.
+
 ### Connection slots are a semaphore
 
 `max_connections` becomes `Semaphore` permits. A permit is taken **before** the
@@ -179,12 +186,22 @@ permit for the OS connect timeout and outlive `stop()`, and a dial that
 completed after a restart would read the *new* token and install itself on the
 restarted transport.
 
-Two nodes that dial each other at the same moment each end up with two
-connections and have to agree on which to keep. If they choose differently,
-each closes the one the other kept and both are lost. The rule is therefore
-computed identically at both ends from values both already have — **the
-connection opened by the lower NodeId wins** — and the loser's per-connection
-token is cancelled. A rule based on local arrival order would not do.
+Two connections to one peer exist whenever both ends dial at once, or two
+lookups dial the same peer. Both ends have to keep the *same* one: if they
+choose differently, each closes the one the other kept and both are lost.
+
+The ordering value is the **channel transcript**: identical at both ends of a
+given connection, different between connections, and known to both without any
+extra exchange. The lower transcript wins, and the loser's per-connection token
+is cancelled. Two weaker rules were tried and are wrong — local arrival order
+can differ at the two ends, and "the lower NodeId's connection wins" does not
+distinguish two connections opened by the *same* node, which is exactly what
+concurrent lookups produce.
+
+A displaced connection closing must emit **no** `NeighborLost`. It is no longer
+the entry in the map, and reporting a loss for a peer that is still connected
+makes the routing layer drop that peer and its routes while the replacement is
+live. The event is therefore tied to actually removing the current entry.
 
 A dial made to reach a *particular* node carries that expectation, and a peer
 that proves a different identity is refused before anything is installed. The

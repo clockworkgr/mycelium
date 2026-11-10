@@ -853,12 +853,16 @@ Each connection also has its own cancellation token, a child of the
 transport's, and the read loop and writer task share the connection's permit.
 Either task cancels the token on the way out, so a connection that can no
 longer be written to is torn down rather than left blocking a reconnect, and
-the slot returns only once both tasks are gone. Two nodes that dial each other
-simultaneously keep the connection opened by the **lower NodeId** — a rule both
-ends compute from values both already have, because a rule based on local
-arrival order would have them keep different connections and lose both. A dial
-made for a particular peer refuses a different proven identity before anything
-is installed.
+the slot returns only once both tasks are gone. When two connections to one peer exist —
+both ends dialling at once, or two lookups dialling the same peer — both ends
+keep the one with the **lower channel transcript**: identical at both ends of a
+connection, different between connections, and needing no extra exchange.
+Neither local arrival order nor "the lower NodeId dialled" works, the first
+because the two ends can disagree and the second because it cannot separate two
+connections opened by the same node. A displaced connection closing emits no
+`NeighborLost`, or the routing layer would drop a peer that is still connected.
+A dial made for a particular peer refuses a different proven identity before
+anything is installed.
 
 **DHT records are signed.** A record is a node's claim about its own address —
 `public_key(32) ‖ addr ‖ published_at(8) ‖ signature(64)`, signed over
