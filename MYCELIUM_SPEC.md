@@ -735,7 +735,7 @@ than a seamless migration (ROADMAP T-03).
 
 ```
 Service UUID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-├─ Node ID  (…7891) Read   — 32-byte Ed25519 public key
+├─ Node ID  (…7891) Read   — the server's 32-byte NodeId
 ├─ Data TX  (…7892) Write  — central writes to peripheral
 ├─ Data RX  (…7893) Notify — peripheral notifies central
 └─ Identity (…7894) Write  — client writes its own NodeId to the server
@@ -744,6 +744,17 @@ Service UUID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
 The Identity characteristic solves BLE Random Private Addresses: the client
 reads the server's NodeId, then writes its own, so both ends have an
 address ↔ NodeId mapping despite the addresses differing per direction.
+
+**Peer identity on BLE is asserted, not proved** — `Partial`, ROADMAP T-34.
+Both characteristics carry a bare 32-byte NodeId: no identity key, no
+signature, nothing bound to the connection. An attacker in radio range can
+therefore claim a neighbour's id, and `TransportManager` installs a route for
+it, so that node's traffic is delivered to the attacker and dropped and its
+AODV routes are poisoned. Payloads stay encrypted (§5.3) and no session can be
+established under a borrowed id (§14.3), so this is denial of delivery and
+route poisoning rather than impersonation. Wi-Fi Direct's `Hello` is the same
+bare id exchange. The internet transport proves identity instead (§8.4,
+ADR-011), and the fix here has the same shape.
 
 Fragmentation uses a 1-byte header: `0x01` first, `0x02` last, `0x03` single,
 `0x00` middle. Fragment size is `max(negotiated_MTU - 4, 20)`. Android permits
@@ -820,12 +831,16 @@ never carried on the wire, so the §14.3 binding holds by construction. The
 DHT. An *inbound* peer's address is its socket IP with that signed port, since
 the socket's source port is ephemeral; an *outbound* connection keeps the
 address it dialled, which has just been proved to work — substituting the
-signed port would break a peer behind a port forward. A handshake that does not complete
-closes the socket and installs nothing: no connection, no DHT contact, no
-`NeighborDiscovered`, so no route. The whole exchange is bounded by a 10 s
-timeout; duplicates and self-connections are refused; the transport is
+signed port would break a peer behind a port forward. A handshake that does
+not complete closes the socket and installs nothing: no connection, no DHT
+contact, no `NeighborDiscovered`, so no route. The whole exchange is bounded by
+a 10 s timeout; duplicates and self-connections are refused; the transport is
 restartable, and `stop()` waits for the listener to close and for every
-connection slot to come back.
+connection slot to come back. Neither call wedges the transport when its
+caller walks away mid-flight: `start()` marks itself started only once its
+tasks are registered, and `stop()` restores the usable stopped state — fresh
+cancellation token, shutdown flag cleared — from a drop guard rather than from
+its own tail.
 
 `max_connections` (default 64) is enforced as semaphore permits, taken *before*
 the handshake and held for the connection's lifetime, inbound and outbound, so
@@ -834,6 +849,17 @@ limit, the socket is closed without a hello.
 
 Framing is binary, little-endian, a 4-byte body length then a 1-byte tag:
 `MeshData 0x01`, `Dht 0x02`, `DhtReply 0x03`, `Hello 0x05`, `Confirm 0x06`.
+A `Dht`/`DhtReply` body carries an 8-byte `request_id` and then a sub-tag:
+requests `Ping 0x01`, `FindNode 0x02` + target(32), `FindValue 0x03` + key(32),
+`Store 0x04` + record; replies `Pong 0x01`, `FoundNodes 0x02` + count(2) and
+that many `node(32) ‖ addr` entries (at most 64), `FoundValue 0x03` + record,
+`Stored 0x04`, `Rejected 0x05`. An address is `family(1)` — 4 with four
+octets, 6 with sixteen — then the port; a record is
+`public_key(32) ‖ addr ‖ published_at(8) ‖ signature(64)`. That address
+encoding is also what the record's signature covers, so a signature verifies
+only against the address bytes the signer meant. The AEAD nonce is the frame
+counter alone: 12 bytes, the first four zero, the counter in the last eight,
+with no associated data.
 The wire frame cap is 1 MiB including the 16-byte AEAD tag; a cleartext
 handshake frame is capped at 1 KiB, and the sealed `Confirm` — read before the
 peer has proved the channel key — at its exact 49 bytes, so an unproven peer
@@ -855,21 +881,38 @@ Each connection also has its own cancellation token, a child of the
 transport's, and the read loop and writer task share the connection's permit.
 Either task cancels the token on the way out, so a connection that can no
 longer be written to is torn down rather than left blocking a reconnect, and
-the slot returns only once both tasks are gone. When two connections to one peer exist —
-both ends dialling at once, or two lookups dialling the same peer — both ends
-keep the one with the **lower channel transcript**: identical at both ends of a
-connection, different between connections, and needing no extra exchange.
-Dials are refused while a `stop()` is draining, and the replacement
-cancellation token is published only afterwards, so no connection can attach to
-it and outlive the shutdown.
-Neither local arrival order nor "the lower NodeId dialled" works, the first
-because the two ends can disagree and the second because it cannot separate two
-connections opened by the same node. A displaced connection closing emits no
-`NeighborLost`, or the routing layer would drop a peer that is still connected;
-both that event and `NeighborDiscovered` are emitted under the connection-map
-lock, so neither can overtake the mutation it describes.
-A dial made for a particular peer refuses a different proven identity before
-anything is installed.
+the slot returns only once both tasks are gone. Dials are refused while a
+`stop()` is draining, and the replacement cancellation token is published only
+afterwards, so no connection can attach to it and outlive the shutdown. A dial
+takes its cancellation token before it reads that shutdown flag, so a dial
+descheduled across an entire `stop()` still holds the token that `stop()`
+cancels rather than its replacement.
+
+When two connections to one peer exist — both ends dialling at once, or two
+lookups dialling the same peer — both ends keep the one with the **lower
+channel transcript**: identical at both ends of a connection, different between
+connections, and needing no extra exchange. Neither local arrival order nor
+"the lower NodeId dialled" works, the first because the two ends can disagree
+and the second because it cannot separate two connections opened by the same
+node. A displaced connection closing emits no `NeighborLost`, or the routing
+layer would drop a peer that is still connected; both that event and
+`NeighborDiscovered` are emitted under the connection-map lock, so neither can
+overtake the mutation it describes. A dial made for a particular peer refuses a
+different proven identity before anything is installed.
+
+Every DHT contact records whether its address was **dialled** or
+**claimed** — an inbound connection's derived address and a referral from a
+third node are claims — and when that was established. A claim never replaces
+a dialled address, because a peer behind a port forward signs a port that is
+unreachable from here; within a level the fresher evidence wins, so a claim
+does replace an older claim and a peer that moved is re-learned. The age is
+that of the *address*, not of the last frame: a connection refreshes its
+contact on every DHT request it answers, and each refresh carries the address
+that connection was dialled on, so an old channel must not outrank a newer
+dial. A dialled address is recorded as soon as its handshake completes, even
+if that channel then loses the tie-break, because the dial proved the endpoint
+either way; a claim waits for the connection to be admitted, so a channel that
+lost the tie-break never rewrites the contact of the one that was kept.
 
 **DHT records are signed.** A record is a node's claim about its own address —
 `public_key(32) ‖ addr ‖ published_at(8) ‖ signature(64)`, signed over
@@ -1795,6 +1838,12 @@ deviation and why:
 - **A malicious relay dropping traffic.** Relays cannot read or forge messages,
   but nothing forces them to forward. DTN spray to `L` relays limits the damage
   probabilistically; there is no accountability mechanism.
+- **A nearby node claiming a neighbour's identity.** BLE and Wi-Fi Direct
+  exchange bare NodeIds, so identity on the local transports is asserted
+  rather than proved (§8.4). Messages stay unreadable and sessions cannot be
+  hijacked (§14.3), but traffic for the impersonated node can be swallowed and
+  its routes poisoned. The internet transport proves identity (ADR-011); the
+  local ones need the same treatment — ROADMAP T-34.
 - **Compromise of a vouched identity.** Trust is transitive with decay, so a
   compromised well-connected identity inherits standing. Threshold revocation
   (§6.3) is the planned answer and is not built.

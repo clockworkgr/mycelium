@@ -76,7 +76,7 @@ export DEVELOPER_DIR=/Library/Developer/CommandLineTools
 ```bash
 make build          # Debug build
 make build-release  # Release build
-make test           # Run all 373 workspace tests
+make test           # Run all 385 workspace tests
 make lint           # cargo fmt --check + cargo clippy
 ```
 

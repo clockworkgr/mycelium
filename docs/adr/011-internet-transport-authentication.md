@@ -14,9 +14,14 @@ the weakest link in the system (ROADMAP T-09):
 1. **The `Hello` was a bare assertion.** `Hello { node_id, listen_port }`
    carried a NodeId and nothing else. A node that claimed an id was believed,
    and `TransportManager` then installed a route for that id, so any internet
-   peer could take delivery of any node's traffic by naming it. Every other
-   ingress path in the codebase enforces `NodeId = SHA-256(identity key)`
-   (spec §14.3); this one had no key to check it against.
+   peer could take delivery of any node's traffic by naming it. The *message*
+   ingress paths enforce `NodeId = SHA-256(identity key)` — a `SessionInit` or
+   `PrekeyResponse` whose key does not hash to the envelope source is dropped
+   (spec §14.3) — but this path had no key to check at all.
+   The local transports are no better: BLE and Wi-Fi Direct both exchange a
+   bare NodeId with no key and no proof of possession (ROADMAP T-34). This
+   ADR does not fix those; it is the first transport to prove identity at the
+   transport layer, not the last to do so.
 
 2. **`max_connections` was configuration only.** Nothing read it. Connections
    were accepted until the process ran out of file descriptors.
@@ -169,11 +174,36 @@ install a fresh token instead, which silently orphaned any connection made by
 `connect_to` before it — a supported case — so a later `stop()` never reached
 those sockets or their permits.
 
+`start()` holds the `started` lock until every background task is registered.
+Releasing it right after the bind let a `stop()` run to completion in the gap:
+it cancelled the token `start()` had already captured, joined a task set the
+accept task was not in yet, drained the permits and returned —
+while `start()` still held a bound listener it was about to hand to a task
+attached to that cancelled token. `stop()` takes the same lock first, so it
+now waits for a `start()` in progress.
+
+`started` is set at the **end** of `start()`, once the tasks exist. Set before
+the awaits in between, a caller that stopped awaiting mid-startup — the
+listener is a local, so it is dropped with the future — left the transport
+marked started with no accept task and no way back: every later `start()`
+returned `AlreadyStarted`.
+
 The replacement token is published only **after** the drain, and dials are
 refused while a `stop()` is in progress. Publishing it first left a window in
 which a concurrent dial attached to the new token, survived the cancellation,
 had its map entry cleared by the shutdown, and then held its socket and permit
 for good.
+
+A dial takes its token **before** it reads the shutdown flag, and both before
+it takes a slot. The flag alone is not enough: a dial can read it, be
+descheduled, and resume after an entire `stop()` has set the flag, cancelled
+the token, drained the permits, published a replacement and cleared the flag
+again — at which point nothing it could consult says a shutdown happened, and
+taking the token then would attach it to the replacement and install a live
+connection on a transport whose `stop()` had already returned, with nothing
+left to cancel it. Taking the token first puts every dial on one side or the
+other: its token is the one `stop()` cancels, or it is a dial after that stop,
+which is a supported `connect_to` on a stopped transport.
 
 ### Connection slots are a semaphore
 
@@ -216,11 +246,60 @@ events have to be ordered with the map mutation they describe: emitted after
 unlocking, a reconnect could insert and announce itself in between, and the
 stale loss would still strip the live peer's routes.
 
+A peer's address becomes a DHT **contact** when it is either proved or
+admitted, and the two are not the same moment. Recorded in `establish` for
+every connection alike, a contact was written before the duplicate was
+resolved, so a connection that lost the tie-break and was closed immediately
+still rewrote the contact of the peer whose other channel we kept.
+
+A contact also carries **where its address came from** (`AddrSource`) and
+**when that was established** (`addr_proved_at`): `Dialled` for an address we
+reached ourselves, `Claimed` for an inbound connection's (its socket IP with
+the signed listen port) or a referral from a third node. A claim never
+displaces a dialled address — the `public:443` → `public:9736` regression,
+reached through the contact table instead of through `dialable_addr` — and
+within a level the fresher evidence wins. A claim replacing an older claim is
+how a peer that moved is re-learned, since what we hold is no better evidence
+than what it now says; a dialled address that has gone stale is for bucket
+liveness to remove (T-32), not for a claim to overwrite.
+
+`addr_proved_at` is **not** `last_seen`, and the difference is the whole
+point: a connection refreshes its contact on every DHT request it answers,
+and those refreshes carry the address *that* connection was made to. Dated
+`now`, a long-lived channel's refresh kept reinstating its own endpoint over
+one a later dial had proved — so a contact could revert to an address that no
+longer reaches the peer. A connection's refreshes therefore carry the instant
+its own handshake completed, which is what makes them lose to newer
+evidence.
+
+The rule lives in the bucket insert rather than at the call sites, because
+there are more of those than is obvious: the first attempt put it in the
+transport and `handle_request` — which refreshes the contact of whoever asks —
+undid it on the next DHT frame.
+
+A **dialled** contact is recorded as soon as the handshake completes, before
+the duplicate is resolved, because a dial that completed proves its endpoint
+whatever becomes of that channel. Recorded only in the read loop, the proof
+was thrown away whenever the dial lost the tie-break, leaving the inbound
+channel's unreachable claim cached for a peer we had just reached at a working
+address. A *claim* still waits for admission: recording one early is what put
+a closed channel's address in the table to begin with.
+
 A dial made to reach a *particular* node carries that expectation, and a peer
 that proves a different identity is refused before anything is installed. The
 identity is legitimate, but the connection is not the one that was asked for,
 and a stale or dishonest DHT referral should not leave an unrelated peer
 holding a slot.
+
+Whatever `stop()` leaves behind is restored by a drop guard rather than by
+the tail of the function, because everything after the cancellation can be
+abandoned by a caller that stops awaiting mid-drain. Left to the tail, such a
+call published no replacement token and never cleared the shutdown flag, so
+every later dial was refused for good and `start()` could not run at all.
+Abandoning the drains themselves is safe — the connections have already been
+cancelled, their read loops remove their own entries and their permits come
+back with nobody waiting on them — but the flag and the token are state no
+later call would repair.
 
 `stop()` cancels, waits for the accept task to drop the listener, and then
 waits for every permit to come back. Connection tasks are deliberately *not*
@@ -243,14 +322,44 @@ little-endian throughout to match §4:
 0x06 Confirm    transcript(32)
 ```
 
+The DHT bodies follow the 8-byte `request_id`:
+
+```
+request  0x01 Ping        —
+         0x02 FindNode    target(32)
+         0x03 FindValue   key(32)
+         0x04 Store       <record>
+reply    0x01 Pong        —
+         0x02 FoundNodes  count(2) then count × [ node(32) <addr> ]
+         0x03 FoundValue  <record>
+         0x04 Stored      —
+         0x05 Rejected    —
+
+<addr>   family(1): 4 → octets(4) | 6 → octets(16), then port(2)
+<record> public_key(32) <addr> published_at(8) signature(64)
+```
+
+`<addr>` is the one canonical address encoding, used on the wire *and* inside
+the record's signed payload, so a signature can only verify against the same
+address bytes the signer meant. `FoundNodes` carries at most
+`MAX_FOUND_NODES` (64) entries and the encoder truncates to that, so it can
+never produce a frame its own decoder would reject.
+
+The AEAD nonce is the frame counter and nothing else: 12 bytes, the first four
+zero, the counter little-endian in the last eight. No associated data is
+passed, because a frame's only context is the key (one per direction) and that
+counter. The counter is refused rather than wrapped when it would overflow
+(`CounterExhausted`), so a (key, nonce) pair is never reused.
+
 `MAX_WIRE_MESSAGE` (1 MiB) caps the frame body as it appears on the wire —
 ciphertext, tag included. A cleartext handshake frame is capped far lower
 (`MAX_HANDSHAKE_FRAME`, 1 KiB) so a peer cannot make us allocate a megabyte
 before it has proved anything, and the sealed `Confirm` frame — read *before*
-the peer has proved the channel key — is capped at its exact 49-byte size. `mtu()` is the frame cap minus the 16-byte AEAD
-tag and the 37 bytes `MeshData` framing costs, so a send at the advertised MTU
-is exactly one frame the receiver accepts; `send()` refuses anything larger up
-front with `ExceedsMtu` instead of writing a frame the peer will discard.
+the peer has proved the channel key — is capped at its exact 49-byte size.
+`mtu()` is the frame cap minus the 16-byte AEAD tag and the 37 bytes
+`MeshData` framing costs, so a send at the advertised MTU is exactly one frame
+the receiver accepts; `send()` refuses anything larger up front with
+`ExceedsMtu` instead of writing a frame the peer will discard.
 
 The decoder is a bounds-checked cursor whose every length check subtracts on
 the trusted side (`len - pos`), rejects trailing bytes, caps a `FoundNodes`
@@ -322,9 +431,11 @@ the same peer and won, and that connection is perfectly usable.
 
 **Easier:**
 
-- An internet peer is now as well identified as a BLE one: the same
-  `NodeId = SHA-256(identity key)` rule, proved rather than asserted, and bound
-  to a channel it has to keep using.
+- An internet peer is now *better* identified than a local-mesh one:
+  `NodeId = SHA-256(identity key)` is proved rather than asserted, and bound to
+  a channel the peer has to keep using. BLE and Wi-Fi Direct still install the
+  id their platform layer reports (ROADMAP T-34), so this is the only
+  transport where a peer's id is proved where the connection is made.
 - Frame-level integrity. Injecting, altering, replaying or reordering a frame
   on an established connection all fail, which previously nothing detected.
 - A send at the advertised MTU works, and a mesh payload costs 37 bytes of
@@ -365,6 +476,14 @@ the same peer and won, and that connection is perfectly usable.
   `send` to an unconnected peer still fails with `PeerNotConnected`. Dialling
   through the DHT is ROADMAP T-33, kept separate because it changes when the
   transport opens connections, not how it authenticates them.
+- **A connection opened only to ask a DHT question is never closed.**
+  `DhtRpc::request` dials the peer it needs and installs an ordinary
+  connection, so a node running many lookups would hold a slot for each one
+  and then refuse the dials that follow fresh referrals. Nothing reaches that
+  path yet — `resolve()` is its only caller and nothing calls `resolve()` — so
+  it becomes real exactly when T-33 wires resolution into the send path, and
+  it is an acceptance criterion there: lookup connections need a lease or idle
+  eviction.
 - A cancelled send can now lose a queued frame instead of corrupting the
   channel. That is the right trade for a transport under a protocol with its
   own retry and DTN fallback, but it does mean `send` returning `Ok` means
@@ -382,7 +501,8 @@ the same peer and won, and that connection is perfectly usable.
    alongside the Ed25519 one the rest of the protocol uses. What is implemented
    here is a signed-ephemeral pattern in the same shape as Noise `IK`, built
    from primitives the project already depends on (X25519, HKDF, AES-GCM,
-   Ed25519) and reviewed as about 200 lines rather than trusted as a black box.
+   Ed25519) and reviewed as under 300 lines rather than trusted as a black
+   box.
    Revisit if the channel ever needs rekeying, 0-RTT or padding.
 3. **Authenticate the handshake and leave later frames in the clear.** Half the
    work and it leaves TCP's lack of integrity exposed on the one transport that

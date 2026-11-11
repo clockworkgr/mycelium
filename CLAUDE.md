@@ -64,7 +64,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 373 tests).
+- `cargo test` runs the whole workspace (currently 385 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -256,7 +256,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-11: 373 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-11: 385 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -271,4 +271,8 @@ clean, `flutter analyze` clean.
 The highest-priority open items (all P0, all defects in shipped features): FFI
 panic guards (`T-01`), group-discovery proof of possession (`T-04`), emergency
 co-signer signatures (`T-05`, wire format and verification landed; collecting
-co-signatures is not built), identity key at rest (`T-08`).
+co-signatures is not built), identity key at rest (`T-08`), BLE/Wi-Fi Direct
+peer identity, which is asserted rather than proved (`T-34`), the
+unconfirmed-handshake bookkeeping a forged `SessionReject` exploits (`T-35`),
+and emergency-broadcast dedup, which lets one unverifiable packet suppress a
+valid alert (`T-36`).

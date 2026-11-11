@@ -40,7 +40,7 @@ use crate::dht::rpc::{
     InternetWireMessage, CONFIRM_FRAME_LEN, MAX_HANDSHAKE_FRAME, MAX_MESH_PAYLOAD,
     MAX_WIRE_MESSAGE,
 };
-use crate::dht::{DhtConfig, DhtEngine, DhtRpc, PeerInfo, REQUEST_TIMEOUT};
+use crate::dht::{AddrSource, DhtConfig, DhtEngine, DhtRpc, PeerInfo, REQUEST_TIMEOUT};
 
 /// Bound on the whole handshake, so an idle or stalling peer cannot hold a
 /// task, a socket and a connection slot indefinitely.
@@ -196,6 +196,9 @@ struct PeerConnection {
     /// port. For an inbound connection the socket's port is ephemeral and
     /// useless for dialling back.
     dialable_addr: SocketAddr,
+    /// True when we dialled `dialable_addr` ourselves, so it is proven
+    /// reachable rather than derived from the peer's own claim.
+    dialled: bool,
     connected_at: Instant,
     /// This channel's transcript, used to order two connections to the same
     /// peer identically at both ends.
@@ -230,6 +233,31 @@ impl PeerConnection {
         })
     }
 
+    /// This connection as a DHT contact.
+    ///
+    /// The address is only *proven* when we dialled it. An inbound
+    /// connection's is derived from its socket IP and the listen port the
+    /// peer signed, which is the peer's claim — and a claim must not replace
+    /// an endpoint we reached, or a peer behind a port forward becomes
+    /// undialable.
+    fn contact(&self, peer_id: NodeId) -> PeerInfo {
+        PeerInfo {
+            node_id: peer_id,
+            addr: self.dialable_addr,
+            last_seen: Instant::now(),
+            addr_source: if self.dialled {
+                AddrSource::Dialled
+            } else {
+                AddrSource::Claimed
+            },
+            // When *this* channel proved the address, not now: every DHT
+            // request this connection answers refreshes the contact, and
+            // dating those refreshes `now` let a long-lived channel keep
+            // reinstating its own endpoint over one a later dial proved.
+            addr_proved_at: self.connected_at,
+        }
+    }
+
     fn resolve_pending(&self, reply: DhtReply) {
         let waiter = self
             .pending
@@ -251,6 +279,36 @@ impl PeerConnection {
         if let Ok(mut pending) = self.pending.lock() {
             pending.remove(&request_id);
         }
+    }
+}
+
+/// Leaves the transport in a usable stopped state however `stop()` ends.
+///
+/// The drains it brackets can be abandoned safely: the connections being
+/// drained have already been cancelled, so their read loops remove their own
+/// entries and their permits come back without anyone waiting for them. What
+/// cannot be left behind is the shutdown flag or the cancelled lifetime
+/// token, because nothing later would repair either — dials would be refused
+/// for good, and a `start()` would hand its tasks a token that is already
+/// cancelled.
+///
+/// The replacement token is published here, which is *after* the drain in the
+/// ordinary case, so a dial still cannot attach to it and outlive the
+/// shutdown.
+struct StopState<'a> {
+    stopping: &'a std::sync::atomic::AtomicBool,
+    lifetime: &'a std::sync::Mutex<CancellationToken>,
+    started: &'a mut bool,
+}
+
+impl Drop for StopState<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut token) = self.lifetime.lock() {
+            *token = CancellationToken::new();
+        }
+        self.stopping
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        *self.started = false;
     }
 }
 
@@ -562,6 +620,7 @@ impl Shared {
         let conn = Arc::new(PeerConnection {
             socket_addr,
             dialable_addr,
+            dialled: dialled.is_some(),
             connected_at: Instant::now(),
             transcript: channel.transcript,
             cancel: conn_cancel.clone(),
@@ -582,14 +641,17 @@ impl Shared {
             permit,
         ));
 
-        self.dht
-            .add_peer(PeerInfo {
-                node_id: peer_id,
-                addr: dialable_addr,
-                last_seen: Instant::now(),
-            })
-            .await;
-        self.offer_self_record(&conn);
+        // A completed dial proves its endpoint whatever happens to this
+        // channel next, so the contact is recorded here rather than in the
+        // read loop: a dial that loses the transcript tie-break is closed
+        // without a read loop, and throwing the proven address away there
+        // left an unreachable claim cached for a peer we had just reached.
+        // Only the dialled case belongs here — an inbound connection's
+        // address is a claim, and recording a claim before the duplicate is
+        // resolved is what put a closed channel's address in the table.
+        if dialled.is_some() {
+            self.dht.add_peer(conn.contact(peer_id)).await;
+        }
 
         // Everything from here on is synchronous, deliberately: once the
         // connection is in the map, the caller must reach `read_loop` without
@@ -698,6 +760,13 @@ impl Shared {
         cancel: CancellationToken,
         _permit: Arc<OwnedSemaphorePermit>,
     ) {
+        // Only an admitted connection becomes a DHT contact. Done in
+        // `establish`, this ran before the duplicate was resolved, so a
+        // connection that lost the tie-break and was closed still rewrote the
+        // contact for a peer we were keeping another channel to.
+        self.dht.add_peer(conn.contact(peer_id)).await;
+        self.offer_self_record(&conn);
+
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -715,14 +784,11 @@ impl Shared {
                         Ok(InternetWireMessage::Dht(request)) => {
                             let reply = self
                                 .dht
-                                .handle_request(
-                                    PeerInfo {
-                                        node_id: peer_id,
-                                        addr: conn.dialable_addr,
-                                        last_seen: Instant::now(),
-                                    },
-                                    request,
-                                )
+                                // Carries the address provenance, or
+                                // answering one request would undo it: the
+                                // engine refreshes the contact for whoever
+                                // asked.
+                                .handle_request(conn.contact(peer_id), request)
                                 .await;
                             // Queued, not written here: a write in this
                             // branch would sit outside the cancellation
@@ -867,9 +933,40 @@ impl InternetTransport {
         addr: SocketAddr,
         expected: Option<NodeId>,
     ) -> Result<NodeId, TransportError> {
+        let cancel = self.begin_dial()?;
+        self.dial_with(cancel, addr, expected).await
+    }
+
+    /// The cancellation token a dial must run under, refusing it outright
+    /// while a `stop()` is in progress.
+    ///
+    /// The token is taken **before** the shutdown flag is read, and both
+    /// before anything that can wait. A dial that read the flag first could
+    /// be descheduled in between for long enough that an entire `stop()`
+    /// passes — flag set, token cancelled, permits drained, a fresh token
+    /// published, flag cleared — and would then take the *new* token and
+    /// install a live connection on a transport whose `stop()` had already
+    /// returned, with nothing left to cancel it. Taking the token first puts
+    /// every dial unambiguously on one side: either its token is the one
+    /// `stop()` cancels, or it is a dial after the stop, which is a
+    /// supported use of `connect_to` on a stopped transport.
+    fn begin_dial(&self) -> Result<CancellationToken, TransportError> {
+        let cancel = self.lifetime_token();
         if self.stopping.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(TransportError::Other("transport is stopping".to_string()));
         }
+        Ok(cancel)
+    }
+
+    /// Dial under a token taken earlier by `begin_dial`.
+    async fn dial_with(
+        &self,
+        cancel: CancellationToken,
+        addr: SocketAddr,
+        expected: Option<NodeId>,
+    ) -> Result<NodeId, TransportError> {
+        // After the token, so a dial that lost its race with `stop()` does
+        // not even take a slot.
         let permit = Arc::new(self.shared.slots.clone().try_acquire_owned().map_err(|_| {
             TransportError::Other(format!(
                 "connection limit of {} reached",
@@ -877,10 +974,6 @@ impl InternetTransport {
             ))
         })?);
 
-        // Captured *before* the dial: a connect that outlives a stop() must
-        // not pick up the token of a later start() and install itself on a
-        // restarted transport.
-        let cancel = self.lifetime_token();
         let stream = tokio::select! {
             _ = cancel.cancelled() => {
                 return Err(TransportError::Other("transport stopped".to_string()));
@@ -999,8 +1092,19 @@ impl Transport for InternetTransport {
             .map_err(|e| TransportError::Other(format!("bind {}: {}", listen_addr, e)))?;
         info!("Internet transport listening on {}", listen_addr);
 
-        *started = true;
-        drop(started);
+        // `started` is set at the end, and the guard is held until then.
+        //
+        // Releasing the guard right after the bind let a `stop()` run to
+        // completion in the gap: it cancelled the token this call had already
+        // captured, joined a task set the accept task was not in yet, drained
+        // the permits and returned — while `start()` still held a bound
+        // listener it was about to hand to a task attached to that cancelled
+        // token, so the port was still bound when `stop()` returned.
+        //
+        // Setting the flag before the awaits below was its own defect: a
+        // caller that walked away during one of them dropped the listener
+        // along with the future and left the transport marked started with no
+        // accept task, so every later `start()` returned `AlreadyStarted`.
 
         // Publish our own address, if it is one anyone could dial.
         if self.shared.has_publishable_address() {
@@ -1138,6 +1242,9 @@ impl Transport for InternetTransport {
             });
         }
 
+        // Every task is registered, so the transport is started and a
+        // concurrent `stop()` — which needs this guard — will reach them all.
+        *started = true;
         Ok(())
     }
 
@@ -1157,6 +1264,17 @@ impl Transport for InternetTransport {
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.lifetime_token().cancel();
+        let _restore = StopState {
+            stopping: &self.stopping,
+            lifetime: &self.lifetime,
+            started: &mut started,
+        };
+        // What the transport looks like after this call is restored by a
+        // guard, not by the tail of this function: everything below can be
+        // abandoned by a caller that stops awaiting mid-drain, and left to
+        // the tail that published no replacement token and never cleared the
+        // shutdown flag — refusing every later dial for good and leaving
+        // `start()` reporting `AlreadyStarted`.
         {
             // The listener lives in the accept task, so a restart cannot bind
             // until that task has dropped it. Bounded: a task that ignores
@@ -1186,14 +1304,6 @@ impl Transport for InternetTransport {
             warn!("Internet: a connection did not release its slot within the stop timeout");
         }
         self.shared.connections.write().await.clear();
-        // Only now is a usable token available again, so the next start() or
-        // dial gets one nothing in this shutdown was attached to.
-        if let Ok(mut guard) = self.lifetime.lock() {
-            *guard = CancellationToken::new();
-        }
-        self.stopping
-            .store(false, std::sync::atomic::Ordering::SeqCst);
-        *started = false;
         info!("Internet transport stopped");
         Ok(())
     }
@@ -1257,7 +1367,7 @@ impl Transport for InternetTransport {
 mod tests {
     use super::*;
     use crate::dht::rpc::MESH_DATA_OVERHEAD;
-    use mycelium_crypto::channel::AEAD_TAG_LEN;
+    use mycelium_crypto::channel::{ChannelKeys, AEAD_TAG_LEN};
     use tokio::time::{sleep, timeout};
 
     fn config_on(port: u16) -> InternetConfig {
@@ -1291,6 +1401,28 @@ mod tests {
             sleep(Duration::from_millis(20)).await;
         }
         false
+    }
+
+    /// The address our routing table holds for a peer, if any.
+    async fn contact_addr(t: &InternetTransport, peer: &NodeId) -> Option<SocketAddr> {
+        t.dht()
+            .all_peers()
+            .await
+            .into_iter()
+            .find(|p| p.node_id == *peer)
+            .map(|p| p.addr)
+    }
+
+    /// The contact is recorded by the connection's read loop, which starts
+    /// just after the handshake returns.
+    async fn wait_for_contact(t: &InternetTransport, peer: &NodeId) -> Option<SocketAddr> {
+        for _ in 0..100 {
+            if let Some(addr) = contact_addr(t, peer).await {
+                return Some(addr);
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        None
     }
 
     async fn next_data_event(
@@ -1418,11 +1550,57 @@ mod tests {
         sign_correctly: bool,
         relay: bool,
     ) -> TcpStream {
+        raw_client_announcing(port, identity, sign_correctly, relay, 7000).await
+    }
+
+    /// As `raw_client`, with the listen port the hello announces — the port a
+    /// server records as the peer's dialable one.
+    async fn raw_client_announcing(
+        port: u16,
+        identity: &Identity,
+        sign_correctly: bool,
+        relay: bool,
+        listen_port: u16,
+    ) -> TcpStream {
         let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
             .unwrap();
+        let _ = raw_handshake(&mut stream, identity, sign_correctly, relay, listen_port).await;
+        stream
+    }
+
+    /// A client that completes the handshake and then asks a DHT question on
+    /// the channel, which is what makes the server refresh its contact.
+    async fn raw_client_pinging(port: u16, identity: &Identity, listen_port: u16) -> TcpStream {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port))
+            .await
+            .unwrap();
+        let mut keys = raw_handshake(&mut stream, identity, true, false, listen_port)
+            .await
+            .expect("the handshake must complete");
+        let (_, mut writer) = tokio::io::split(&mut stream);
+        let sealed = keys
+            .send
+            .seal(&encode_body(&InternetWireMessage::Dht(DhtRequest {
+                request_id: 1,
+                body: DhtRequestBody::Ping,
+            })))
+            .unwrap();
+        write_framed(&mut writer, &sealed).await.unwrap();
+        stream
+    }
+
+    /// The client half of the handshake, returning the channel keys so a
+    /// caller can keep sending on it. `None` if the server hung up.
+    async fn raw_handshake(
+        stream: &mut TcpStream,
+        identity: &Identity,
+        sign_correctly: bool,
+        relay: bool,
+        listen_port: u16,
+    ) -> Option<ChannelKeys> {
         {
-            let (mut reader, mut writer) = tokio::io::split(&mut stream);
+            let (mut reader, mut writer) = tokio::io::split(stream);
             // The exchange whose secret we hold.
             let mine = ChannelHandshake::new();
             // A relay puts a key it does *not* hold the secret for in the
@@ -1444,7 +1622,7 @@ mod tests {
                 .sign(&channel_hello_payload(
                     &signed_ephemeral,
                     &identity_key,
-                    7000,
+                    listen_port,
                 ))
                 .to_bytes();
             write_framed(
@@ -1452,7 +1630,7 @@ mod tests {
                 &encode_body(&InternetWireMessage::Hello {
                     identity_key,
                     ephemeral_public: hello_ephemeral,
-                    listen_port: 7000,
+                    listen_port,
                     signature,
                 }),
             )
@@ -1461,7 +1639,7 @@ mod tests {
 
             let Ok(body) = read_framed(&mut reader, MAX_HANDSHAKE_FRAME).await else {
                 // The server hung up on the hello; nothing left to confirm.
-                return stream;
+                return None;
             };
             let (server_key, server_ephemeral) = match deserialize_wire_message(&body).unwrap() {
                 InternetWireMessage::Hello {
@@ -1481,8 +1659,8 @@ mod tests {
                 }))
                 .unwrap();
             let _ = write_framed(&mut writer, &sealed).await;
+            Some(keys)
         }
-        stream
     }
 
     #[tokio::test]
@@ -1577,6 +1755,7 @@ mod tests {
         let conn = PeerConnection {
             socket_addr: "127.0.0.1:1".parse().unwrap(),
             dialable_addr: "127.0.0.1:1".parse().unwrap(),
+            dialled: true,
             connected_at: Instant::now(),
             transcript: [0u8; 32],
             cancel: CancellationToken::new(),
@@ -1634,6 +1813,8 @@ mod tests {
             node_id: b_identity.node_id(),
             addr: format!("127.0.0.1:{}", port).parse().unwrap(),
             last_seen: Instant::now(),
+            addr_source: AddrSource::Dialled,
+            addr_proved_at: Instant::now(),
         };
         let request = DhtRequest {
             request_id: 4242,
@@ -1652,6 +1833,307 @@ mod tests {
 
         a.stop().await.unwrap();
         b.stop().await.unwrap();
+    }
+
+    /// A transport with a proven contact for a peer that is no longer
+    /// connected: `a` dials `b`, then `b` goes away. Contacts outlive the
+    /// connection (the stored address is what allows a redial), and with no
+    /// live connection left the tests below exercise the address rule rather
+    /// than which of two concurrent channels won.
+    async fn proven_contact_then_disconnect(a: &InternetTransport) -> (Arc<Identity>, SocketAddr) {
+        let b_port = free_port().await;
+        let (b_identity, b) = transport(b_port);
+        b.start().await.unwrap();
+        let b_addr: SocketAddr = format!("127.0.0.1:{}", b_port).parse().unwrap();
+        a.connect_to(b_addr).await.unwrap();
+        assert_eq!(
+            wait_for_contact(a, &b_identity.node_id()).await,
+            Some(b_addr),
+            "the address we dialled is the contact"
+        );
+
+        b.stop().await.unwrap();
+        for _ in 0..100 {
+            if !a.connected_peers().contains(&b_identity.node_id()) {
+                return (b_identity, b_addr);
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        panic!("a never noticed b going away");
+    }
+
+    #[tokio::test]
+    async fn test_an_inbound_connection_keeps_the_address_we_dialled() {
+        // The peer comes back inbound, announcing the port it listens on
+        // inside its own network. That claim must not replace the address we
+        // proved: for a peer behind a port forward it turns a working
+        // `public:443` into an unreachable `public:9736`.
+        let a_port = free_port().await;
+        let (_, a) = transport(a_port);
+        a.start().await.unwrap();
+        let (b_identity, b_addr) = proven_contact_then_disconnect(&a).await;
+
+        let _inbound = raw_client_announcing(a_port, &b_identity, true, false, 9736).await;
+        assert!(wait_for_peer(&a, &b_identity.node_id()).await);
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            contact_addr(&a, &b_identity.node_id()).await,
+            Some(b_addr),
+            "an inbound hello must not overwrite an address we dialled"
+        );
+
+        a.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_dht_request_from_an_inbound_peer_keeps_the_proven_address() {
+        // Answering a request refreshes the asker's contact, so the address
+        // provenance has to travel with it. Without that, the first DHT frame
+        // on an inbound channel undid the rule the test above checks.
+        let a_port = free_port().await;
+        let (_, a) = transport(a_port);
+        a.start().await.unwrap();
+        let (b_identity, b_addr) = proven_contact_then_disconnect(&a).await;
+
+        let _inbound = raw_client_pinging(a_port, &b_identity, 9736).await;
+        assert!(wait_for_peer(&a, &b_identity.node_id()).await);
+        sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(
+            contact_addr(&a, &b_identity.node_id()).await,
+            Some(b_addr),
+            "answering a DHT request must not replace an address we dialled"
+        );
+
+        a.stop().await.unwrap();
+    }
+
+    /// A peer that answers one dial, keeps the channel, and pings on demand.
+    /// Returns the address to dial and the trigger for its DHT request.
+    async fn fake_peer(
+        identity: Arc<Identity>,
+        claims_port: u16,
+    ) -> (SocketAddr, oneshot::Sender<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (mut reader, mut writer) = tokio::io::split(stream);
+            let Ok(mut channel) = handshake(&identity, claims_port, &mut reader, &mut writer).await
+            else {
+                return;
+            };
+            if rx.await.is_ok() {
+                let sealed = channel
+                    .send
+                    .seal(&encode_body(&InternetWireMessage::Dht(DhtRequest {
+                        request_id: 7,
+                        body: DhtRequestBody::Ping,
+                    })))
+                    .unwrap();
+                let _ = write_framed(&mut writer, &sealed).await;
+            }
+            sleep(Duration::from_secs(5)).await;
+        });
+        (addr, tx)
+    }
+
+    #[tokio::test]
+    async fn test_a_live_channel_does_not_restore_the_endpoint_it_was_dialled_on() {
+        // Every DHT request a connection answers refreshes its contact. A
+        // long-lived channel's refresh therefore kept reinstating the address
+        // it was dialled on, undoing a later dial that had proved a different
+        // endpoint — so the contact could go back to one that no longer
+        // reaches the peer.
+        let a_port = free_port().await;
+        let (_, a) = transport(a_port);
+        a.start().await.unwrap();
+
+        for _ in 0..20 {
+            let peer = Arc::new(Identity::generate());
+            let (first_addr, ping_first) = fake_peer(peer.clone(), 9736).await;
+            a.connect_to(first_addr).await.unwrap();
+            assert_eq!(
+                wait_for_contact(&a, &peer.node_id()).await,
+                Some(first_addr)
+            );
+
+            // A second endpoint for the same peer, proved later. The channel
+            // it opens has to lose the transcript tie-break for the case
+            // under test, so retry until it does.
+            let (second_addr, _ping_second) = fake_peer(peer.clone(), 9736).await;
+            match a.connect_to(second_addr).await {
+                Err(e) if e.to_string().contains("wins the tie") => {}
+                _ => continue,
+            }
+            assert_eq!(
+                contact_addr(&a, &peer.node_id()).await,
+                Some(second_addr),
+                "the later dial proved a newer endpoint"
+            );
+
+            // The first channel is still live. Let it answer a DHT request.
+            ping_first.send(()).unwrap();
+            sleep(Duration::from_millis(300)).await;
+
+            assert_eq!(
+                contact_addr(&a, &peer.node_id()).await,
+                Some(second_addr),
+                "answering on an older channel must not restore its endpoint"
+            );
+            a.stop().await.unwrap();
+            return;
+        }
+        panic!("no second dial lost the tie-break in 20 tries");
+    }
+
+    #[tokio::test]
+    async fn test_a_dial_that_loses_the_tie_break_still_records_its_endpoint() {
+        // The dial completed, so its address is reachable from here whatever
+        // happens to the channel. Recording contacts only in the read loop
+        // threw that away when the dial lost the transcript tie-break, and
+        // left the inbound channel's unreachable claim cached instead.
+        let a_port = free_port().await;
+        let (_, a) = transport(a_port);
+        a.start().await.unwrap();
+
+        let peer = Arc::new(Identity::generate());
+        let mut sockets = Vec::new();
+        let mut refused = None;
+        // Which of two channels wins is decided by the transcript, so retry
+        // until the dial is the one refused.
+        for _ in 0..20 {
+            if !a.connected_peers().contains(&peer.node_id()) {
+                sockets.push(raw_client_announcing(a_port, &peer, true, false, 9736).await);
+                assert!(wait_for_peer(&a, &peer.node_id()).await);
+            }
+            // The same identity, now answering a dial on a port it never
+            // announces — the port-forward case.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let dialled = listener.local_addr().unwrap();
+            let server = peer.clone();
+            tokio::spawn(async move {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let (mut reader, mut writer) = tokio::io::split(stream);
+                    let _ = handshake(&server, 9736, &mut reader, &mut writer).await;
+                    sleep(Duration::from_secs(5)).await;
+                }
+            });
+            match a.connect_to(dialled).await {
+                Err(e) if e.to_string().contains("wins the tie") => {
+                    refused = Some(dialled);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+
+        let dialled = refused.expect("no dial lost the tie-break in 20 tries");
+        assert_eq!(
+            contact_addr(&a, &peer.node_id()).await,
+            Some(dialled),
+            "a completed dial proves its endpoint even when its channel is closed"
+        );
+
+        a.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_refused_duplicate_leaves_the_dht_contact_alone() {
+        // The contact used to be recorded before the duplicate was resolved,
+        // so a second connection that lost the transcript tie-break — and was
+        // closed — still rewrote the address of the peer whose other channel
+        // we kept.
+        let a_port = free_port().await;
+        let (_, a) = transport(a_port);
+        a.start().await.unwrap();
+
+        let first_addr: SocketAddr = "127.0.0.1:1111".parse().unwrap();
+        // Which of two connections wins is decided by the channel transcript,
+        // so retry until the second one is the refused one.
+        for _ in 0..20 {
+            let peer = Identity::generate();
+            let first = raw_client_announcing(a_port, &peer, true, false, 1111).await;
+            if !wait_for_peer(&a, &peer.node_id()).await {
+                continue;
+            }
+            let first_transcript = {
+                let conns = a.shared.connections.read().await;
+                conns.get(&peer.node_id()).map(|c| c.transcript)
+            };
+            assert_eq!(
+                wait_for_contact(&a, &peer.node_id()).await,
+                Some(first_addr)
+            );
+
+            let second = raw_client_announcing(a_port, &peer, true, false, 2222).await;
+            sleep(Duration::from_millis(300)).await;
+            let kept = {
+                let conns = a.shared.connections.read().await;
+                conns.get(&peer.node_id()).map(|c| c.transcript)
+            };
+            if kept != first_transcript {
+                // The second connection won; this attempt says nothing.
+                drop(first);
+                drop(second);
+                continue;
+            }
+
+            assert_eq!(
+                contact_addr(&a, &peer.node_id()).await,
+                Some(first_addr),
+                "a connection that lost the tie-break must not rewrite the contact"
+            );
+            drop(first);
+            drop(second);
+            a.stop().await.unwrap();
+            return;
+        }
+        panic!("no attempt produced a refused duplicate");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_stop_waits_for_a_start_that_is_still_registering_tasks() {
+        // start() used to publish `started = true` and release the lock before
+        // spawning its accept task, so a stop() in that gap joined an empty
+        // task set and returned while the listener was still bound.
+        let port = free_port().await;
+        let (_, t) = transport(port);
+        let t = Arc::new(t);
+
+        // Park start() between its bind and the registration of its tasks: it
+        // publishes our own record in there, which needs this lock.
+        let held = t.shared.dht.hold_store_for_test().await;
+        let starting = {
+            let t = t.clone();
+            tokio::spawn(async move { t.start().await })
+        };
+
+        // A successful connect proves the listener is bound, so there is no
+        // sleep to guess at: start() is at or past the parked publish.
+        let addr = format!("127.0.0.1:{}", port);
+        let mut bound = false;
+        for _ in 0..200 {
+            if TcpStream::connect(&addr).await.is_ok() {
+                bound = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(bound, "start() never bound its listener");
+
+        assert!(
+            timeout(Duration::from_millis(250), t.stop()).await.is_err(),
+            "stop() must not finish while start() still has tasks to register"
+        );
+
+        drop(held);
+        starting.await.unwrap().unwrap();
+        t.stop().await.unwrap();
     }
 
     /// Two connections to one peer must be ordered by something both ends
@@ -1866,15 +2348,11 @@ mod tests {
         let addr: SocketAddr = format!("127.0.0.1:{}", reachable_port).parse().unwrap();
         assert_eq!(client.connect_to(addr).await.unwrap(), server_id);
 
-        let contact = client
-            .dht()
-            .all_peers()
+        let contact = wait_for_contact(&client, &server_id)
             .await
-            .into_iter()
-            .find(|p| p.node_id == server_id)
             .expect("the peer should be a DHT contact");
         assert_eq!(
-            contact.addr, addr,
+            contact, addr,
             "an outbound contact must keep the endpoint that actually worked"
         );
 
@@ -1893,17 +2371,136 @@ mod tests {
         let _socket = raw_client(port, &peer, true, false).await;
         assert!(wait_for_peer(&a, &peer.node_id()).await);
 
-        let contact = a
-            .dht()
-            .all_peers()
+        let contact = wait_for_contact(&a, &peer.node_id())
             .await
-            .into_iter()
-            .find(|p| p.node_id == peer.node_id())
             .expect("the peer should be a DHT contact");
         // `raw_client` signs listen_port 7000.
-        assert_eq!(contact.addr.port(), 7000);
+        assert_eq!(contact.port(), 7000);
 
         a.stop().await.unwrap();
+    }
+
+    /// `start()` again until it binds, failing immediately if the transport
+    /// has been left marked started instead.
+    async fn start_again(t: &InternetTransport) {
+        let mut last = None;
+        for _ in 0..50 {
+            match t.start().await {
+                Ok(()) => return,
+                Err(e) => {
+                    assert!(
+                        !matches!(e, TransportError::AlreadyStarted),
+                        "the transport was left marked started: {}",
+                        e
+                    );
+                    last = Some(e);
+                    sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        panic!("start() never succeeded: {:?}", last);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_a_cancelled_start_leaves_the_transport_startable() {
+        // A caller that walks away mid-startup drops the listener with the
+        // future. Marking the transport started before that point left it
+        // with no accept task and no way back: every later `start()` returned
+        // `AlreadyStarted`.
+        let port = free_port().await;
+        let (_, t) = transport(port);
+        let t = Arc::new(t);
+
+        let held = t.shared.dht.hold_store_for_test().await;
+        let starting = {
+            let t = t.clone();
+            tokio::spawn(async move { t.start().await })
+        };
+        let addr = format!("127.0.0.1:{}", port);
+        let mut bound = false;
+        for _ in 0..200 {
+            if TcpStream::connect(&addr).await.is_ok() {
+                bound = true;
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(bound, "start() never bound its listener");
+
+        starting.abort();
+        let _ = starting.await;
+        drop(held);
+
+        start_again(&t).await;
+        t.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_cancelled_stop_does_not_wedge_the_transport() {
+        // The shutdown flag and the replacement token used to be set in the
+        // tail of `stop()`, so a caller that stopped awaiting during a drain
+        // left the flag set and the cancelled token in place: every later
+        // dial was refused and `start()` could not run.
+        let port = free_port().await;
+        let (_, t) = transport(port);
+        t.start().await.unwrap();
+
+        // Hold a slot so the permit drain cannot finish, then walk away.
+        let hog = t.shared.slots.clone().try_acquire_owned().unwrap();
+        assert!(
+            timeout(Duration::from_millis(150), t.stop()).await.is_err(),
+            "the drain must still have been waiting"
+        );
+        drop(hog);
+
+        assert!(
+            !t.stopping.load(std::sync::atomic::Ordering::SeqCst),
+            "a cancelled stop must not leave dials refused"
+        );
+        assert!(t.begin_dial().is_ok(), "dials must be accepted again");
+        start_again(&t).await;
+        t.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_dial_that_overlapped_a_stop_cannot_install_afterwards() {
+        // The dial takes its token, and is then overtaken by an entire
+        // `stop()`: the flag is set and cleared again, the permits drained
+        // and a fresh token published. Nothing it could consult afterwards
+        // says a shutdown happened — so a dial that took its token *after*
+        // reading the flag adopted the new one and installed a live
+        // connection on a stopped transport, with nothing left to cancel it.
+        let port = free_port().await;
+        let (_, server) = transport(port);
+        server.start().await.unwrap();
+
+        let client = InternetTransport::new(
+            Arc::new(Identity::generate()),
+            InternetConfig {
+                listen_addr: format!("127.0.0.1:{}", free_port().await).parse().unwrap(),
+                bootstrap_nodes: Vec::new(),
+                max_connections: 4,
+            },
+        );
+
+        let cancel = client
+            .begin_dial()
+            .expect("the transport is not stopping yet");
+        client.stop().await.unwrap();
+
+        let err = client
+            .dial_with(cancel, format!("127.0.0.1:{}", port).parse().unwrap(), None)
+            .await
+            .expect_err("a dial from before the stop must not install after it");
+        assert!(err.to_string().contains("stopped"), "{}", err);
+        assert!(client.connected_peers().is_empty());
+        assert_eq!(
+            client.available_slots(),
+            4,
+            "a refused dial must not keep a slot"
+        );
+
+        server.stop().await.unwrap();
     }
 
     #[tokio::test]

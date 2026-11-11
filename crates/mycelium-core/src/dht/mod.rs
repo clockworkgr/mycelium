@@ -75,12 +75,36 @@ impl Default for DhtConfig {
     }
 }
 
+/// Where a contact's address came from.
+///
+/// The distinction is load-bearing: an address we dialled is reachable from
+/// here, while one the peer asserts may not be. A peer behind a port forward
+/// signs the port it listens on inside its own network, so letting its claim
+/// replace a proven `public:443` records an unreachable `public:9736`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrSource {
+    /// We dialled this address and the handshake completed.
+    Dialled,
+    /// The peer's own claim: an inbound socket's IP with the listen port it
+    /// signed, or a referral from a third node.
+    Claimed,
+}
+
 /// A peer's contact information in the DHT.
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
     pub node_id: NodeId,
     pub addr: SocketAddr,
     pub last_seen: Instant,
+    /// How `addr` was learned. See [`AddrSource`].
+    pub addr_source: AddrSource,
+    /// When `addr` was learned — *not* when the peer was last heard from.
+    ///
+    /// A live connection refreshes its contact on every DHT request it
+    /// answers, and each of those refreshes carries the address that
+    /// connection was made to. Dated `now`, an old channel's refresh would
+    /// keep reinstating its own endpoint over a newer one.
+    pub addr_proved_at: Instant,
 }
 
 /// Sends a DHT request to one peer and waits for its reply.
@@ -141,6 +165,16 @@ impl DhtEngine {
     pub async fn remove_peer(&self, node_id: &NodeId) {
         let mut rt = self.routing_table.write().await;
         rt.remove(node_id);
+    }
+
+    /// Test hook: hold the record store's write lock, so a caller that needs
+    /// it parks. Used to stop `start()` inside the window between its bind
+    /// and the registration of its background tasks.
+    #[cfg(test)]
+    pub(crate) async fn hold_store_for_test(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, HashMap<NodeId, DhtRecord>> {
+        self.store.write().await
     }
 
     /// Find the K closest nodes to a target in our routing table.
@@ -333,6 +367,10 @@ impl DhtEngine {
                                 node_id,
                                 addr,
                                 last_seen: Instant::now(),
+                                // A referral is another node's claim, and we
+                                // learn it now.
+                                addr_source: AddrSource::Claimed,
+                                addr_proved_at: Instant::now(),
                             });
                         }
                     }
@@ -431,6 +469,8 @@ mod tests {
             node_id,
             addr: make_addr(port),
             last_seen: Instant::now(),
+            addr_source: AddrSource::Dialled,
+            addr_proved_at: Instant::now(),
         }
     }
 

@@ -5,7 +5,7 @@
 
 use mycelium_protocol::types::NodeId;
 
-use super::PeerInfo;
+use super::{AddrSource, PeerInfo};
 
 /// XOR distance between two node IDs, returned as an array for comparison.
 /// Big-endian byte order, so the arrays compare in distance order directly.
@@ -48,11 +48,16 @@ impl KBucket {
     }
 
     /// Insert a peer. If the bucket is full and the peer is new, it's dropped.
-    /// If the peer already exists, update its last_seen.
+    /// If the peer already exists, its liveness is refreshed and its address
+    /// replaced only by better or fresher evidence.
     fn insert(&mut self, peer: PeerInfo) -> bool {
         if let Some(existing) = self.entries.iter_mut().find(|e| e.node_id == peer.node_id) {
             existing.last_seen = peer.last_seen;
-            existing.addr = peer.addr;
+            if Self::addr_wins(&peer, existing) {
+                existing.addr = peer.addr;
+                existing.addr_source = peer.addr_source;
+                existing.addr_proved_at = peer.addr_proved_at;
+            }
             return true;
         }
 
@@ -61,6 +66,27 @@ impl KBucket {
             true
         } else {
             false // Bucket full
+        }
+    }
+
+    /// Whether `incoming`'s address should replace `held`'s.
+    ///
+    /// A dial beats a claim: a claim that displaced an address we reached
+    /// would make a peer behind a port forward undialable — its signed
+    /// `public:9736` is not where we found it at `public:443`. Within a
+    /// level the fresher evidence wins, which is why the comparison is
+    /// `addr_proved_at` and not `last_seen`: a live channel refreshes its
+    /// contact on every DHT request it answers, and dating those refreshes
+    /// `now` let an old channel keep reinstating its own endpoint over one a
+    /// later dial had proved. A claim replacing an older claim is how a peer
+    /// that moved is re-learned; an address we dialled that has gone stale is
+    /// for bucket liveness to remove (ROADMAP T-32), not for a claim to
+    /// overwrite.
+    fn addr_wins(incoming: &PeerInfo, held: &PeerInfo) -> bool {
+        match (incoming.addr_source, held.addr_source) {
+            (AddrSource::Dialled, AddrSource::Claimed) => true,
+            (AddrSource::Claimed, AddrSource::Dialled) => false,
+            _ => incoming.addr_proved_at >= held.addr_proved_at,
         }
     }
 
@@ -165,7 +191,7 @@ impl RoutingTable {
 mod tests {
     use super::*;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn random_node_id() -> NodeId {
         use rand::Rng;
@@ -173,11 +199,104 @@ mod tests {
     }
 
     fn make_peer(port: u16) -> PeerInfo {
+        make_peer_from(port, AddrSource::Dialled)
+    }
+
+    fn make_peer_from(port: u16, addr_source: AddrSource) -> PeerInfo {
         PeerInfo {
             node_id: random_node_id(),
             addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
             last_seen: Instant::now(),
+            addr_source,
+            addr_proved_at: Instant::now(),
         }
+    }
+
+    /// The address a peer holds in a bucket, for the provenance tests.
+    fn held(table: &RoutingTable, peer: &PeerInfo) -> Option<PeerInfo> {
+        table.closest_peers(&peer.node_id, 1).into_iter().next()
+    }
+
+    #[test]
+    fn test_a_claimed_address_does_not_displace_one_we_dialled() {
+        let mut table = RoutingTable::new(random_node_id(), 20);
+        let dialled = make_peer_from(443, AddrSource::Dialled);
+        assert!(table.insert(dialled.clone()));
+
+        // The same peer, now claiming the port it listens on inside its own
+        // network — what an inbound connection or a referral yields.
+        let mut claimed = dialled.clone();
+        claimed.addr = "127.0.0.1:9736".parse().unwrap();
+        claimed.addr_source = AddrSource::Claimed;
+        claimed.last_seen = Instant::now();
+        assert!(table.insert(claimed.clone()));
+
+        let entry = held(&table, &dialled).expect("the peer must still be there");
+        assert_eq!(
+            entry.addr, dialled.addr,
+            "a claim must not replace an address we dialled"
+        );
+        assert_eq!(entry.addr_source, AddrSource::Dialled);
+        assert!(
+            entry.last_seen >= claimed.last_seen,
+            "liveness must still be refreshed"
+        );
+    }
+
+    #[test]
+    fn test_a_claim_replaces_an_earlier_claim_so_a_peer_can_move() {
+        let mut table = RoutingTable::new(random_node_id(), 20);
+        let first = make_peer_from(9736, AddrSource::Claimed);
+        assert!(table.insert(first.clone()));
+
+        let mut moved = first.clone();
+        moved.addr = "127.0.0.1:9737".parse().unwrap();
+        assert!(table.insert(moved.clone()));
+        assert_eq!(
+            held(&table, &first).map(|p| p.addr),
+            Some(moved.addr),
+            "nothing we hold is better evidence than the newer claim"
+        );
+
+        // And a dial supersedes any claim.
+        let mut proven = first.clone();
+        proven.addr = "127.0.0.1:443".parse().unwrap();
+        proven.addr_source = AddrSource::Dialled;
+        assert!(table.insert(proven.clone()));
+        let entry = held(&table, &first).expect("still there");
+        assert_eq!(entry.addr, proven.addr);
+        assert_eq!(entry.addr_source, AddrSource::Dialled);
+    }
+
+    #[test]
+    fn test_a_refresh_does_not_restore_an_endpoint_a_newer_dial_superseded() {
+        let mut table = RoutingTable::new(random_node_id(), 20);
+        let first = make_peer_from(443, AddrSource::Dialled);
+        let mut second = first.clone();
+        second.addr = "127.0.0.1:444".parse().unwrap();
+        second.addr_proved_at = first.addr_proved_at + Duration::from_secs(1);
+        second.last_seen = second.addr_proved_at;
+
+        assert!(table.insert(first.clone()));
+        assert!(table.insert(second.clone()));
+        assert_eq!(held(&table, &first).map(|p| p.addr), Some(second.addr));
+
+        // The first connection is still alive and answers a DHT request,
+        // which refreshes the contact. Its evidence is older than the second
+        // dial's, so it must not put its own endpoint back.
+        let mut refresh = first.clone();
+        refresh.last_seen = Instant::now();
+        assert!(table.insert(refresh.clone()));
+
+        let entry = held(&table, &first).expect("the peer must still be there");
+        assert_eq!(
+            entry.addr, second.addr,
+            "a liveness refresh must not restore the older endpoint"
+        );
+        assert!(
+            entry.last_seen >= refresh.last_seen,
+            "liveness must still be refreshed"
+        );
     }
 
     #[test]
@@ -237,6 +356,8 @@ mod tests {
             node_id: local,
             addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5000)),
             last_seen: Instant::now(),
+            addr_source: AddrSource::Dialled,
+            addr_proved_at: Instant::now(),
         };
         assert!(!rt.insert(peer));
         assert_eq!(rt.len(), 0);
