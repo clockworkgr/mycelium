@@ -14,7 +14,7 @@ work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **385 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **397 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -211,27 +211,56 @@ wrong in three places, so a forged reject can do considerably more.
    failed and leaves the rest claiming "sent" though the peer discarded the
    session they were encrypted under.
 
-Found while reviewing ADR-009 against the code during T-09. ADR-009 also
-states that a reject cannot be authenticated because there is "no key to sign
-it with that the receiver can check" — that is **false**: the responder has an
-Ed25519 identity key, and the initiator knows the NodeId it dialled, so a
-domain-separated signature over the rejected initiation would verify. Signing
-the reject removes this whole class of problem rather than bounding it, and is
-the preferred fix; the bookkeeping above still has to be right either way,
-because a legitimate reject must report exactly the messages that died.
+Found while reviewing ADR-009 against the code during T-09.
+
+**Landed 2026-11-11 (ADR-012).** The bookkeeping above is fixed: accepting an
+authenticated session clears the handshake it supersedes and reports the
+messages that died with it, the pending marker is registered atomically with
+the initiation under the lock that creates the session, every message sent
+while a handshake is unconfirmed is recorded against it, and status writes no
+longer undo a settled outcome (a send cannot revive a failed message, a
+failure cannot overwrite a delivery, and DTN cannot revive either). A reject is
+now signed, bound to the init it refuses and to both NodeIds, and a rejection
+of an init we did not send is ignored. `content_type` joined the AEAD's
+associated data, which also stops a relay retyping any message, and the
+handshake payloads refuse trailing bytes, non-canonical prekey flags and
+non-canonical X25519 encodings.
+
+**What remains: the signature does not yet make a forgery useless.** Binding
+the rejection to a hash of the init's wire bytes does not identify a
+handshake, because several inits can be equivalent to the responder while
+hashing differently. Each is a way to have the responder sign a rejection the
+initiator will act on: accept the altered copy, then replay the original.
+
+1. **Equivalent ephemeral keys.** RFC 7748 §7: for any X25519 public key there
+   are other, publicly computable keys that produce the same shared secret —
+   `u⁻¹ mod p` among them. Canonical encoding does not help. The mitigation the
+   RFC names is to include the public key in the key derivation, so the fix is
+   to bind the raw init header into the derivation or into the first message's
+   associated data, and to identify the handshake by what the AEAD
+   authenticates rather than by a hash of its bytes.
+2. **The one-time prekey is consumed before authentication.** A corrupted copy
+   burns it; the untouched original then fails and draws a rejection naming
+   exactly the transcript the initiator recorded. Prekey consumption has to be
+   committed only after the first message authenticates, as session
+   installation already is (ADR-009). The empty-init path has the same shape
+   and additionally accepts an unknown nested payload type.
+3. **Simultaneous-initiation suppression is not durable.** The rule that a
+   tie-break winner never rejects keys off a 60-second initiation timer and is
+   lost on restart, so a discarded init can be replayed afterwards for an
+   actionable rejection. The evidence has to outlive both.
 
 **Acceptance:**
-- Accepting an authenticated session clears any unconfirmed-handshake state
-  for that peer, and the messages that were sent under the session it replaces
-  are reported rather than silently dropped from the bookkeeping.
-- The pending marker is registered atomically with the initiation, before any
-  ciphertext is exposed, and removed if the send fails.
-- Every message sent while a handshake is unconfirmed is recorded against it.
-- A reject is signed and bound to the initiation it rejects, or the ADR's
-  rationale is corrected to say why it is not.
-- Tests: a reject after a simultaneous initiation leaves the authenticated
-  session intact; a reject racing the initiation is not ignored; a reject
-  after three follow-up sends reports all four messages failed.
+- An init that a responder would treat as equivalent to another cannot be given
+  a second identity: the raw ephemeral is bound cryptographically, with a
+  reciprocal-key regression test.
+- A one-time prekey is spent only once the first message has authenticated, and
+  an unknown nested payload type is refused.
+- Replay suppression for accepted *and* discarded inits survives a restart and
+  does not depend on the initiation timer.
+- With all three closed, a forged or provoked `SessionReject` changes nothing:
+  no discarded handshake, no dropped bundle, no failed message.
+- Tests for each, delivering the altered copy before the original.
 
 ### T-36 · Emergency broadcast dedup suppresses valid alerts and allows replay
 

@@ -44,7 +44,7 @@ Every message is end-to-end encrypted using the Signal Protocol (X3DH key exchan
 - SQLCipher encrypted database
 
 **Platform**
-- Rust core (10 crates, 385 tests)
+- Rust core (10 crates, 397 tests)
 - Local REST API (38 endpoints) + WebSocket server, bearer-token authenticated (ADR-006)
 - Flutter mobile app for Android and iOS (14 screens, 49 Dart files)
 - Onboarding with seed phrase groups or QR code scanning
@@ -87,7 +87,7 @@ The Rust daemon exposes a local API on `127.0.0.1:9735`. The Flutter app (and an
 ```bash
 # Rust workspace
 make build    # Debug build
-make test     # Run all 385 tests
+make test     # Run all 397 tests
 make lint     # cargo fmt --check + cargo clippy
 
 # Flutter app

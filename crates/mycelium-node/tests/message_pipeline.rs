@@ -476,15 +476,18 @@ async fn test_stale_bundle_is_rejected_and_discarded() {
     );
 }
 
-/// A forged `SessionReject` must not tear down a session the peer has used.
+/// Neither a forged `SessionReject` nor a late authentic one may tear down a
+/// session the peer has used.
 ///
 /// Round 5 finding #1: the first version of this handler keyed off "did we
 /// initiate within 60 seconds", so a forgery could kill a working session
 /// established moments earlier. Confirmation is now "we have successfully
 /// decrypted something from this peer", which only their ratchet could have
-/// produced.
+/// produced. Since T-35 a reject is also signed, so this covers both an
+/// authentic reject that arrives late — what DTN handshakes do routinely —
+/// and one whose signature is garbage.
 #[tokio::test]
-async fn test_forged_reject_cannot_tear_down_a_used_session() {
+async fn test_a_reject_cannot_tear_down_a_used_session() {
     use mycelium_protocol::codec::Envelope;
     use mycelium_protocol::types::{MessageFlags, MessageId, ProtocolVersion};
     use mycelium_protocol::wire::{self, SessionRejectReason};
@@ -519,11 +522,30 @@ async fn test_forged_reject_cannot_tear_down_a_used_session() {
 
     // Establish a session and get a reply, so Alice has decrypted something
     // from Bob and the handshake is confirmed.
-    alice
+    let init_id = alice
         .send_message(bob_node_id, b"hello", ContentType::Text)
         .await
         .expect("alice send");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // A reject names the transcript of the SessionInit it refuses, so the
+    // test needs the one Alice recorded. With no cached bundle her first send
+    // only asks for one, and the SessionInit goes out when Bob's
+    // PrekeyResponse arrives — so wait for it, and read it before Bob's reply
+    // confirms the handshake and clears it.
+    let mut transcript = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        transcript = alice
+            .session_manager
+            .read()
+            .await
+            .handshake_transcript(&bob_node_id);
+        if transcript.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let transcript = transcript.expect("Alice should have sent a SessionInit");
+    let _ = init_id;
     let reply_id = bob
         .send_message(alice_node_id, b"hi back", ContentType::Text)
         .await
@@ -542,9 +564,10 @@ async fn test_forged_reject_cannot_tear_down_a_used_session() {
         "precondition: Alice must have decrypted Bob's reply"
     );
 
-    // Now inject a reject that looks like it came from Bob, well inside the
-    // 60 s window the old implementation trusted.
-    let forged = Envelope {
+    // An authentic reject, signed by Bob over the very SessionInit Alice
+    // sent, arriving after she has decrypted his reply.
+    let reason = SessionRejectReason::StaleSignedPrekey;
+    let reject_envelope = |payload: Vec<u8>| Envelope {
         source: bob_node_id,
         destination: alice_node_id,
         message_id: MessageId::random(),
@@ -554,11 +577,21 @@ async fn test_forged_reject_cannot_tear_down_a_used_session() {
         lamport_clock: 0,
         device_timestamp: 0,
         protocol_version: ProtocolVersion::CURRENT,
-        payload: wire::serialize_session_reject(
-            SessionRejectReason::StaleSignedPrekey,
-            &bob_public_key,
-        ),
+        payload,
     };
+    let authentic = reject_envelope(wire::serialize_session_reject(
+        reason,
+        &bob_public_key,
+        &transcript,
+        &mycelium_crypto::reject::sign_reject(&bob.identity, &transcript, &alice_node_id, reason),
+    ));
+    // And a forgery: Bob's public key, but a signature nobody made.
+    let forged = reject_envelope(wire::serialize_session_reject(
+        reason,
+        &bob_public_key,
+        &transcript,
+        &[0u8; 64],
+    ));
     // Precondition: Alice cached Bob's bundle during the handshake. Acting on
     // the reject would discard it, so it is the observable the teardown
     // cannot hide — delivery alone is not, because Alice would silently
@@ -568,17 +601,20 @@ async fn test_forged_reject_cannot_tear_down_a_used_session() {
         "precondition: Alice should have cached Bob's prekey bundle"
     );
 
-    network
-        .deliver(bob_node_id, alice_node_id, forged.serialize())
-        .await
-        .expect("deliver forged reject");
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    for (envelope, what) in [(authentic, "authentic but late"), (forged, "forged")] {
+        network
+            .deliver(bob_node_id, alice_node_id, envelope.serialize())
+            .await
+            .expect("deliver reject");
+        tokio::time::sleep(Duration::from_millis(400)).await;
 
-    assert!(
-        alice.prekey_cache.read().await.contains_key(&bob_node_id),
-        "a forged SessionReject must be ignored for a confirmed session: the cached \
-         bundle was discarded, which means the session was torn down too"
-    );
+        assert!(
+            alice.prekey_cache.read().await.contains_key(&bob_node_id),
+            "an {} SessionReject must be ignored for a confirmed session: the cached \
+             bundle was discarded, which means the session was torn down too",
+            what
+        );
+    }
 
     // And traffic still flows.
     let after_id = alice
@@ -595,4 +631,339 @@ async fn test_forged_reject_cannot_tear_down_a_used_session() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(still_working, "traffic must continue after a forged reject");
+}
+
+/// A forged `SessionReject` must be ignored even while the handshake it names
+/// is unconfirmed — the case the signature exists for (T-35).
+///
+/// Before rejects were signed, this was the whole attack: a reject is acted on
+/// precisely when a handshake is outstanding, so anyone who knew a peer had
+/// just initiated could discard its cached bundle and fail its message by
+/// naming that peer. The authentic reject at the end is the control: the same
+/// envelope, signed, does act.
+#[tokio::test]
+async fn test_a_forged_reject_is_ignored_while_the_handshake_is_unconfirmed() {
+    use std::time::Instant;
+
+    use mycelium_crypto::x3dh::PrekeyState;
+    use mycelium_protocol::codec::Envelope;
+    use mycelium_protocol::types::{MessageFlags, MessageId, ProtocolVersion};
+    use mycelium_protocol::wire::{self, SessionRejectReason};
+
+    let alice_identity = Identity::generate();
+    let alice_node_id = alice_identity.node_id();
+    // A peer that never runs: Alice only needs a bundle to handshake against,
+    // and nothing must reply, or the handshake would be confirmed.
+    let peer_identity = Identity::generate();
+    let peer_node_id = peer_identity.node_id();
+
+    let alice = make_node(alice_identity);
+    let network = MockNetwork::new();
+    let alice_transport = Arc::new(MockTransport::new(alice_node_id, network.clone()).await);
+    let peer_transport = Arc::new(MockTransport::new(peer_node_id, network.clone()).await);
+    alice
+        .transport_manager
+        .add_transport(alice_transport.clone())
+        .await;
+    let _ = peer_transport;
+    alice.start().await.expect("alice start");
+    network
+        .add_link(alice_node_id, peer_node_id, MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut peer_state = PrekeyState::new(Identity::from_bytes(&peer_identity.to_bytes()).unwrap());
+    peer_state.generate_one_time_prekeys(2);
+    alice
+        .prekey_cache
+        .write()
+        .await
+        .insert(peer_node_id, (peer_state.bundle(), Instant::now()));
+
+    let doomed_id = alice
+        .send_message(peer_node_id, b"outstanding", ContentType::Text)
+        .await
+        .expect("send is accepted locally");
+    assert!(
+        alice.prekey_cache.read().await.contains_key(&peer_node_id),
+        "precondition: the bundle Alice handshook against is cached"
+    );
+    let transcript = alice
+        .session_manager
+        .read()
+        .await
+        .handshake_transcript(&peer_node_id)
+        .expect("Alice recorded her SessionInit");
+
+    let reason = SessionRejectReason::DecryptFailed;
+    let reject = |signature: [u8; 64]| Envelope {
+        source: peer_node_id,
+        destination: alice_node_id,
+        message_id: MessageId::random(),
+        ttl: 10,
+        hop_count: 0,
+        flags: MessageFlags::SYSTEM,
+        lamport_clock: 0,
+        device_timestamp: 0,
+        protocol_version: ProtocolVersion::CURRENT,
+        payload: wire::serialize_session_reject(
+            reason,
+            &peer_identity.public_key_bytes(),
+            &transcript,
+            &signature,
+        ),
+    };
+
+    network
+        .deliver(peer_node_id, alice_node_id, reject([0u8; 64]).serialize())
+        .await
+        .expect("deliver forged reject");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        alice.prekey_cache.read().await.contains_key(&peer_node_id),
+        "a reject with a signature nobody made must not discard the bundle"
+    );
+    assert_ne!(
+        alice.db.get_message(&doomed_id).unwrap().status,
+        "failed",
+        "a forged reject must not report the message dead"
+    );
+
+    // The indirect forgery, which is why the signature covers a transcript
+    // and not the envelope's message id. An attacker who watched Alice's
+    // SessionInit can send the peer a *malformed* init carrying Alice's id,
+    // source and public key — all cleartext — and the peer will sign a
+    // genuine rejection of it. The signature is real; the trigger was not.
+    // Alice must refuse it because the transcript is not the one she sent.
+    let elsewhere = mycelium_crypto::reject::init_transcript(b"an init Alice never sent");
+    let provoked = Envelope {
+        source: peer_node_id,
+        destination: alice_node_id,
+        message_id: MessageId::random(),
+        ttl: 10,
+        hop_count: 0,
+        flags: MessageFlags::SYSTEM,
+        lamport_clock: 0,
+        device_timestamp: 0,
+        protocol_version: ProtocolVersion::CURRENT,
+        payload: wire::serialize_session_reject(
+            reason,
+            &peer_identity.public_key_bytes(),
+            &elsewhere,
+            &mycelium_crypto::reject::sign_reject(
+                &peer_identity,
+                &elsewhere,
+                &alice_node_id,
+                reason,
+            ),
+        ),
+    };
+    network
+        .deliver(peer_node_id, alice_node_id, provoked.serialize())
+        .await
+        .expect("deliver provoked reject");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        alice.prekey_cache.read().await.contains_key(&peer_node_id),
+        "a validly signed rejection of a SessionInit Alice never sent must be ignored"
+    );
+    assert_ne!(
+        alice.db.get_message(&doomed_id).unwrap().status,
+        "failed",
+        "and must not report her message dead"
+    );
+
+    // The control: the same reject, signed by the peer it claims to be from.
+    let signature =
+        mycelium_crypto::reject::sign_reject(&peer_identity, &transcript, &alice_node_id, reason);
+    network
+        .deliver(peer_node_id, alice_node_id, reject(signature).serialize())
+        .await
+        .expect("deliver authentic reject");
+    let mut acted = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if !alice.prekey_cache.read().await.contains_key(&peer_node_id) {
+            acted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        acted,
+        "an authentic reject must still discard the unusable bundle"
+    );
+    assert_eq!(
+        alice.db.get_message(&doomed_id).unwrap().status,
+        "failed",
+        "and report the message that died with the handshake"
+    );
+}
+
+/// A replayed `SessionInit` must be answered with silence, not a signed
+/// rejection of it (T-35, ADR-012).
+///
+/// Duplicate detection keys on the envelope's `message_id`, which the
+/// transcript does not cover, so a relay can re-deliver an init we accepted
+/// under a fresh id. Its one-time prekey is spent and the ratchet has moved
+/// past its message, so accepting fails — and the rejection that used to
+/// follow was a *valid* rejection of an init the peer really sent, which the
+/// peer would act on: exactly the teardown the signature was meant to prevent.
+#[tokio::test]
+async fn test_a_replayed_session_init_draws_no_rejection() {
+    use mycelium_crypto::session::SessionManager;
+    use mycelium_protocol::codec::Envelope;
+    use mycelium_protocol::types::{MessageFlags, MessageId, ProtocolVersion};
+    use mycelium_protocol::wire::{
+        EncryptedPayload, SessionInitPayload, WirePayloadType, WireRatchetHeader,
+    };
+
+    let alice_identity = Identity::generate();
+    let alice_node_id = alice_identity.node_id();
+    let peer_identity = Identity::generate();
+    let peer_node_id = peer_identity.node_id();
+
+    let alice = make_node(alice_identity);
+    let network = MockNetwork::new();
+    let alice_transport = Arc::new(MockTransport::new(alice_node_id, network.clone()).await);
+    alice
+        .transport_manager
+        .add_transport(alice_transport.clone())
+        .await;
+    alice.start().await.expect("alice start");
+
+    // The peer is only a mailbox here: registering its own channel is how the
+    // test sees what Alice sends back.
+    let (peer_tx, mut peer_rx) = tokio::sync::broadcast::channel(64);
+    network.register_node(peer_node_id, peer_tx).await;
+    network
+        .add_link(peer_node_id, alice_node_id, MockLinkConfig::default())
+        .await;
+    network
+        .add_link(alice_node_id, peer_node_id, MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Build a genuine SessionInit from the peer to Alice.
+    let alice_bundle = alice.prekey_state.read().await.bundle();
+    let mut peer_sessions = SessionManager::new();
+    let init_result = peer_sessions
+        .initiate_session(&peer_identity, alice_node_id, &alice_bundle)
+        .expect("peer initiates");
+    // Same associated data the node builds: source, destination and the
+    // content type, which is authenticated so a relay cannot retype a message
+    // (T-35, ADR-012).
+    let ad = {
+        let mut buf = Vec::with_capacity(65);
+        buf.extend_from_slice(peer_node_id.as_bytes());
+        buf.extend_from_slice(alice_node_id.as_bytes());
+        buf.push(0);
+        buf
+    };
+    let (header, ciphertext) = peer_sessions
+        .encrypt_for(&alice_node_id, b"hello", &ad)
+        .expect("peer encrypts");
+    let init_payload = SessionInitPayload {
+        ephemeral_public: init_result.ephemeral_public,
+        identity_key: peer_identity.public_key_bytes(),
+        signed_prekey_id: init_result.used_signed_prekey_id,
+        one_time_prekey_id: init_result.used_one_time_prekey_id,
+        encrypted_payload: EncryptedPayload {
+            content_type: 0,
+            header: WireRatchetHeader {
+                dh_public: header.dh_public,
+                previous_chain_length: header.previous_chain_length,
+                message_number: header.message_number,
+            },
+            ciphertext,
+        }
+        .serialize(),
+    }
+    .serialize();
+
+    let envelope = |payload: Vec<u8>| Envelope {
+        source: peer_node_id,
+        destination: alice_node_id,
+        message_id: MessageId::random(),
+        ttl: 10,
+        hop_count: 0,
+        flags: MessageFlags::SYSTEM,
+        lamport_clock: 1,
+        device_timestamp: 0,
+        protocol_version: ProtocolVersion::CURRENT,
+        payload,
+    };
+
+    // Accepted once.
+    let replayable = init_payload.clone();
+    network
+        .deliver(
+            peer_node_id,
+            alice_node_id,
+            envelope(init_payload.clone()).serialize(),
+        )
+        .await
+        .expect("deliver init");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        alice
+            .session_manager
+            .read()
+            .await
+            .has_session(&peer_node_id),
+        "precondition: Alice accepted the SessionInit"
+    );
+
+    // Replayed under a fresh envelope id, which is what duplicate detection
+    // keys on.
+    network
+        .deliver(
+            peer_node_id,
+            alice_node_id,
+            envelope(init_payload).serialize(),
+        )
+        .await
+        .expect("deliver replay");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    let mut rejects = 0;
+    while let Ok(event) = peer_rx.try_recv() {
+        if let mycelium_core::transport::TransportEvent::DataReceived { data, .. } = event {
+            if let Ok(env) = Envelope::deserialize(&data) {
+                if env.payload.first().copied() == Some(WirePayloadType::SessionReject as u8) {
+                    rejects += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        rejects, 0,
+        "a replayed SessionInit must draw no rejection: a valid one would tear \
+         down the peer's live handshake"
+    );
+
+    // The control, so the silence above is not just a test that cannot see
+    // rejections: the same init with one ciphertext byte flipped is a
+    // different handshake attempt, and Alice has every reason to refuse it.
+    let mut tampered = replayable.clone();
+    *tampered.last_mut().unwrap() ^= 0x01;
+    network
+        .deliver(peer_node_id, alice_node_id, envelope(tampered).serialize())
+        .await
+        .expect("deliver tampered init");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let mut saw_reject = false;
+    while let Ok(event) = peer_rx.try_recv() {
+        if let mycelium_core::transport::TransportEvent::DataReceived { data, .. } = event {
+            if let Ok(env) = Envelope::deserialize(&data) {
+                if env.payload.first().copied() == Some(WirePayloadType::SessionReject as u8) {
+                    saw_reject = true;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_reject,
+        "an init Alice refuses must still draw a rejection, or this test proves nothing"
+    );
 }

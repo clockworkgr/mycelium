@@ -689,7 +689,7 @@ impl Node {
                                         .is_ok()
                                     {
                                         let _ = db_d
-                                            .update_message_status(&route.message_id, "sent");
+                                            .mark_message_sent(&route.message_id);
                                     } else {
                                         // The route went away again. Store and
                                         // carry rather than losing it.
@@ -706,10 +706,10 @@ impl Node {
                                                 {
                                                     persist_dtn_bundle(&db_d, bundle);
                                                 }
-                                                let _ = db_d.update_message_status(
-                                                    &route.message_id,
-                                                    "dtn_pending",
-                                                );
+                                                // Guarded, like every DTN
+                                                // transition (T-35).
+                                                let _ = db_d
+                                                    .mark_message_dtn_pending(&route.message_id);
                                             }
                                             Err(e) => {
                                                 warn!(
@@ -726,8 +726,12 @@ impl Node {
                                     }
                                 }
                                 Disposition::Stored => {
-                                    let _ = db_d
-                                        .update_message_status(&route.message_id, "dtn_pending");
+                                    // Guarded: a message a rejection already
+                                    // failed cannot be revived here, since
+                                    // its ciphertext belongs to a ratchet
+                                    // that no longer exists (T-35).
+                                    let _ =
+                                        db_d.mark_message_dtn_pending(&route.message_id);
                                 }
                                 Disposition::Refused(e) => {
                                     // The envelope has already left the pending
@@ -1029,10 +1033,21 @@ impl Node {
         }
 
         // Session exists — encrypt and send
-        let ad = build_ad(ctx.local_id, destination);
+        let ad = build_ad(
+            ctx.local_id,
+            destination,
+            content_type_to_byte(content_type),
+        );
         let (header, ciphertext) = {
             let mut sm = ctx.session_manager.write().await;
-            sm.encrypt_for(&destination, plaintext, &ad)?
+            let encrypted = sm.encrypt_for(&destination, plaintext, &ad)?;
+            // Under the same lock as the ratchet advance: a message sent
+            // before the peer has confirmed the handshake dies with it, and
+            // recording it separately let a concurrent accept or confirmation
+            // land in between (T-35). Ignored when there is no unconfirmed
+            // handshake.
+            sm.record_unconfirmed_message(destination, message_id);
+            encrypted
         };
 
         // Persist the ratchet advance before the ciphertext can leave.
@@ -1372,7 +1387,11 @@ impl Node {
                             serialized.len(),
                             next_hop
                         );
-                        let _ = ctx.db.update_message_status(&message_id, "sent");
+                        // Guarded: a `SessionReject` can mark this failed
+                        // while the transport write is still in flight, and
+                        // an unconditional write would claim success for a
+                        // message that cannot arrive (T-35).
+                        let _ = ctx.db.mark_message_sent(&message_id);
                     }
                     Err(e) => {
                         info!("route_and_send: transport send failed: {}", e);
@@ -1418,7 +1437,9 @@ impl Node {
                         persist_dtn_bundle(ctx.db, bundle);
                     }
                 }
-                let _ = ctx.db.update_message_status(&message_id, "dtn_pending");
+                // Guarded, like every DTN transition: a message a rejection
+                // already failed cannot be revived here (T-35).
+                let _ = ctx.db.mark_message_dtn_pending(&message_id);
             }
             RoutingDecision::DeliverLocal => {
                 return Err(NodeError::SendToSelf);
@@ -1440,10 +1461,6 @@ impl Node {
         timestamp: u64,
     ) -> Result<(), NodeError> {
         let identity = identity_clone_for_prekeys(ctx.identity);
-        let init_result = {
-            let mut sm = ctx.session_manager.write().await;
-            sm.initiate_session(&identity, destination, bundle)?
-        };
 
         // Note: the session is deliberately NOT persisted here. Storing it
         // before the first message is encrypted gains nothing — if we die
@@ -1455,44 +1472,81 @@ impl Node {
         // If anything below fails the session must not be left installed:
         // `send_encrypted` would see `has_session()` and send a bare
         // EncryptedMessage to a peer that never received the handshake.
-        let ad = build_ad(ctx.local_id, destination);
-        let (header, ciphertext) = {
+        let ad = build_ad(
+            ctx.local_id,
+            destination,
+            content_type_to_byte(content_type),
+        );
+
+        // Choosing, initiating, encrypting and recording all happen under one
+        // lock. Split apart, a second send to the same new peer could pass the
+        // "no session" check, initiate again and replace the ratchet the first
+        // had already encrypted under — stranding its message at both ends —
+        // and an authenticated `SessionInit` accepted in the gap had its
+        // clearing of this bookkeeping undone by the record that followed
+        // (T-35). Everything in here is synchronous; the persist and the send
+        // are outside it.
+        let (payload, our_handshake) = {
             let mut sm = ctx.session_manager.write().await;
-            match sm.encrypt_for(&destination, plaintext, &ad) {
-                Ok(r) => r,
-                Err(e) => {
-                    drop(sm);
-                    Self::discard_unsent_session(ctx, &destination).await;
-                    return Err(e.into());
-                }
+            if sm.has_session(&destination) {
+                // Another send got here first. Use what it installed: a second
+                // `initiate_session` would discard it.
+                let (header, ciphertext) = sm.encrypt_for(&destination, plaintext, &ad)?;
+                sm.record_unconfirmed_message(destination, message_id);
+                let enc_payload = EncryptedPayload {
+                    content_type: content_type_to_byte(content_type),
+                    header: WireRatchetHeader {
+                        dh_public: header.dh_public,
+                        previous_chain_length: header.previous_chain_length,
+                        message_number: header.message_number,
+                    },
+                    ciphertext,
+                };
+                (enc_payload.serialize(), None)
+            } else {
+                let init_result = sm.initiate_session(&identity, destination, bundle)?;
+                let (header, ciphertext) = match sm.encrypt_for(&destination, plaintext, &ad) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        drop(sm);
+                        Self::discard_unsent_session(ctx, &destination).await;
+                        return Err(e.into());
+                    }
+                };
+                let enc_payload = EncryptedPayload {
+                    content_type: content_type_to_byte(content_type),
+                    header: WireRatchetHeader {
+                        dh_public: header.dh_public,
+                        previous_chain_length: header.previous_chain_length,
+                        message_number: header.message_number,
+                    },
+                    ciphertext,
+                };
+                let session_init = SessionInitPayload {
+                    ephemeral_public: init_result.ephemeral_public,
+                    identity_key: ctx.identity.public_key_bytes(),
+                    signed_prekey_id: init_result.used_signed_prekey_id,
+                    one_time_prekey_id: init_result.used_one_time_prekey_id,
+                    encrypted_payload: enc_payload.serialize(),
+                };
+                let payload = session_init.serialize();
+                // The transcript is over the body, which is what the responder
+                // hashes: the type byte is the dispatcher's, not the payload's.
+                let transcript = mycelium_crypto::reject::init_transcript(&payload[1..]);
+                sm.mark_handshake_pending(destination, transcript, message_id);
+                (payload, Some(transcript))
             }
         };
 
         // Persist the ratchet advance before the ciphertext can leave.
         if let Err(e) = Self::persist_session(ctx.session_manager, ctx.db, &destination).await {
-            Self::discard_unsent_session(ctx, &destination).await;
+            // Only tear down a session this call created, and only while it
+            // is still the one outstanding.
+            if let Some(transcript) = our_handshake {
+                Self::discard_if_still_ours(ctx, &destination, transcript).await;
+            }
             return Err(e.into());
         }
-
-        // Build the encrypted payload part (without type byte prefix)
-        let enc_payload = EncryptedPayload {
-            content_type: content_type_to_byte(content_type),
-            header: WireRatchetHeader {
-                dh_public: header.dh_public,
-                previous_chain_length: header.previous_chain_length,
-                message_number: header.message_number,
-            },
-            ciphertext,
-        };
-        let enc_bytes = enc_payload.serialize();
-
-        let session_init = SessionInitPayload {
-            ephemeral_public: init_result.ephemeral_public,
-            identity_key: ctx.identity.public_key_bytes(),
-            signed_prekey_id: init_result.used_signed_prekey_id,
-            one_time_prekey_id: init_result.used_one_time_prekey_id,
-            encrypted_payload: enc_bytes,
-        };
 
         let envelope = Envelope {
             source: ctx.local_id,
@@ -1504,7 +1558,7 @@ impl Node {
             lamport_clock: clock_val.0,
             device_timestamp: timestamp,
             protocol_version: ProtocolVersion::CURRENT,
-            payload: session_init.serialize(),
+            payload,
         };
 
         // Routing or the transport can still refuse this. If the SessionInit
@@ -1512,17 +1566,11 @@ impl Node {
         // go out as bare EncryptedMessage to a peer that never saw the
         // handshake (round 5 finding #7).
         if let Err(e) = Self::route_and_send(ctx, envelope, message_id).await {
-            Self::discard_unsent_session(ctx, &destination).await;
+            if let Some(transcript) = our_handshake {
+                Self::discard_if_still_ours(ctx, &destination, transcript).await;
+            }
             return Err(e);
         }
-
-        // On its way, but unconfirmed until the peer sends something back.
-        // Recorded so a SessionReject can report exactly which messages died
-        // with the handshake (ADR-009).
-        ctx.session_manager
-            .write()
-            .await
-            .mark_handshake_pending(destination, message_id);
 
         Ok(())
     }
@@ -2109,6 +2157,7 @@ impl Node {
                             prekey_cache,
                             session_manager,
                             db,
+                            local_id,
                         )
                         .await;
                     }
@@ -2492,7 +2541,7 @@ impl Node {
                 message_number: enc.header.message_number,
             };
 
-            let ad = build_ad(envelope.source, envelope.destination);
+            let ad = build_ad(envelope.source, envelope.destination, enc.content_type);
             let plaintext = {
                 let mut sm = session_manager.write().await;
                 match sm.decrypt_from(&envelope.source, &ratchet_header, &enc.ciphertext, &ad) {
@@ -2631,6 +2680,32 @@ impl Node {
             return;
         }
 
+        // What a rejection of *this* attempt is bound to. The envelope's id
+        // and source are cleartext, so they identify nothing an attacker
+        // could not have chosen; the payload is what the initiator built.
+        let init_transcript = mycelium_crypto::reject::init_transcript(body);
+
+        // A replay of the init this session was accepted from is answered
+        // with silence. Duplicate detection keys on the envelope's
+        // `message_id`, which the transcript does not cover, so a relay can
+        // re-deliver an accepted init under a fresh id; its one-time prekey is
+        // spent and the ratchet has moved past its message, so it would fail
+        // and we would sign a *valid* rejection of an init the peer really
+        // sent — which the peer would act on, tearing down a live handshake
+        // (ADR-012).
+        if session_manager
+            .read()
+            .await
+            .is_replayed_init(&envelope.source, &init_transcript)
+        {
+            debug!(
+                "Ignoring a replayed SessionInit from {}: it is the one our session \
+                 was accepted from",
+                envelope.source
+            );
+            return;
+        }
+
         let init = match SessionInitPayload::deserialize_body(body) {
             Ok(i) => i,
             Err(e) => {
@@ -2684,12 +2759,19 @@ impl Node {
                 &init.ephemeral_public,
                 init.signed_prekey_id,
                 init.one_time_prekey_id,
+                init_transcript,
             ) {
-                Ok(safety_number) => {
+                Ok((safety_number, superseded)) => {
                     info!(
                         "Accepted session from {}, safety number: {}",
                         envelope.source, safety_number
                     );
+                    // See the message-carrying path below: accepting clears
+                    // our own unconfirmed handshake, so what it recorded is
+                    // reported here (T-35).
+                    for message_id in &superseded {
+                        let _ = db.mark_message_failed(message_id);
+                    }
                 }
                 Err(e) => {
                     debug!("Failed to accept session from {}: {}", envelope.source, e);
@@ -2704,7 +2786,7 @@ impl Node {
             // Sent after the locks are released: the initiator must learn its
             // bundle is dead or it retries against it forever (T-06).
             if let Some(reason) = reject {
-                Self::send_session_reject(ctx, envelope.source, reason).await;
+                Self::send_session_reject(ctx, envelope.source, reason, init_transcript).await;
             }
             return;
         };
@@ -2714,7 +2796,7 @@ impl Node {
             previous_chain_length: enc.header.previous_chain_length,
             message_number: enc.header.message_number,
         };
-        let ad = build_ad(envelope.source, envelope.destination);
+        let ad = build_ad(envelope.source, envelope.destination, enc.content_type);
 
         // Simultaneous initiation: if we also just initiated a session with
         // this peer, exactly one side must give way or the two sessions end
@@ -2744,7 +2826,7 @@ impl Node {
                     &enc.ciphertext,
                     &ad,
                 )
-                .map(|pt| (String::new(), pt))
+                .map(|pt| (String::new(), pt, Vec::new()))
             } else {
                 sm.accept_session_with_first_message(
                     &mut ps,
@@ -2756,13 +2838,14 @@ impl Node {
                     &ratchet_header,
                     &enc.ciphertext,
                     &ad,
+                    init_transcript,
                 )
             };
             // Persist prekey state (a one-time prekey may have been consumed
             // even when the session was rejected)
             let _ = db.save_prekey_state_blob(&zeroize::Zeroizing::new(ps.to_bytes()));
             match result {
-                Ok((safety_number, plaintext)) if keep_ours => {
+                Ok((safety_number, plaintext, _)) if keep_ours => {
                     let _ = safety_number;
                     info!(
                         "Simultaneous session initiation with {}: keeping ours (lower id wins)",
@@ -2770,11 +2853,28 @@ impl Node {
                     );
                     plaintext
                 }
-                Ok((safety_number, plaintext)) => {
+                Ok((safety_number, plaintext, superseded)) => {
                     info!(
                         "Accepted session from {}, safety number: {}",
                         envelope.source, safety_number
                     );
+                    // Messages we had sent under the session this one
+                    // replaced went to a session the peer never had. They are
+                    // reported here because accepting clears the handshake
+                    // that recorded them — which it must, or a forged
+                    // `SessionReject` would pass the unconfirmed gate and
+                    // delete the session we just authenticated (T-35).
+                    if !superseded.is_empty() {
+                        info!(
+                            "Our own handshake with {} was superseded; failing {} message(s) \
+                             sent under it",
+                            envelope.source,
+                            superseded.len()
+                        );
+                        for message_id in &superseded {
+                            let _ = db.mark_message_failed(message_id);
+                        }
+                    }
                     plaintext
                 }
                 Err(e) => {
@@ -2785,7 +2885,16 @@ impl Node {
                     let reason = session_reject_reason(&e);
                     drop(ps);
                     drop(sm);
-                    Self::send_session_reject(ctx, envelope.source, reason).await;
+                    // A node keeping its own session under ADR-007's tie-break
+                    // does not reject: the initiator is the loser and will
+                    // accept *ours*, so it needs no rejection — and a decrypt
+                    // failure here is also what a replayed init looks like,
+                    // which would have us sign a valid rejection of an init
+                    // the peer really sent.
+                    if !keep_ours {
+                        Self::send_session_reject(ctx, envelope.source, reason, init_transcript)
+                            .await;
+                    }
                     return;
                 }
             }
@@ -2966,25 +3075,6 @@ impl Node {
             return;
         }
 
-        // Initiate session
-        let init_result = {
-            let mut sm = session_manager.write().await;
-            match sm.initiate_session(identity, peer_id, &bundle) {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!("Failed to initiate session with {}: {}", peer_id, e);
-                    // Keep the messages queued for the next prekey response.
-                    pending_messages
-                        .write()
-                        .await
-                        .entry(peer_id)
-                        .or_default()
-                        .extend(pending);
-                    return;
-                }
-            }
-        };
-
         // Deliberately not persisted here, matching
         // `initiate_session_and_send`: a provisional write would leave a
         // session on disk whose SessionInit never reached the peer if we die
@@ -3003,11 +3093,43 @@ impl Node {
                 .unwrap_or_default()
                 .as_secs();
 
-            let ad = build_ad(local_id, peer_id);
+            let ad = build_ad(local_id, peer_id, content_type_to_byte(msg.content_type));
 
-            let (header, ciphertext) = {
+            // Initiating, encrypting, building the payload and recording
+            // the message against the handshake happen under one lock. Split
+            // apart, a concurrent send could land in the gap: it would find a
+            // session but no handshake record, so its own bookkeeping was
+            // silently dropped and its message kept claiming "sent" after a
+            // rejection (T-35).
+            let (payload, our_handshake) = {
                 let mut sm = session_manager.write().await;
-                match sm.encrypt_for(&peer_id, &msg.plaintext, &ad) {
+                // Only initiate when there is nothing to use. A concurrent
+                // send may have installed a session after this bundle was
+                // cached, and initiating over it would replace the ratchet it
+                // had already encrypted under (T-35).
+                let init_result = if i == 0 && !sm.has_session(&peer_id) {
+                    match sm.initiate_session(identity, peer_id, &bundle) {
+                        Ok(r) => Some(r),
+                        Err(e) => {
+                            debug!("Failed to initiate session with {}: {}", peer_id, e);
+                            // Keep the messages queued for the next prekey
+                            // response.
+                            let mut rest = vec![msg];
+                            rest.extend(queue.map(|(_, m)| m));
+                            drop(sm);
+                            pending_messages
+                                .write()
+                                .await
+                                .entry(peer_id)
+                                .or_default()
+                                .extend(rest);
+                            return;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (header, ciphertext) = match sm.encrypt_for(&peer_id, &msg.plaintext, &ad) {
                     Ok(r) => r,
                     Err(e) => {
                         debug!("Failed to encrypt for {}: {}", peer_id, e);
@@ -3024,6 +3146,32 @@ impl Node {
                             .extend(rest);
                         return;
                     }
+                };
+                let enc_payload = EncryptedPayload {
+                    content_type: content_type_to_byte(msg.content_type),
+                    header: WireRatchetHeader {
+                        dh_public: header.dh_public,
+                        previous_chain_length: header.previous_chain_length,
+                        message_number: header.message_number,
+                    },
+                    ciphertext,
+                };
+                if let Some(init_result) = init_result {
+                    // First message: wrap in SessionInit
+                    let session_init = SessionInitPayload {
+                        ephemeral_public: init_result.ephemeral_public,
+                        identity_key: identity.public_key_bytes(),
+                        signed_prekey_id: init_result.used_signed_prekey_id,
+                        one_time_prekey_id: init_result.used_one_time_prekey_id,
+                        encrypted_payload: enc_payload.serialize(),
+                    };
+                    let payload = session_init.serialize();
+                    let transcript = mycelium_crypto::reject::init_transcript(&payload[1..]);
+                    sm.mark_handshake_pending(peer_id, transcript, msg.message_id);
+                    (payload, Some(transcript))
+                } else {
+                    sm.record_unconfirmed_message(peer_id, msg.message_id);
+                    (enc_payload.serialize(), None)
                 }
             };
 
@@ -3037,17 +3185,36 @@ impl Node {
                     "Not sending to {}: ratchet state could not be persisted: {}",
                     peer_id, e
                 );
-                if i == 0 {
+                if let Some(transcript) = our_handshake {
                     // The SessionInit that would have carried this message has
                     // not been transmitted, so the peer knows nothing of this
                     // session. Leaving it installed would make every later
                     // send a bare EncryptedMessage it cannot decrypt.
-                    session_manager.write().await.remove_session(&peer_id);
-                    let _ = db.delete_session(&peer_id);
-                    warn!(
-                        "Discarded unsent session with {}; the handshake will be retried",
-                        peer_id
-                    );
+                    //
+                    // Only this call's own handshake, and only under one lock:
+                    // an accepted `SessionInit` or another sender's session
+                    // must not be deleted here (T-35).
+                    let dead = {
+                        let mut sm = session_manager.write().await;
+                        match sm.remove_if_handshake(&peer_id, &transcript) {
+                            Some(dead) => {
+                                let _ = db.delete_session(&peer_id);
+                                Some(dead)
+                            }
+                            None => None,
+                        }
+                    };
+                    if let Some(dead) = dead {
+                        for message_id in &dead {
+                            let _ = db.mark_message_failed(message_id);
+                        }
+                        warn!(
+                            "Discarded unsent session with {}; the handshake will be \
+                             retried, {} message(s) reported failed",
+                            peer_id,
+                            dead.len()
+                        );
+                    }
                 }
                 // Do not requeue: `pending_messages` is drained only by an
                 // incoming PrekeyResponse, and a later send would take the
@@ -3060,30 +3227,6 @@ impl Node {
                 }
                 return;
             }
-
-            let enc_payload = EncryptedPayload {
-                content_type: content_type_to_byte(msg.content_type),
-                header: WireRatchetHeader {
-                    dh_public: header.dh_public,
-                    previous_chain_length: header.previous_chain_length,
-                    message_number: header.message_number,
-                },
-                ciphertext,
-            };
-
-            let payload = if i == 0 {
-                // First message: wrap in SessionInit
-                let session_init = SessionInitPayload {
-                    ephemeral_public: init_result.ephemeral_public,
-                    identity_key: identity.public_key_bytes(),
-                    signed_prekey_id: init_result.used_signed_prekey_id,
-                    one_time_prekey_id: init_result.used_one_time_prekey_id,
-                    encrypted_payload: enc_payload.serialize(),
-                };
-                session_init.serialize()
-            } else {
-                enc_payload.serialize()
-            };
 
             let envelope = Envelope {
                 source: local_id,
@@ -3099,32 +3242,55 @@ impl Node {
             };
 
             let serialized = envelope.serialize();
+
             let decision = {
                 let r = routing.read().await;
                 r.route_message(&peer_id)
             };
 
-            match decision {
+            let sent = match decision {
                 RoutingDecision::SendRealtime { next_hop } => {
-                    let _ = transport_manager.send(&next_hop, &serialized).await;
-                    let _ = db.update_message_status(&msg.message_id, "sent");
+                    transport_manager.send(&next_hop, &serialized).await
                 }
                 _ => {
                     // Direct send to peer (since they just sent us a prekey response,
                     // they should be a neighbor)
-                    let _ = transport_manager.send(&peer_id, &serialized).await;
-                    let _ = db.update_message_status(&msg.message_id, "sent");
+                    transport_manager.send(&peer_id, &serialized).await
                 }
-            }
+            };
 
-            // This is the common handshake path — no cached bundle, so the
-            // session was just initiated here. Record it as unconfirmed so a
-            // SessionReject can act on it and name the messages that died
-            // with it (ADR-009).
-            session_manager
-                .write()
-                .await
-                .mark_handshake_pending(peer_id, msg.message_id);
+            if let Err(e) = sent {
+                // The transport refused it. Reporting "sent" here left the
+                // caller believing a message had gone out, and keeping the
+                // session left every later send a bare `EncryptedMessage` the
+                // peer could not read, because its `SessionInit` never
+                // arrived (T-35).
+                warn!("Could not send {} to {}: {}", msg.message_id, peer_id, e);
+                let dead = match our_handshake {
+                    Some(transcript) => {
+                        // One lock for memory and storage, as above.
+                        let mut sm = session_manager.write().await;
+                        match sm.remove_if_handshake(&peer_id, &transcript) {
+                            Some(dead) => {
+                                let _ = db.delete_session(&peer_id);
+                                Some(dead)
+                            }
+                            None => None,
+                        }
+                    }
+                    None => None,
+                };
+                for stranded in dead
+                    .unwrap_or_default()
+                    .into_iter()
+                    .chain(std::iter::once(msg.message_id))
+                    .chain(queue.map(|(_, m)| m.message_id))
+                {
+                    let _ = db.mark_message_failed(&stranded);
+                }
+                return;
+            }
+            let _ = db.mark_message_sent(&msg.message_id);
         }
 
         // Each message above persisted its own advance before transmitting;
@@ -3134,12 +3300,24 @@ impl Node {
 
     /// Tell an initiator its `SessionInit` could not be accepted, so it stops
     /// retrying against a bundle that can never work (ROADMAP T-06).
+    ///
+    /// Signed over the id of the `SessionInit` being refused and both NodeIds,
+    /// so the initiator can tell this apart from a forgery and cannot have it
+    /// replayed against a later handshake (T-35, ADR-012).
     async fn send_session_reject(
         ctx: &SendCtx<'_>,
         peer: NodeId,
         reason: wire::SessionRejectReason,
+        init_transcript: [u8; 32],
     ) {
-        let payload = wire::serialize_session_reject(reason, &ctx.identity.public_key_bytes());
+        let signature =
+            mycelium_crypto::reject::sign_reject(ctx.identity, &init_transcript, &peer, reason);
+        let payload = wire::serialize_session_reject(
+            reason,
+            &ctx.identity.public_key_bytes(),
+            &init_transcript,
+            &signature,
+        );
         let envelope = Envelope {
             source: ctx.local_id,
             destination: peer,
@@ -3183,32 +3361,36 @@ impl Node {
     /// fresh one (ROADMAP T-06). Without this the initiator retries against the
     /// same dead bundle forever and the conversation is silently stuck.
     ///
-    /// A reject cannot be authenticated: by definition no confirmed session
-    /// exists yet. It is therefore treated as a hint, and deliberately
-    /// bounded:
+    /// A reject is authenticated, and three checks have to pass before it is
+    /// acted on (T-35, ADR-012):
     ///
-    /// - the NodeId binding check applies, as on every other ingress path;
-    /// - a session older than `SIMULTANEOUS_INIT_WINDOW` is never touched, so
-    ///   a forged reject cannot tear down working traffic;
-    /// - it does nothing when no bundle is cached and nothing was just
-    ///   initiated, so it is not an amplification vector.
+    /// - the NodeId binding, as on the other handshake ingress paths: the
+    ///   claimed identity key must hash to the envelope source;
+    /// - the signature, over the refused `SessionInit`'s id and both NodeIds,
+    ///   against that key — which X3DH already gave us for this peer;
+    /// - the refused id must be one we actually sent under a handshake this
+    ///   peer has not confirmed.
     ///
-    /// The worst a forgery achieves is one discarded unconfirmed handshake and
-    /// one extra prekey request.
+    /// A forgery therefore achieves nothing, where before it could discard an
+    /// unconfirmed handshake and the cached bundle with it. ADR-009 reasoned
+    /// that a reject could not be authenticated because no confirmed session
+    /// exists yet; the responder's identity key is what that missed.
     async fn handle_session_reject(
         envelope: &Envelope,
         body: &[u8],
         prekey_cache: &RwLock<HashMap<NodeId, (PrekeyBundle, Instant)>>,
         session_manager: &RwLock<SessionManager>,
         db: &Database,
+        local_id: NodeId,
     ) {
-        let (reason, identity_key) = match wire::deserialize_session_reject(body) {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("Bad SessionReject payload: {}", e);
-                return;
-            }
-        };
+        let (reason, identity_key, init_transcript, signature) =
+            match wire::deserialize_session_reject(body) {
+                Ok(v) => v,
+                Err(e) => {
+                    debug!("Bad SessionReject payload: {}", e);
+                    return;
+                }
+            };
 
         // Same binding rule as PrekeyResponse and SessionInit: the claimed
         // identity key must hash to the envelope source.
@@ -3216,6 +3398,21 @@ impl Node {
             debug!(
                 "Dropping SessionReject from {}: identity key does not match the source",
                 envelope.source
+            );
+            return;
+        }
+
+        if let Err(e) = mycelium_crypto::reject::verify_reject(
+            &identity_key,
+            &init_transcript,
+            &local_id,
+            &envelope.source,
+            reason,
+            &signature,
+        ) {
+            debug!(
+                "Dropping SessionReject from {}: signature did not verify ({:?})",
+                envelope.source, e
             );
             return;
         }
@@ -3232,7 +3429,11 @@ impl Node {
         // #1, #2).
         let unconfirmed_messages = {
             let mut sm = session_manager.write().await;
-            if !sm.handshake_unconfirmed(&envelope.source) {
+            if sm.handshake_transcript(&envelope.source) != Some(init_transcript) {
+                // Either there is no unconfirmed handshake with this peer, or
+                // the reject names a `SessionInit` we did not send — a
+                // captured reject replayed at a later handshake, or a genuine
+                // rejection of an init an attacker fabricated under our name.
                 None
             } else {
                 // Take the message ids *first*: `remove_session` also clears
@@ -3269,7 +3470,7 @@ impl Node {
         // them, so no receipt can have arrived. Report them rather than
         // leaving rows that claim "sent" (round 5 finding #6).
         for message_id in &dead_messages {
-            let _ = db.update_message_status(message_id, "failed");
+            let _ = db.mark_message_failed(message_id);
         }
 
         info!(
@@ -3361,7 +3562,7 @@ impl Node {
                     message_number: enc.header.message_number,
                 };
 
-                let ad = build_ad(inner_envelope.source, local_id);
+                let ad = build_ad(inner_envelope.source, local_id, enc.content_type);
                 let plaintext = {
                     let mut sm = session_manager.write().await;
                     match sm.decrypt_from(
@@ -3508,7 +3709,7 @@ impl Node {
                 message_number: enc.header.message_number,
             };
 
-            let ad = build_ad(inner_envelope.source, local_id);
+            let ad = build_ad(inner_envelope.source, local_id, enc.content_type);
             let plaintext = {
                 let mut sm = session_manager.write().await;
                 match sm.decrypt_from(
@@ -3598,14 +3799,59 @@ impl Node {
     /// managed to send, from memory and from storage. Leaving it installed
     /// would make every later send use a ratchet the peer knows nothing about.
     async fn discard_unsent_session(ctx: &SendCtx<'_>, destination: &NodeId) {
-        ctx.session_manager
-            .write()
-            .await
-            .remove_session(destination);
-        let _ = ctx.db.delete_session(destination);
+        {
+            // Memory and storage under one lock, so a replacement installed
+            // by another sender cannot have its row deleted by this cleanup.
+            let mut sm = ctx.session_manager.write().await;
+            sm.remove_session(destination);
+            let _ = ctx.db.delete_session(destination);
+        }
         warn!(
             "Discarded unsent session with {}; the handshake will be retried",
             destination
+        );
+    }
+
+    /// Discard a session this send created, unless it is no longer the one
+    /// outstanding.
+    ///
+    /// An authenticated `SessionInit` accepted while the transport write was
+    /// in flight replaces our session and clears our handshake record, so
+    /// "we initiated" stops being true: tearing down on a late failure would
+    /// delete the peer's live replacement (T-35). The outstanding transcript
+    /// is the evidence — `install_accepted` is what clears it.
+    async fn discard_if_still_ours(ctx: &SendCtx<'_>, destination: &NodeId, transcript: [u8; 32]) {
+        // The stored row is deleted under the *same* lock. Released first,
+        // another sender could install and persist a replacement in the gap
+        // and have its durable state deleted by this cleanup (T-35).
+        let dead = {
+            let mut sm = ctx.session_manager.write().await;
+            match sm.remove_if_handshake(destination, &transcript) {
+                Some(dead) => {
+                    let _ = ctx.db.delete_session(destination);
+                    Some(dead)
+                }
+                None => None,
+            }
+        };
+        let Some(dead) = dead else {
+            debug!(
+                "Not discarding the session with {}: it is no longer the handshake \
+                 this send created",
+                destination
+            );
+            return;
+        };
+        // Messages a concurrent send had already queued under this handshake
+        // die with it: their ciphertext belongs to a ratchet that is gone.
+        for message_id in &dead {
+            let _ = ctx.db.mark_message_failed(message_id);
+        }
+        warn!(
+            "Discarded unsent session with {}; the handshake will be retried, \
+             {} message(s) reported failed",
+            destination,
+            dead.len()
         );
     }
 
@@ -4301,10 +4547,19 @@ fn session_reject_reason(e: &SessionError) -> wire::SessionRejectReason {
 }
 
 /// Build associated data for Double Ratchet from source + destination NodeIds.
-fn build_ad(source: NodeId, destination: NodeId) -> Vec<u8> {
-    let mut ad = Vec::with_capacity(64);
+/// The AEAD associated data for a pairwise message.
+///
+/// `content_type` is in here because it travels in the clear beside the
+/// ciphertext. Unauthenticated, a relay could retype any message — text into
+/// a GPS pin, say — and, because the altered copy still decrypted, it could
+/// also be used to mint a second identity for the same `SessionInit`: accept
+/// the retyped copy, then replay the original past the replay check and
+/// collect a valid rejection of it (T-35, ADR-012).
+fn build_ad(source: NodeId, destination: NodeId, content_type: u8) -> Vec<u8> {
+    let mut ad = Vec::with_capacity(65);
     ad.extend_from_slice(source.as_bytes());
     ad.extend_from_slice(destination.as_bytes());
+    ad.push(content_type);
     ad
 }
 
@@ -4376,4 +4631,43 @@ fn serialize_aodv_message(msg: &AodvMessage) -> Vec<u8> {
 fn identity_clone_for_prekeys(identity: &Identity) -> Identity {
     let bytes = identity.to_bytes();
     Identity::from_bytes(&bytes).expect("identity roundtrip failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The content type is inside the associated data, so retyping a message
+    /// in flight breaks its decryption (T-35, ADR-012).
+    ///
+    /// It travels in the clear beside the ciphertext, so without this a relay
+    /// could turn a text message into a GPS pin — and, because the altered
+    /// copy would still decrypt, it could mint a second identity for the same
+    /// `SessionInit` and replay the original past the replay check.
+    ///
+    /// `double_ratchet::tests::test_ratchet_wrong_ad_fails` is the other half:
+    /// a different AD does not decrypt. The end-to-end path is not covered by
+    /// an integration test, because the harness cannot replay the exact bytes
+    /// a node put on the wire.
+    #[test]
+    fn test_the_associated_data_covers_the_content_type() {
+        let a = NodeId::from_bytes([1u8; 32]);
+        let b = NodeId::from_bytes([2u8; 32]);
+
+        let text = build_ad(a, b, content_type_to_byte(ContentType::Text));
+        let pin = build_ad(a, b, content_type_to_byte(ContentType::GpsPin));
+        assert_ne!(
+            text, pin,
+            "a retyped message must not share associated data with the original"
+        );
+        assert_eq!(text.len(), 65, "source, destination, content type");
+        assert_eq!(&text[..32], a.as_bytes());
+        assert_eq!(&text[32..64], b.as_bytes());
+
+        // Direction still matters, as it did before.
+        assert_ne!(
+            text,
+            build_ad(b, a, content_type_to_byte(ContentType::Text))
+        );
+    }
 }

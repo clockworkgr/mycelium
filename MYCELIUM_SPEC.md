@@ -13,7 +13,7 @@
 This is the single normative document for Mycelium. It specifies the wire
 protocol and cryptography, and describes the architecture as built. The
 companion document is [`ROADMAP.md`](ROADMAP.md), which tracks the open work.
-Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/) (ADR-001 … ADR-011);
+Decisions that shaped the design are recorded in [`docs/adr/`](docs/adr/) (ADR-001 … ADR-012);
 build and contribution mechanics live in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### Status legend
@@ -269,7 +269,7 @@ defined.
 | `0x11` | `SessionInit` | 69 | X3DH ephemeral + identity key + encrypted first message |
 | `0x20` | `PrekeyRequest` | 32 | Requester's identity key |
 | `0x21` | `PrekeyResponse` | 66 | Prekey bundle: SPK + signature + optional OTP |
-| `0x22` | `SessionReject` | 33 | Refusal of a `SessionInit`: reason + identity key (ADR-009) |
+| `0x22` | `SessionReject` | 129 | Refusal of a `SessionInit`: reason + identity key + the refused init's transcript + signature (ADR-012) |
 | `0x30` | `AodvRreq` | 78 | Route request |
 | `0x31` | `AodvRrep` | 77 | Route reply |
 | `0x32` | `AodvRerr` | 68 | Route error |
@@ -383,17 +383,57 @@ a cached bundle survives a rotation. An id outside the retention window is a
 hard error, never a silently mismatched derivation (ADR-009).
 
 **Rejection.** When a `SessionInit` cannot be accepted the responder sends
-`SessionReject` (`0x22`). A reject is unauthenticated by construction — no
-confirmed session exists yet to sign it with — so it acts **only** on a
-handshake the peer has not confirmed.
+`SessionReject` (`0x22`), **signed** (ADR-012):
 
-A handshake is **confirmed** the moment the initiator successfully decrypts
+```
+reason(1) ‖ identity_key(32) ‖ init_transcript(32) ‖ signature(64)
+
+init_transcript = SHA-256( b"mycelium-session-init-transcript-v1:"
+                         ‖ len(payload)(4 LE) ‖ session_init_payload )
+signature       = Ed25519( SHA-256( b"mycelium-session-reject-v1:"
+                         ‖ init_transcript ‖ initiator ‖ rejecter ‖ reason ) )
+```
+
+An initiator acts on a reject only when the identity key hashes to the
+envelope source (§14.3), the signature verifies under that key — X3DH already
+gave it that key — and the transcript is the one it recorded for the
+`SessionInit` it is waiting on.
+
+The transcript, rather than the rejected envelope's id, is what makes the
+signature worth having. An id and a source are cleartext and a public key is
+public, so an attacker can have the responder sign a genuine rejection of a
+`SessionInit` it fabricated under the initiator's name; it cannot make the
+responder reject the init the initiator actually sent. ADR-012 records the
+attack.
+
+The AEAD associated data for a pairwise message is
+`source(32) ‖ destination(32) ‖ content_type(1)`. The content type is in there
+because it travels in the clear: unauthenticated, a relay could retype a
+message, and a retyped copy that still decrypted could also be used to mint a
+second identity for one `SessionInit` (ADR-012).
+
+A replayed `SessionInit` draws no rejection. A session records the transcript
+of the init it was accepted from, and an init matching it is answered with
+silence: its prekey is spent and its message already decrypted, so refusing it
+would mean signing a valid rejection of an init the peer really sent. For the
+same reason a node keeping its own session under ADR-007's tie-break never
+rejects — the initiator is the loser and will accept ours.
+
+A reject still acts **only** on a handshake the peer has not confirmed. A
+handshake is **confirmed** the moment the initiator successfully decrypts
 anything from that peer: only the peer's own ratchet could have produced it.
 Until then, a reject discards the unconfirmed session, the cached bundle (in
-memory and in storage) and reports the messages sent under it as failed. A
-confirmed session **must not** be torn down by a reject, which is what stops a
-forgery from killing working traffic. Confirmation is a state, not a deadline:
-an elapsed-time cutoff was tried first and was wrong both ways. See ADR-009.
+memory and in storage) and reports every message sent under the handshake as
+failed. A confirmed session **must not** be torn down by a reject.
+Confirmation is a state, not a deadline: an elapsed-time cutoff was tried
+first and was wrong both ways (ADR-009).
+
+Accepting an authenticated `SessionInit` clears any unconfirmed handshake of
+our own that it supersedes, and reports the messages sent *after* that init as
+failed — not the one carried inside it, which the peer decrypted under
+ADR-007's tie-break. A status write never undoes a settled outcome: "sent"
+does not apply to a message a rejection has failed, and "failed" does not
+apply to one the peer has acknowledged.
 
 ### 5.3 Double Ratchet
 
@@ -1322,8 +1362,13 @@ The checks below are conformance requirements. Each one closes an attack that
 a plain reading of the protocol allows:
 
 - **Identity binding** — drop `PrekeyResponse` (direct or cached while
-  forwarding) and `SessionInit` unless `SHA-256(identity_key) ==
-  envelope.source`.
+  forwarding), `SessionInit` and `SessionReject` unless
+  `SHA-256(identity_key) == envelope.source`. Other handlers in the table
+  above carry no key to bind: `PrekeyRequest`, for instance, has an empty
+  body.
+- **Authenticated rejection** — a `SessionReject` is acted on only if its
+  signature verifies under that key *and* its `init_transcript` is the one
+  recorded for the `SessionInit` awaiting confirmation (§5.2, ADR-012).
 - **Non-destructive session accept** — the first message enclosed in a
   `SessionInit` must decrypt before the new session replaces an existing one; a
   `SessionInit` without a message is refused when a session exists; replays of

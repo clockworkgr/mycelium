@@ -118,6 +118,39 @@ pub fn verify_signature(
 ///
 /// Lets crates that only ever handle serialized keys and signatures stay off a
 /// direct `ed25519-dalek` dependency.
+/// Whether a 32-byte X25519 public key is in its canonical encoding.
+///
+/// X25519 ignores the high bit of the last byte and reduces the u-coordinate
+/// modulo `p = 2^255 - 19` (RFC 7748 §5), so several byte strings denote the
+/// same key and produce the same shared secret. That makes the encoding
+/// malleable, and anything that identifies a handshake by its bytes — the
+/// transcript a `SessionReject` is bound to — malleable with it: an altered
+/// copy of a `SessionInit` decrypts exactly like the original while hashing
+/// differently (ROADMAP T-35, ADR-012).
+///
+/// Canonical means the high bit is clear and the value is below `p`.
+pub fn is_canonical_x25519(key: &[u8; 32]) -> bool {
+    if key[31] & 0x80 != 0 {
+        return false;
+    }
+    // p = 2^255 - 19, little-endian.
+    const P: [u8; 32] = [
+        0xED, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xFF, 0x7F,
+    ];
+    for i in (0..32).rev() {
+        if key[i] < P[i] {
+            return true;
+        }
+        if key[i] > P[i] {
+            return false;
+        }
+    }
+    // Exactly p, which reduces to zero.
+    false
+}
+
 pub fn verify_signature_bytes(
     public_key: &[u8; 32],
     message: &[u8],
@@ -146,6 +179,44 @@ pub enum IdentityError {
 
 #[cfg(test)]
 mod tests {
+
+    /// X25519 keys have one encoding here: the high bit masked off and values
+    /// at or above p both denote keys that would decrypt identically while
+    /// hashing differently (T-35, ADR-012).
+    #[test]
+    fn test_only_canonical_x25519_encodings_are_accepted() {
+        let mut key = [0u8; 32];
+        key[0] = 9; // the X25519 base point
+        assert!(is_canonical_x25519(&key));
+
+        // The same key with the ignored high bit set.
+        let mut high_bit = key;
+        high_bit[31] |= 0x80;
+        assert!(!is_canonical_x25519(&high_bit));
+
+        // p itself, and p + 1, both reduce into range.
+        let p: [u8; 32] = [
+            0xED, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0x7F,
+        ];
+        assert!(!is_canonical_x25519(&p));
+        let mut above = p;
+        above[0] = 0xEE;
+        assert!(!is_canonical_x25519(&above));
+
+        // One below p is in range.
+        let mut below = p;
+        below[0] = 0xEC;
+        assert!(is_canonical_x25519(&below));
+
+        // And an ordinary generated key is canonical, which is the case that
+        // matters for not breaking honest peers.
+        for _ in 0..16 {
+            let id = Identity::generate();
+            assert!(is_canonical_x25519(id.x25519_public_key().as_bytes()));
+        }
+    }
     use super::*;
 
     #[test]

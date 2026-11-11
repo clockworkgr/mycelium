@@ -9,6 +9,20 @@ use crate::x3dh::{self, PrekeyBundle, PrekeyState, X3dhError};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// A `SessionInit` we have sent and the peer has not confirmed.
+///
+/// The transcript is what a `SessionReject` has to name: the envelope's id and
+/// source are cleartext and forgeable, so an attacker could otherwise provoke
+/// a genuine rejection of a `SessionInit` it fabricated under our name and
+/// have us act on it.
+struct UnconfirmedHandshake {
+    transcript: [u8; 32],
+    /// The message carried inside the `SessionInit`.
+    init_message: MessageId,
+    /// Messages sent after it, before the peer confirmed anything.
+    follow_ups: Vec<MessageId>,
+}
+
 /// A per-peer encrypted session.
 #[derive(Clone)]
 pub struct Session {
@@ -16,6 +30,16 @@ pub struct Session {
     pub ratchet: RatchetState,
     pub safety_number: String,
     pub is_verified: bool,
+    /// The transcript of the `SessionInit` this session was accepted from,
+    /// when we were the responder.
+    ///
+    /// Kept so a replay of that init can be recognised. An envelope's
+    /// `message_id` is not covered by the transcript and duplicate detection
+    /// keys on it, so a relay can re-deliver an init we accepted under a fresh
+    /// id; the one-time prekey it used is gone and the ratchet has moved on, so
+    /// it fails — and the rejection we would send is a *valid* rejection of an
+    /// init the initiator really sent, which it would act on (ADR-012).
+    pub accepted_init: Option<[u8; 32]>,
 }
 
 /// Manages all active crypto sessions.
@@ -37,7 +61,7 @@ pub struct SessionManager {
     /// In memory only. After a restart an unconfirmed handshake is treated as
     /// confirmed, so a reject arriving across a restart is ignored and
     /// recovery waits for the next send to fail.
-    unconfirmed_handshakes: HashMap<NodeId, Vec<MessageId>>,
+    unconfirmed_handshakes: HashMap<NodeId, UnconfirmedHandshake>,
 }
 
 impl SessionManager {
@@ -115,6 +139,8 @@ impl SessionManager {
             ratchet,
             safety_number: safety_number.clone(),
             is_verified: false,
+            // We initiated this one; there is no init of theirs behind it.
+            accepted_init: None,
         };
 
         self.sessions.insert(peer_id, session);
@@ -130,6 +156,10 @@ impl SessionManager {
     }
 
     /// Accept an incoming session from a peer.
+    ///
+    /// Returns the safety number and the ids of any messages we had sent
+    /// under the session this one replaces — see `install_accepted`.
+    #[allow(clippy::too_many_arguments)]
     pub fn accept_session(
         &mut self,
         our_state: &mut PrekeyState,
@@ -138,8 +168,9 @@ impl SessionManager {
         their_ephemeral_key: &[u8; 32],
         used_signed_prekey_id: u32,
         used_otp_id: Option<u32>,
-    ) -> Result<String, SessionError> {
-        let session = Self::build_accepted_session(
+        init_transcript: [u8; 32],
+    ) -> Result<(String, Vec<MessageId>), SessionError> {
+        let mut session = Self::build_accepted_session(
             our_state,
             peer_id,
             their_identity_key,
@@ -147,9 +178,32 @@ impl SessionManager {
             used_signed_prekey_id,
             used_otp_id,
         )?;
+        session.accepted_init = Some(init_transcript);
         let safety_number = session.safety_number.clone();
+        let superseded = self.install_accepted(peer_id, session);
+        Ok((safety_number, superseded))
+    }
+
+    /// Install an accepted session, clearing any handshake of our own it
+    /// supersedes and returning the messages that died with it.
+    ///
+    /// Only the **follow-ups** die. Under ADR-007's tie-break the peer that
+    /// keeps its own session still decrypts the first message out of ours, so
+    /// the message carried inside our `SessionInit` was delivered; reporting
+    /// it failed would overwrite a status that may already be "delivered" or
+    /// "read". Messages sent after it went out under the session the peer
+    /// discarded, so those cannot arrive.
+    ///
+    /// Clearing the entry is the point: `handshake_unconfirmed` stayed true
+    /// for a peer whose session we had just authenticated, so a
+    /// `SessionReject` passed that gate and deleted a working session along
+    /// with its stored row and cached bundle.
+    fn install_accepted(&mut self, peer_id: NodeId, session: Session) -> Vec<MessageId> {
         self.sessions.insert(peer_id, session);
-        Ok(safety_number)
+        self.unconfirmed_handshakes
+            .remove(&peer_id)
+            .map(|handshake| handshake.follow_ups)
+            .unwrap_or_default()
     }
 
     /// Accept an incoming session and decrypt the first message it carries.
@@ -169,7 +223,8 @@ impl SessionManager {
         header: &RatchetHeader,
         ciphertext: &[u8],
         ad: &[u8],
-    ) -> Result<(String, Vec<u8>), SessionError> {
+        init_transcript: [u8; 32],
+    ) -> Result<(String, Vec<u8>, Vec<MessageId>), SessionError> {
         let mut session = Self::build_accepted_session(
             our_state,
             peer_id,
@@ -178,13 +233,14 @@ impl SessionManager {
             used_signed_prekey_id,
             used_otp_id,
         )?;
+        session.accepted_init = Some(init_transcript);
         let plaintext = session
             .ratchet
             .decrypt(header, ciphertext, ad)
             .map_err(SessionError::Ratchet)?;
         let safety_number = session.safety_number.clone();
-        self.sessions.insert(peer_id, session);
-        Ok((safety_number, plaintext))
+        let superseded = self.install_accepted(peer_id, session);
+        Ok((safety_number, plaintext, superseded))
     }
 
     fn build_accepted_session(
@@ -197,6 +253,16 @@ impl SessionManager {
     ) -> Result<Session, SessionError> {
         if node_id_from_public_key(their_identity_key) != peer_id {
             return Err(SessionError::IdentityMismatch);
+        }
+
+        // One encoding per key, so the init's bytes identify the handshake.
+        // X25519 masks the high bit and reduces modulo p, so without this an
+        // altered copy of an init derives the same secrets and decrypts the
+        // same message while hashing differently — which is a second identity
+        // for one handshake, and that is what lets a replay of the original
+        // collect an actionable rejection (T-35, ADR-012).
+        if !crate::identity::is_canonical_x25519(their_ephemeral_key) {
+            return Err(SessionError::NonCanonicalEphemeralKey);
         }
 
         // Resolve the signed prekey the initiator actually used before any DH,
@@ -232,6 +298,8 @@ impl SessionManager {
             ratchet,
             safety_number,
             is_verified: false,
+            // Set by the caller, which knows the init it accepted.
+            accepted_init: None,
         })
     }
 
@@ -271,12 +339,54 @@ impl SessionManager {
         Ok(plaintext)
     }
 
-    /// Record a message sent under a handshake the peer has not confirmed.
-    pub fn mark_handshake_pending(&mut self, peer: NodeId, message_id: MessageId) {
-        self.unconfirmed_handshakes
-            .entry(peer)
-            .or_default()
-            .push(message_id);
+    /// Record a `SessionInit` the peer has not confirmed.
+    ///
+    /// `transcript` is the hash of the init's payload as sent, which is what a
+    /// `SessionReject` must name to be acted on, and `init_message` is the
+    /// message carried inside it — tracked apart from later sends because the
+    /// two die differently (see `install_accepted`).
+    pub fn mark_handshake_pending(
+        &mut self,
+        peer: NodeId,
+        transcript: [u8; 32],
+        init_message: MessageId,
+    ) {
+        self.unconfirmed_handshakes.insert(
+            peer,
+            UnconfirmedHandshake {
+                transcript,
+                init_message,
+                follow_ups: Vec::new(),
+            },
+        );
+    }
+
+    /// Record a message sent after the init, while the handshake is still
+    /// unconfirmed. Ignored if there is no such handshake.
+    pub fn record_unconfirmed_message(&mut self, peer: NodeId, message_id: MessageId) {
+        if let Some(handshake) = self.unconfirmed_handshakes.get_mut(&peer) {
+            if handshake.init_message != message_id {
+                handshake.follow_ups.push(message_id);
+            }
+        }
+    }
+
+    /// The transcript of the `SessionInit` we are waiting on, if any.
+    pub fn handshake_transcript(&self, peer: &NodeId) -> Option<[u8; 32]> {
+        self.unconfirmed_handshakes.get(peer).map(|h| h.transcript)
+    }
+
+    /// Whether this is the very `SessionInit` our session with the peer was
+    /// accepted from — that is, a replay of it.
+    ///
+    /// Answering it again means refusing it, because its one-time prekey is
+    /// spent and the ratchet has moved past its message, and that refusal
+    /// would be a valid rejection of an init the peer really sent.
+    pub fn is_replayed_init(&self, peer: &NodeId, init_transcript: &[u8; 32]) -> bool {
+        self.sessions
+            .get(peer)
+            .and_then(|s| s.accepted_init)
+            .is_some_and(|accepted| accepted == *init_transcript)
     }
 
     /// Whether we are waiting for this peer to confirm a handshake.
@@ -284,9 +394,39 @@ impl SessionManager {
         self.unconfirmed_handshakes.contains_key(peer)
     }
 
-    /// Take the messages sent under an unconfirmed handshake, clearing it.
+    /// Take every message sent under an unconfirmed handshake, clearing it.
+    ///
+    /// For a rejection: the peer refused the `SessionInit` itself, so the
+    /// message inside it died with the follow-ups.
     pub fn take_unconfirmed_messages(&mut self, peer: &NodeId) -> Vec<MessageId> {
-        self.unconfirmed_handshakes.remove(peer).unwrap_or_default()
+        match self.unconfirmed_handshakes.remove(peer) {
+            Some(handshake) => {
+                let mut ids = vec![handshake.init_message];
+                ids.extend(handshake.follow_ups);
+                ids
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Remove the session this handshake installed, if it is still the
+    /// outstanding one, returning the messages that died with it.
+    ///
+    /// The comparison and the removal are one operation on purpose: done as a
+    /// read then a write, an authenticated `SessionInit` accepted in between
+    /// was deleted anyway (T-35). `None` means the handshake is no longer
+    /// ours and nothing was touched.
+    pub fn remove_if_handshake(
+        &mut self,
+        peer: &NodeId,
+        transcript: &[u8; 32],
+    ) -> Option<Vec<MessageId>> {
+        if self.handshake_transcript(peer) != Some(*transcript) {
+            return None;
+        }
+        let dead = self.take_unconfirmed_messages(peer);
+        self.remove_session(peer);
+        Some(dead)
     }
 
     /// Mark a handshake confirmed without decrypting (e.g. a verified receipt
@@ -348,6 +488,15 @@ impl SessionManager {
         buf.extend_from_slice(&(safety_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(safety_bytes);
         buf.push(session.is_verified as u8);
+        // Appended, and optional on the way back in, so a row written before
+        // this field existed still loads.
+        match session.accepted_init {
+            Some(transcript) => {
+                buf.push(1);
+                buf.extend_from_slice(&transcript);
+            }
+            None => buf.push(0),
+        }
         buf
     }
 
@@ -388,12 +537,23 @@ impl SessionManager {
         } else {
             false
         };
+        offset += 1;
+
+        let accepted_init = match data.get(offset) {
+            Some(1) if data.len() >= offset + 33 => {
+                let mut transcript = [0u8; 32];
+                transcript.copy_from_slice(&data[offset + 1..offset + 33]);
+                Some(transcript)
+            }
+            _ => None,
+        };
 
         Ok(Session {
             peer_id,
             ratchet,
             safety_number,
             is_verified,
+            accepted_init,
         })
     }
 
@@ -455,6 +615,8 @@ pub enum SessionError {
     NoSession,
     #[error("identity key does not match the claimed node id")]
     IdentityMismatch,
+    #[error("the peer's ephemeral key is not in its canonical encoding")]
+    NonCanonicalEphemeralKey,
     #[error("X3DH error: {0}")]
     X3dh(#[from] X3dhError),
     #[error("ratchet error: {0}")]
@@ -492,11 +654,12 @@ mod tests {
                 &init_result.ephemeral_public,
                 init_result.used_signed_prekey_id,
                 init_result.used_one_time_prekey_id,
+                [0u8; 32],
             )
             .unwrap();
 
         // Safety numbers should match
-        assert_eq!(init_result.safety_number, safety_bob);
+        assert_eq!(init_result.safety_number, safety_bob.0);
 
         // Alice sends to Bob
         let ad = b"session-ad";
@@ -548,6 +711,7 @@ mod tests {
                 &[9u8; 32],
                 bob_spk_id,
                 None,
+                [3u8; 32],
             )
             .unwrap_err();
         assert!(matches!(err, SessionError::IdentityMismatch));
@@ -572,7 +736,7 @@ mod tests {
             .unwrap();
         let ad = b"ad";
         let (header, ct) = alice_sessions.encrypt_for(&bob_node_id, b"m1", ad).unwrap();
-        let (_, pt) = bob_sessions
+        let (_, pt, _) = bob_sessions
             .accept_session_with_first_message(
                 &mut bob_prekey_state,
                 alice_node_id,
@@ -583,6 +747,7 @@ mod tests {
                 &header,
                 &ct,
                 ad,
+                [4u8; 32],
             )
             .unwrap();
         assert_eq!(pt, b"m1");
@@ -601,6 +766,7 @@ mod tests {
                 &header2,
                 &ct2,
                 ad,
+                [7u8; 32],
             )
             .unwrap_err();
         assert!(matches!(err, SessionError::Ratchet(_)));
@@ -614,6 +780,141 @@ mod tests {
 
     /// Both peers initiate at once. The lower NodeId keeps its own session
     /// and only decrypts the other side's first message; the higher NodeId
+    /// The transcript a session was accepted from survives persistence, and
+    /// is what identifies a replay of that init (T-35, ADR-012).
+    #[test]
+    fn test_the_accepted_init_transcript_round_trips_and_marks_replays() {
+        let alice = Identity::generate();
+        let bob = Identity::generate();
+        let alice_node = alice.node_id();
+        let mut bob_state = PrekeyState::new(Identity::from_bytes(&bob.to_bytes()).unwrap());
+        bob_state.generate_one_time_prekeys(1);
+        let bob_bundle = bob_state.bundle();
+
+        let mut alice_sm = SessionManager::new();
+        let init = alice_sm
+            .initiate_session(&alice, bob.node_id(), &bob_bundle)
+            .unwrap();
+        let ad = b"ad";
+        let (header, ct) = alice_sm.encrypt_for(&bob.node_id(), b"m", ad).unwrap();
+
+        let transcript = [42u8; 32];
+        let mut bob_sm = SessionManager::new();
+        bob_sm
+            .accept_session_with_first_message(
+                &mut bob_state,
+                alice_node,
+                &alice.public_key_bytes(),
+                &init.ephemeral_public,
+                init.used_signed_prekey_id,
+                init.used_one_time_prekey_id,
+                &header,
+                &ct,
+                ad,
+                transcript,
+            )
+            .unwrap();
+
+        assert!(
+            bob_sm.is_replayed_init(&alice_node, &transcript),
+            "the init this session came from is a replay if it arrives again"
+        );
+        assert!(
+            !bob_sm.is_replayed_init(&alice_node, &[7u8; 32]),
+            "a different init is a new handshake attempt, not a replay"
+        );
+
+        // And the same holds after a restart, which is when the in-memory
+        // alternative would have let the replay through.
+        let session = bob_sm.all_sessions().next().unwrap().1.clone();
+        let blob = SessionManager::serialize_session(&session);
+        let restored = SessionManager::deserialize_session(&blob).unwrap();
+        assert_eq!(restored.accepted_init, Some(transcript));
+
+        // A session we initiated has no accepted init, and round-trips as
+        // such — the field is optional on the way back in, so rows written
+        // before it existed still load.
+        let ours = alice_sm.all_sessions().next().unwrap().1.clone();
+        assert_eq!(ours.accepted_init, None);
+        let blob = SessionManager::serialize_session(&ours);
+        assert_eq!(
+            SessionManager::deserialize_session(&blob)
+                .unwrap()
+                .accepted_init,
+            None
+        );
+    }
+
+    /// Accepting a peer's session must clear the handshake of our own that it
+    /// supersedes, and hand back what that handshake recorded.
+    ///
+    /// A `SessionReject` is unauthenticated and its only gate is "do we have
+    /// an unconfirmed handshake with this peer". Leaving ours in place after
+    /// accepting an authenticated session let a forged reject delete a
+    /// working session (T-35).
+    #[test]
+    fn test_accepting_a_session_clears_the_handshake_it_supersedes() {
+        let a_id = Identity::generate();
+        let b_id = Identity::generate();
+        let (a_node, b_node) = (a_id.node_id(), b_id.node_id());
+        let mut a_state = PrekeyState::new(Identity::from_bytes(&a_id.to_bytes()).unwrap());
+        let mut b_state = PrekeyState::new(Identity::from_bytes(&b_id.to_bytes()).unwrap());
+        a_state.generate_one_time_prekeys(2);
+        b_state.generate_one_time_prekeys(2);
+        let a_bundle = a_state.issue_bundle();
+        let b_bundle = b_state.issue_bundle();
+
+        let mut a_sm = SessionManager::new();
+        let mut b_sm = SessionManager::new();
+
+        // B initiates and sends two messages under its optimistic session.
+        let b_init = b_sm.initiate_session(&b_id, a_node, &a_bundle).unwrap();
+        let ad = b"ad";
+        let (b_h, b_c) = b_sm.encrypt_for(&a_node, b"from b", ad).unwrap();
+        let init_message = MessageId::random();
+        let follow_up = MessageId::random();
+        b_sm.mark_handshake_pending(a_node, [7u8; 32], init_message);
+        b_sm.record_unconfirmed_message(a_node, follow_up);
+        assert!(b_sm.handshake_unconfirmed(&a_node));
+        assert_eq!(b_sm.handshake_transcript(&a_node), Some([7u8; 32]));
+        let _ = b_init;
+
+        // A initiated too, and B accepts A's session: B's own handshake is
+        // superseded, so it is reported rather than left behind.
+        let a_init = a_sm.initiate_session(&a_id, b_node, &b_bundle).unwrap();
+        let (a_h, a_c) = a_sm.encrypt_for(&b_node, b"from a", ad).unwrap();
+        let (_, plaintext, superseded) = b_sm
+            .accept_session_with_first_message(
+                &mut b_state,
+                a_node,
+                &a_id.public_key_bytes(),
+                &a_init.ephemeral_public,
+                a_init.used_signed_prekey_id,
+                a_init.used_one_time_prekey_id,
+                &a_h,
+                &a_c,
+                ad,
+                [1u8; 32],
+            )
+            .unwrap();
+        assert_eq!(plaintext, b"from a");
+        assert_eq!(
+            superseded,
+            vec![follow_up],
+            "only the follow-ups die: ADR-007 has the winner decrypt the first \
+             message out of the session it discards, so reporting that one failed \
+             would overwrite a delivery that happened"
+        );
+        assert!(
+            !b_sm.handshake_unconfirmed(&a_node),
+            "a reject must no longer find an unconfirmed handshake to act on"
+        );
+        // The accepted session is the one that works.
+        let (h, c) = a_sm.encrypt_for(&b_node, b"a2", ad).unwrap();
+        assert_eq!(b_sm.decrypt_from(&a_node, &h, &c, ad).unwrap(), b"a2");
+        let _ = (b_h, b_c);
+    }
+
     /// replaces its session with the peer's. Afterwards both directions work.
     #[test]
     fn test_simultaneous_initiation_tie_break() {
@@ -659,7 +960,7 @@ mod tests {
         assert_eq!(pt, b"from b");
 
         // B (loser) receives A's SessionInit: replaces its own session.
-        let (_, pt) = b_sm
+        let (_, pt, _) = b_sm
             .accept_session_with_first_message(
                 &mut b_state,
                 a_node,
@@ -670,6 +971,7 @@ mod tests {
                 &a_h,
                 &a_c,
                 ad,
+                [1u8; 32],
             )
             .unwrap();
         assert_eq!(pt, b"from a");

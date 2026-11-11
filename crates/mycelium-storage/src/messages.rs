@@ -82,6 +82,52 @@ impl Database {
         Ok(())
     }
 
+    /// Mark a message sent, unless it has already reached a better or final
+    /// state.
+    ///
+    /// A send and a rejection can race: the transport write completes while a
+    /// `SessionReject` for the same handshake is being processed, and an
+    /// unconditional write then turned an undeliverable message back into
+    /// "sent" (ROADMAP T-35).
+    pub fn mark_message_sent(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        let changed = self.conn().execute(
+            "UPDATE messages SET status = 'sent' \
+             WHERE message_id = ?1 AND status IN ('pending', 'dtn_pending')",
+            params![message_id.as_bytes().as_slice()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Queue a message for DTN, unless its send has already been settled.
+    ///
+    /// Discovery expiry hands a message to DTN after the fact, and writing
+    /// `dtn_pending` unconditionally revived messages a `SessionReject` had
+    /// already failed — their ciphertext was encrypted under a ratchet that no
+    /// longer exists, so they could never be delivered (ROADMAP T-35).
+    pub fn mark_message_dtn_pending(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        let changed = self.conn().execute(
+            "UPDATE messages SET status = 'dtn_pending' \
+             WHERE message_id = ?1 AND status IN ('pending', 'sent')",
+            params![message_id.as_bytes().as_slice()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Mark a message failed, unless the peer has already received it.
+    ///
+    /// A handshake can be superseded or rejected after its first message was
+    /// delivered — ADR-007's tie-break has the winner decrypt the loser's
+    /// first message — and "failed" must not overwrite "received",
+    /// "delivered" or "read" (ROADMAP T-35).
+    pub fn mark_message_failed(&self, message_id: &MessageId) -> Result<bool, StorageError> {
+        let changed = self.conn().execute(
+            "UPDATE messages SET status = 'failed' \
+             WHERE message_id = ?1 AND status IN ('pending', 'sent', 'dtn_pending')",
+            params![message_id.as_bytes().as_slice()],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Get conversation messages between two nodes, returning the *latest* N
     /// messages in chronological (oldest-first) order.
     pub fn get_conversation(
@@ -312,6 +358,75 @@ mod tests {
             .unwrap();
         let updated = db.get_message(&msg.message_id).unwrap();
         assert_eq!(updated.status, "delivered");
+    }
+
+    /// The two status writes that race, and what each must refuse.
+    ///
+    /// A send and a rejection overlap: the transport write finishes while a
+    /// `SessionReject` for the same handshake is being processed. Writing
+    /// "sent" unconditionally turned an undeliverable message back into a
+    /// successful one, and writing "failed" unconditionally overwrote a
+    /// delivery that had already happened (ROADMAP T-35).
+    #[test]
+    fn test_status_writes_do_not_undo_a_settled_outcome() {
+        let db = Database::open_in_memory().unwrap();
+        let record = |status: &str| MessageRecord {
+            message_id: MessageId::random(),
+            source: NodeId([1u8; 32]),
+            destination: NodeId([2u8; 32]),
+            content_type: "text".to_string(),
+            plaintext: b"m".to_vec(),
+            lamport_clock: 1,
+            device_timestamp: 1000,
+            status: status.to_string(),
+            is_incoming: false,
+        };
+
+        // "sent" applies to a message still in flight, and not to one a
+        // rejection has already failed.
+        let pending = record("pending");
+        db.insert_message(&pending).unwrap();
+        assert!(db.mark_message_sent(&pending.message_id).unwrap());
+        assert_eq!(db.get_message(&pending.message_id).unwrap().status, "sent");
+
+        let failed = record("failed");
+        db.insert_message(&failed).unwrap();
+        assert!(!db.mark_message_sent(&failed.message_id).unwrap());
+        assert_eq!(db.get_message(&failed.message_id).unwrap().status, "failed");
+
+        // "failed" applies to a message that never arrived, and not to one
+        // the peer has acknowledged.
+        let sent = record("sent");
+        db.insert_message(&sent).unwrap();
+        assert!(db.mark_message_failed(&sent.message_id).unwrap());
+        assert_eq!(db.get_message(&sent.message_id).unwrap().status, "failed");
+
+        for settled in ["received", "delivered", "read"] {
+            let msg = record(settled);
+            db.insert_message(&msg).unwrap();
+            assert!(
+                !db.mark_message_failed(&msg.message_id).unwrap(),
+                "{} must not become failed",
+                settled
+            );
+            assert_eq!(db.get_message(&msg.message_id).unwrap().status, settled);
+        }
+
+        // DTN picks a message up after discovery expires, which must not
+        // revive one a rejection failed: its ciphertext belongs to a ratchet
+        // that no longer exists.
+        let in_flight = record("sent");
+        db.insert_message(&in_flight).unwrap();
+        assert!(db.mark_message_dtn_pending(&in_flight.message_id).unwrap());
+        assert_eq!(
+            db.get_message(&in_flight.message_id).unwrap().status,
+            "dtn_pending"
+        );
+
+        let dead = record("failed");
+        db.insert_message(&dead).unwrap();
+        assert!(!db.mark_message_dtn_pending(&dead.message_id).unwrap());
+        assert_eq!(db.get_message(&dead.message_id).unwrap().status, "failed");
     }
 
     #[test]

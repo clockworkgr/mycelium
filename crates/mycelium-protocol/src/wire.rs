@@ -126,7 +126,9 @@ impl EncryptedPayload {
         let content_type = data[0];
         let header = WireRatchetHeader::deserialize(&data[1..1 + WireRatchetHeader::SIZE])?;
         let ct_len = u32::from_le_bytes(data[41..45].try_into().unwrap()) as usize;
-        if data.len() - 45 < ct_len {
+        if data.len() - 45 != ct_len {
+            // Exactly, for the same reason as `SessionInitPayload`: this blob
+            // sits inside the init whose hash identifies the handshake.
             return Err(CodecError::PayloadLengthMismatch {
                 header: ct_len,
                 actual: data.len() - 45,
@@ -202,6 +204,14 @@ impl SessionInitPayload {
         offset += 4;
 
         let has_otp = data[offset];
+        if has_otp > 1 {
+            // Canonical, because this payload's hash identifies the handshake
+            // a `SessionReject` names: `2` parsed the same as `1` but hashed
+            // differently, so an altered copy could be accepted under one
+            // identity and the original replayed under another (T-35,
+            // ADR-012).
+            return Err(CodecError::InvalidDiscriminant { value: has_otp });
+        }
         offset += 1;
 
         let one_time_prekey_id = if has_otp != 0 {
@@ -227,7 +237,13 @@ impl SessionInitPayload {
         let payload_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        if data.len() - offset < payload_len {
+        if data.len() - offset != payload_len {
+            // Exactly, not at least: trailing bytes are ignored by the parse
+            // but change the payload's hash, and that hash is the identity a
+            // `SessionReject` is bound to. A padded copy of an init would
+            // otherwise be accepted under a different identity, leaving the
+            // original free to be replayed past the replay check (T-35,
+            // ADR-012).
             return Err(CodecError::PayloadLengthMismatch {
                 header: payload_len,
                 actual: data.len() - offset,
@@ -388,21 +404,38 @@ impl SessionRejectReason {
 /// receiver must treat it as a hint only: drop the cached bundle and
 /// re-request, never touch an established session. The `identity_key` lets the
 /// receiver apply the same NodeId binding check as every other ingress path.
-pub fn serialize_session_reject(reason: SessionRejectReason, identity_key: &[u8; 32]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(34);
+/// Body of a `SessionReject`, after the type byte.
+///
+/// `reason(1) ‖ identity_key(32) ‖ init_transcript(32) ‖ signature(64)`.
+/// The transcript identifies the `SessionInit` being refused — the envelope's
+/// id and source are both forgeable, so they identify nothing — and the
+/// signature covers it, so a reject can be neither forged nor replayed
+/// against another handshake (ROADMAP T-35).
+pub const SESSION_REJECT_BODY_LEN: usize = 1 + 32 + 32 + 64;
+
+pub fn serialize_session_reject(
+    reason: SessionRejectReason,
+    identity_key: &[u8; 32],
+    init_transcript: &[u8; 32],
+    signature: &[u8; 64],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + SESSION_REJECT_BODY_LEN);
     buf.push(WirePayloadType::SessionReject as u8);
     buf.push(reason as u8);
     buf.extend_from_slice(identity_key);
+    buf.extend_from_slice(init_transcript);
+    buf.extend_from_slice(signature);
     buf
 }
 
 /// Deserialize a session rejection from body bytes (after the type byte).
+#[allow(clippy::type_complexity)]
 pub fn deserialize_session_reject(
     data: &[u8],
-) -> Result<(SessionRejectReason, [u8; 32]), CodecError> {
-    if data.len() < 33 {
+) -> Result<(SessionRejectReason, [u8; 32], [u8; 32], [u8; 64]), CodecError> {
+    if data.len() < SESSION_REJECT_BODY_LEN {
         return Err(CodecError::BufferTooShort {
-            expected: 33,
+            expected: SESSION_REJECT_BODY_LEN,
             actual: data.len(),
         });
     }
@@ -410,7 +443,11 @@ pub fn deserialize_session_reject(
         .ok_or(CodecError::InvalidDiscriminant { value: data[0] })?;
     let mut identity_key = [0u8; 32];
     identity_key.copy_from_slice(&data[1..33]);
-    Ok((reason, identity_key))
+    let mut init_transcript = [0u8; 32];
+    init_transcript.copy_from_slice(&data[33..65]);
+    let mut signature = [0u8; 64];
+    signature.copy_from_slice(&data[65..129]);
+    Ok((reason, identity_key, init_transcript, signature))
 }
 
 /// AODV Route Request wire format.
@@ -956,6 +993,13 @@ pub const COSIGNER_ENTRY_LEN: usize = 32 + 64;
 /// carries wire bytes and deliberately pulls in no hashing.
 pub const EMERGENCY_COSIGN_CONTEXT: &[u8] = b"mycelium-emergency-cosign-v1:";
 
+/// Domain separation for the signature on a `SessionReject` (ROADMAP T-35).
+pub const SESSION_REJECT_CONTEXT: &[u8] = b"mycelium-session-reject-v1:";
+
+/// Domain separation for a `SessionInit`'s transcript hash, which is what a
+/// `SessionReject` is bound to (ROADMAP T-35).
+pub const SESSION_INIT_TRANSCRIPT_CONTEXT: &[u8] = b"mycelium-session-init-transcript-v1:";
+
 /// Serialize an emergency broadcast payload.
 /// Layout: type(1=0x90) + level(1) + msg_len(4) + message + cosigner_count(1)
 ///       + cosigners(N * (node_id(32) + signature(64)))
@@ -1384,32 +1428,80 @@ mod tests {
         assert_eq!(tid, target_id);
         assert_eq!(sig, signature);
     }
+    /// Trailing bytes are refused, because the payload's hash is the identity
+    /// a `SessionReject` is bound to (T-35, ADR-012).
+    ///
+    /// A parse that ignored them let a padded copy of a `SessionInit` be
+    /// accepted under a different hash, which left the original free to be
+    /// replayed past the receiver's replay check.
+    #[test]
+    fn test_handshake_payloads_refuse_trailing_bytes() {
+        let enc = EncryptedPayload {
+            content_type: 0,
+            header: WireRatchetHeader {
+                dh_public: [1u8; 32],
+                previous_chain_length: 0,
+                message_number: 0,
+            },
+            ciphertext: vec![9u8; 24],
+        };
+        let enc_bytes = enc.serialize();
+        assert!(EncryptedPayload::deserialize_body(&enc_bytes[1..]).is_ok());
+        let mut padded = enc_bytes[1..].to_vec();
+        padded.push(0);
+        assert!(matches!(
+            EncryptedPayload::deserialize_body(&padded),
+            Err(CodecError::PayloadLengthMismatch { .. })
+        ));
+
+        let init = SessionInitPayload {
+            ephemeral_public: [2u8; 32],
+            identity_key: [3u8; 32],
+            signed_prekey_id: 7,
+            one_time_prekey_id: Some(4),
+            encrypted_payload: enc_bytes.clone(),
+        };
+        let init_bytes = init.serialize();
+        assert!(SessionInitPayload::deserialize_body(&init_bytes[1..]).is_ok());
+        let mut padded = init_bytes[1..].to_vec();
+        padded.push(0);
+        assert!(matches!(
+            SessionInitPayload::deserialize_body(&padded),
+            Err(CodecError::PayloadLengthMismatch { .. })
+        ));
+    }
+
     /// Every payload type needs a roundtrip test (CLAUDE.md testing rules).
     #[test]
     fn test_session_reject_roundtrip() {
         let identity_key = [7u8; 32];
+        let rejected = [9u8; 32];
+        let signature = [3u8; 64];
         for reason in [
             SessionRejectReason::StaleSignedPrekey,
             SessionRejectReason::UnknownOneTimePrekey,
             SessionRejectReason::DecryptFailed,
         ] {
-            let bytes = serialize_session_reject(reason, &identity_key);
+            let bytes = serialize_session_reject(reason, &identity_key, &rejected, &signature);
             assert_eq!(bytes[0], WirePayloadType::SessionReject as u8);
-            assert_eq!(bytes.len(), 34);
+            assert_eq!(bytes.len(), 1 + SESSION_REJECT_BODY_LEN);
 
-            let (got_reason, got_key) = deserialize_session_reject(&bytes[1..]).unwrap();
+            let (got_reason, got_key, got_transcript, got_sig) =
+                deserialize_session_reject(&bytes[1..]).unwrap();
             assert_eq!(got_reason, reason);
             assert_eq!(got_key, identity_key);
+            assert_eq!(got_transcript, rejected);
+            assert_eq!(got_sig, signature);
         }
     }
 
     #[test]
     fn test_session_reject_rejects_short_and_unknown() {
         assert!(matches!(
-            deserialize_session_reject(&[1u8; 32]),
+            deserialize_session_reject(&[1u8; SESSION_REJECT_BODY_LEN - 1]),
             Err(CodecError::BufferTooShort { .. })
         ));
-        let mut body = vec![0u8; 33];
+        let mut body = vec![0u8; SESSION_REJECT_BODY_LEN];
         body[0] = 99; // not a known reason
         assert!(matches!(
             deserialize_session_reject(&body),

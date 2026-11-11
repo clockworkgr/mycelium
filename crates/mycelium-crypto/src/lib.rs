@@ -4,6 +4,7 @@ pub mod double_ratchet;
 pub mod emergency;
 pub mod group;
 pub mod identity;
+pub mod reject;
 pub mod session;
 pub mod wot;
 pub mod x3dh;
