@@ -1,6 +1,6 @@
 # Mycelium Roadmap
 
-**Last updated:** 2026-11-10 · **Current version:** 0.1 (pre-release)
+**Last updated:** 2026-11-11 · **Current version:** 0.1 (pre-release)
 
 The companion document is [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md), which
 specifies the protocol and describes what is built. This document tracks only
@@ -9,12 +9,12 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-10 against the working tree, after the T-06/07/09/10/11
+Verified on 2026-11-11 against the working tree, after the T-06/07/09/10/11
 work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **373 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **385 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -50,8 +50,11 @@ shipped and claimed to work.
 ADR-009), T-07 (ratchet/chain durability + zeroization), T-09 (authenticated
 internet transport, binary framing, signed DHT records, ADR-011), T-10
 (discovery timeout on its own sweep, one attempt per destination), T-11
-(origin-aware DTN eviction, persisted origin + spray history). Four tasks
-remain below.
+(origin-aware DTN eviction, persisted origin + spray history). Seven tasks
+remain below. Three of them came out of reviewing T-09's ADRs against the
+code: T-34 is the defect T-09 fixed, still open on the local transports, and
+T-35 and T-36 are defects in the T-06 and T-05 work that the ADRs' own claims
+turned out not to hold.
 
 ### T-01 · FFI robustness
 
@@ -150,6 +153,117 @@ protects against nothing an attacker with filesystem access cannot bypass.
 - The database key is derived through a KDF that does not expose the identity
   key if the database key leaks.
 - A migration moves existing plaintext identities without data loss.
+
+### T-34 · Local transport peer identity is asserted, not proved
+
+**Area:** `mycelium-core`, Android Kotlin, iOS Swift · **Spec:** §8.4, §22
+
+The BLE Node ID characteristic (`…7891`) serves a bare 32-byte NodeId and the
+Identity characteristic (`…7894`) takes one; Wi-Fi Direct's `Hello` exchanges
+the same. No identity key is carried, nothing proves possession of one, and
+nothing binds the claim to the connection — so `mycelium_ble_on_peer_discovered`
+installs whatever id the platform layer reports. An attacker in radio range can
+claim any node's id: `TransportManager` installs a route for it, AODV prefers
+the fake neighbour, and that node's traffic is delivered to the attacker and
+dropped. Payloads stay encrypted and no session can be established under a
+borrowed id (§14.3), so the damage is denial of delivery and route poisoning,
+not disclosure.
+
+This is the defect T-09 fixed for the internet transport, and the fix has the
+same shape (ADR-011): carry the identity key, prove possession of it against
+something fresh and connection-bound, and *derive* the NodeId instead of
+accepting one. The local transports need it in a form their platform layers can
+carry — the Identity characteristic becomes a key plus a signature over a
+channel-binding value rather than an id.
+
+**Acceptance:**
+- A peer's NodeId is derived from a proved identity key on BLE and Wi-Fi
+  Direct; no code path installs a peer from an asserted id.
+- The proof is bound to the connection, so a replayed identity frame
+  authenticates nobody.
+- Test: a peer that replays a captured identity exchange installs no transport
+  peer and no route; one that holds the key succeeds.
+- Spec §8.4 and §22 updated, and an ADR for the local-transport handshake.
+
+### T-35 · Unconfirmed-handshake bookkeeping is not maintained
+
+**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §5.2, §14.3 · **ADR-009**
+
+A `SessionReject` is unauthenticated, and ADR-009 bounds the damage by acting
+only on an *unconfirmed* handshake: the worst a forgery should achieve is one
+discarded optimistic session. The bookkeeping that bound holds depends on is
+wrong in three places, so a forged reject can do considerably more.
+
+1. `SessionManager::accept_session_with_first_message` installs an
+   authenticated responder session — the peer's first message decrypted, so
+   only their ratchet could have produced it — without clearing that peer's
+   `unconfirmed_handshakes` entry from our own earlier initiation. After a
+   simultaneous initiation, a reject therefore passes the "unconfirmed" gate
+   and `remove_session` deletes a working, authenticated session, along with
+   its stored row and cached bundle.
+2. `Node` marks the handshake pending *after* `route_and_send` returns
+   (`node.rs`). A reject that arrives before that is ignored, leaving the
+   optimistic session installed and its message marked "sent"; worse, a reply
+   that arrives first and *confirms* the handshake has its confirmation undone
+   by the insertion, so a later forged reject can kill a confirmed session.
+3. Messages sent through the existing-session branch are never added to the
+   unconfirmed handshake's list, so a reject reports only the first message as
+   failed and leaves the rest claiming "sent" though the peer discarded the
+   session they were encrypted under.
+
+Found while reviewing ADR-009 against the code during T-09. ADR-009 also
+states that a reject cannot be authenticated because there is "no key to sign
+it with that the receiver can check" — that is **false**: the responder has an
+Ed25519 identity key, and the initiator knows the NodeId it dialled, so a
+domain-separated signature over the rejected initiation would verify. Signing
+the reject removes this whole class of problem rather than bounding it, and is
+the preferred fix; the bookkeeping above still has to be right either way,
+because a legitimate reject must report exactly the messages that died.
+
+**Acceptance:**
+- Accepting an authenticated session clears any unconfirmed-handshake state
+  for that peer, and the messages that were sent under the session it replaces
+  are reported rather than silently dropped from the bookkeeping.
+- The pending marker is registered atomically with the initiation, before any
+  ciphertext is exposed, and removed if the send fails.
+- Every message sent while a handshake is unconfirmed is recorded against it.
+- A reject is signed and bound to the initiation it rejects, or the ADR's
+  rationale is corrected to say why it is not.
+- Tests: a reject after a simultaneous initiation leaves the authenticated
+  session intact; a reject racing the initiation is not ignored; a reject
+  after three follow-up sends reports all four messages failed.
+
+### T-36 · Emergency broadcast dedup suppresses valid alerts and allows replay
+
+**Area:** `mycelium-node` · **Spec:** §9.5 · **ADR-010**
+
+Two defects in the dedup set that guards emergency floods, the one message
+type that bypasses routing limits:
+
+1. The `message_id` is inserted **before** the trust threshold and
+   co-signature checks. A `message_id` is cleartext in every envelope, so any
+   node that relays a legitimate critical alert can immediately send a bogus
+   copy carrying the same id; the real alert then arrives and is dropped as a
+   duplicate. One unverifiable packet suppresses a verified mesh-wide alert.
+2. At 10 000 entries the set is **cleared wholesale**. A captured,
+   correctly-signed critical alert can then be flooded again under its
+   original id and will be accepted, because the signed digest
+   (`broadcast_id ‖ originator ‖ level ‖ message`) has no freshness bound. An
+   attacker can force the clear by flooding distinct ids first.
+
+Found while reviewing ADR-010 against the code during T-09. Related to T-14,
+which covers expiry for the channel-flood dedup set; this one additionally
+needs the verification order fixed and a notion of signed freshness.
+
+**Acceptance:**
+- An id is remembered only after the broadcast verifies, so an invalid copy
+  cannot suppress a valid alert with the same id.
+- Accepted ids are retained for as long as a signed broadcast is considered
+  fresh, with eviction by age rather than by clearing the set.
+- The signed payload carries, or the receiver derives, a freshness bound so a
+  captured alert cannot be replayed indefinitely.
+- Tests: a forged copy with a legitimate id does not suppress the real alert;
+  a replay after eviction pressure is refused.
 
 ---
 
@@ -323,8 +437,11 @@ connections, not how it authenticates them.
   and delivers — subject to `max_connections` and without a dial per message.
 - Failed resolutions are negatively cached, so an unreachable peer does not
   trigger a lookup on every send.
+- A lookup's own dials do not permanently consume connection slots: a
+  connection opened only to ask a DHT question gets a lease or idle eviction.
 - Test: three nodes where A and C know only B; A sends to C and it arrives,
   and a send to an unknown id fails without an unbounded lookup.
+- Test: repeated lookups do not exhaust `max_connections`.
 
 ### T-14 · Channel events and flood dedup expiry
 

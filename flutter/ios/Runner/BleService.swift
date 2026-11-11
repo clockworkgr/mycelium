@@ -16,7 +16,8 @@ protocol BleServiceDelegate: AnyObject {
 ///
 /// GATT Service Layout (same as Android):
 ///   Service UUID:   a1b2c3d4-e5f6-7890-abcd-ef1234567890
-///   Node ID char:   ...7891  (Read)   — 32-byte Ed25519 public key
+///   Node ID char:   ...7891  (Read)   — the node's own 32-byte NodeId
+///                                       (asserted, not proved — ROADMAP T-34)
 ///   Identity char:  ...7894  (Write)  — maps BLE random address to node ID
 ///   Data TX char:   ...7892  (Write)  — central writes data to peripheral
 ///   Data RX char:   ...7893  (Notify) — peripheral notifies central with data

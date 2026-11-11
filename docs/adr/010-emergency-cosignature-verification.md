@@ -133,3 +133,15 @@ mistaken for keys.
    better fit conceptually, but it needs a group-key setup the project does not
    have, and it would obscure *which* co-signers approved, which the spec wants
    for accountability (§9.5: emergencies are deliberately non-anonymous).
+
+## Note (2026-11-11)
+
+"the same binding rule as every other ingress path (spec §14.3)" above means
+the handlers that §14.3's identity-binding rule actually names: `SessionInit`
+and `PrekeyResponse`, which are dropped unless
+`NodeId = SHA-256(identity key)`. It is not a property of every handler in
+that table — `PrekeyRequest`, for instance, has an empty body and carries no
+key to bind — and it is not a claim about transport peer identity. BLE and Wi-Fi Direct exchange a bare NodeId with no key and no proof
+of possession (ROADMAP T-34), and the internet transport only began proving it
+in ADR-011. Appended rather than edited in place, because these records are
+append-only.
