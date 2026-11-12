@@ -977,7 +977,7 @@ impl EmergencyLevel {
 ///
 /// A bare NodeId proves nothing — anyone can list three trusted ids they do
 /// not control. The signature is over
-/// `mycelium_crypto::emergency::cosign_digest` and is
+/// `mycelium_crypto::emergency::broadcast_digest` and is
 /// verified against the co-signer's stored identity key (ROADMAP T-05).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmergencyCosigner {
@@ -985,13 +985,41 @@ pub struct EmergencyCosigner {
     pub signature: [u8; 64],
 }
 
+/// A parsed emergency broadcast body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmergencyBroadcastPayload {
+    pub level: EmergencyLevel,
+    /// Unix seconds at which the originator raised this alert.
+    ///
+    /// Covered by every co-signature, and bounded on receipt against the
+    /// local clock, so a captured alert cannot be replayed indefinitely
+    /// (ADR-013). It is the originator's claim, not a relay's: nothing in the
+    /// envelope is authenticated.
+    pub signed_at: u64,
+    pub message: Vec<u8>,
+    pub cosigners: Vec<EmergencyCosigner>,
+}
+
+/// Smallest valid emergency body (after the type byte):
+/// `level(1) + signed_at(8) + msg_len(4) + cosigner_count(1)`.
+pub const EMERGENCY_BODY_MIN_LEN: usize = 1 + 8 + 4 + 1;
+
 /// Size of one serialized co-signer entry.
 pub const COSIGNER_ENTRY_LEN: usize = 32 + 64;
 
-/// Domain separator for the bytes a level-3 co-signer signs. The digest
-/// itself is built by `mycelium_crypto::emergency::cosign_digest`; this crate
-/// carries wire bytes and deliberately pulls in no hashing.
-pub const EMERGENCY_COSIGN_CONTEXT: &[u8] = b"mycelium-emergency-cosign-v1:";
+/// Co-signer entries one broadcast can carry: the count is a single byte.
+/// Three are required (ADR-010), so this is a ceiling, not a target.
+pub const MAX_EMERGENCY_COSIGNERS: usize = u8::MAX as usize;
+
+/// Domain separator for the digest that identifies an emergency broadcast:
+/// what a level-3 co-signer signs, and what a receiver keys flood dedup on
+/// (ADR-013). The digest itself is built by
+/// `mycelium_crypto::emergency::broadcast_digest`; this crate carries wire
+/// bytes and deliberately pulls in no hashing.
+///
+/// `v2` because the digest gained `signed_at`: a v1 signature must not be
+/// readable as a v2 one.
+pub const EMERGENCY_BROADCAST_CONTEXT: &[u8] = b"mycelium-emergency-broadcast-v2:";
 
 /// Domain separation for the signature on a `SessionReject` (ROADMAP T-35).
 pub const SESSION_REJECT_CONTEXT: &[u8] = b"mycelium-session-reject-v1:";
@@ -1001,10 +1029,12 @@ pub const SESSION_REJECT_CONTEXT: &[u8] = b"mycelium-session-reject-v1:";
 pub const SESSION_INIT_TRANSCRIPT_CONTEXT: &[u8] = b"mycelium-session-init-transcript-v1:";
 
 /// Serialize an emergency broadcast payload.
-/// Layout: type(1=0x90) + level(1) + msg_len(4) + message + cosigner_count(1)
+/// Layout: type(1=0x90) + level(1) + signed_at(8 LE) + msg_len(4 LE)
+///       + message + cosigner_count(1)
 ///       + cosigners(N * (node_id(32) + signature(64)))
 pub fn serialize_emergency_broadcast(
     level: EmergencyLevel,
+    signed_at: u64,
     message: &[u8],
     cosigners: &[EmergencyCosigner],
 ) -> Vec<u8> {
@@ -1012,10 +1042,17 @@ pub fn serialize_emergency_broadcast(
     // broadcast id (see `mycelium_crypto::emergency`), which is why the id is
     // not repeated in the body.
 
-    let mut buf =
-        Vec::with_capacity(1 + 1 + 4 + message.len() + 1 + cosigners.len() * COSIGNER_ENTRY_LEN);
+    // The count is one byte. Writing more entries than it can express would
+    // produce a body this crate's own parser refuses, so the list is cut to
+    // what the format holds.
+    let cosigners = &cosigners[..cosigners.len().min(MAX_EMERGENCY_COSIGNERS)];
+
+    let mut buf = Vec::with_capacity(
+        1 + EMERGENCY_BODY_MIN_LEN + message.len() + cosigners.len() * COSIGNER_ENTRY_LEN,
+    );
     buf.push(WirePayloadType::EmergencyBroadcast as u8);
     buf.push(level as u8);
+    buf.extend_from_slice(&signed_at.to_le_bytes());
     buf.extend_from_slice(&(message.len() as u32).to_le_bytes());
     buf.extend_from_slice(message);
     buf.push(cosigners.len() as u8);
@@ -1026,38 +1063,39 @@ pub fn serialize_emergency_broadcast(
     buf
 }
 
-/// Deserialize emergency broadcast body (after type byte).
-/// Returns: (level, message, cosigners)
-#[allow(clippy::type_complexity)]
+/// Deserialize an emergency broadcast body (after the type byte).
+///
+/// The length must match exactly. A body that parses with bytes left over
+/// gives one broadcast two encodings, which is the shape of defect the
+/// handshake payloads were hardened against in ADR-012; here it would also
+/// give it two flood-dedup keys.
 pub fn deserialize_emergency_broadcast(
     data: &[u8],
-) -> Result<(EmergencyLevel, Vec<u8>, Vec<EmergencyCosigner>), CodecError> {
-    if data.len() < 6 {
+) -> Result<EmergencyBroadcastPayload, CodecError> {
+    if data.len() < EMERGENCY_BODY_MIN_LEN {
         return Err(CodecError::BufferTooShort {
-            expected: 6,
+            expected: EMERGENCY_BODY_MIN_LEN,
             actual: data.len(),
         });
     }
-    let level = EmergencyLevel::from_byte(data[0]).ok_or(CodecError::BufferTooShort {
-        expected: 1,
-        actual: 0,
-    })?;
-    let msg_len = u32::from_le_bytes(data[1..5].try_into().unwrap()) as usize;
-    // Need msg_len bytes of message plus one cosigner-count byte after offset 5.
-    if data.len() - 5 <= msg_len {
+    let level = EmergencyLevel::from_byte(data[0])
+        .ok_or(CodecError::InvalidDiscriminant { value: data[0] })?;
+    let signed_at = u64::from_le_bytes(data[1..9].try_into().unwrap());
+    let msg_len = u32::from_le_bytes(data[9..13].try_into().unwrap()) as usize;
+    // Need msg_len bytes of message plus one cosigner-count byte after offset 13.
+    if data.len() - 13 <= msg_len {
         return Err(CodecError::BufferTooShort {
-            expected: msg_len.saturating_add(6),
+            expected: msg_len.saturating_add(EMERGENCY_BODY_MIN_LEN),
             actual: data.len(),
         });
     }
-    let message = data[5..5 + msg_len].to_vec();
-    let cosigner_count = data[5 + msg_len] as usize;
-    let cosigners_start = 5 + msg_len + 1;
-    // Overflow-safe on 32-bit targets: compare against what remains.
-    if (data.len() - cosigners_start) / COSIGNER_ENTRY_LEN < cosigner_count {
+    let message = data[13..13 + msg_len].to_vec();
+    let cosigner_count = data[13 + msg_len] as usize;
+    let cosigners_start = 13 + msg_len + 1;
+    let expected_len = cosigners_start.saturating_add(cosigner_count * COSIGNER_ENTRY_LEN);
+    if data.len() != expected_len {
         return Err(CodecError::BufferTooShort {
-            expected: cosigners_start
-                .saturating_add(cosigner_count.saturating_mul(COSIGNER_ENTRY_LEN)),
+            expected: expected_len,
             actual: data.len(),
         });
     }
@@ -1073,7 +1111,12 @@ pub fn deserialize_emergency_broadcast(
             signature,
         });
     }
-    Ok((level, message, cosigners))
+    Ok(EmergencyBroadcastPayload {
+        level,
+        signed_at,
+        message,
+        cosigners,
+    })
 }
 
 #[cfg(test)]
@@ -1382,13 +1425,19 @@ mod tests {
                 signature: [i; 64],
             })
             .collect();
-        let bytes = serialize_emergency_broadcast(EmergencyLevel::Critical, message, &cosigners);
+        let bytes = serialize_emergency_broadcast(
+            EmergencyLevel::Critical,
+            1_762_000_000,
+            message,
+            &cosigners,
+        );
         assert_eq!(bytes[0], WirePayloadType::EmergencyBroadcast as u8);
-        let (level, msg, cs) = deserialize_emergency_broadcast(&bytes[1..]).unwrap();
-        assert_eq!(level, EmergencyLevel::Critical);
-        assert_eq!(msg, message);
+        let parsed = deserialize_emergency_broadcast(&bytes[1..]).unwrap();
+        assert_eq!(parsed.level, EmergencyLevel::Critical);
+        assert_eq!(parsed.signed_at, 1_762_000_000);
+        assert_eq!(parsed.message, message);
         assert_eq!(
-            cs, cosigners,
+            parsed.cosigners, cosigners,
             "co-signer ids and signatures must round trip"
         );
 
@@ -1400,14 +1449,62 @@ mod tests {
         ));
     }
 
+    /// A body with bytes left over must be refused: a broadcast that has two
+    /// encodings has two flood-dedup keys, and only one of them is the one
+    /// the receiver remembered (ADR-013).
+    #[test]
+    fn test_emergency_broadcast_refuses_trailing_bytes() {
+        let bytes =
+            serialize_emergency_broadcast(EmergencyLevel::Urgent, 1_762_000_000, b"go", &[]);
+        let mut padded = bytes[1..].to_vec();
+        padded.push(0);
+        assert!(
+            matches!(
+                deserialize_emergency_broadcast(&padded),
+                Err(CodecError::BufferTooShort { .. })
+            ),
+            "a padded body must not parse"
+        );
+    }
+
+    /// The count byte cannot express more than 255 entries, and a body whose
+    /// count disagrees with its entries is one this parser refuses — so the
+    /// serializer must not produce one.
+    #[test]
+    fn test_emergency_broadcast_caps_the_cosigner_list() {
+        let many: Vec<EmergencyCosigner> = (0..300)
+            .map(|i| EmergencyCosigner {
+                node_id: NodeId([(i % 251) as u8; 32]),
+                signature: [1u8; 64],
+            })
+            .collect();
+        let bytes = serialize_emergency_broadcast(EmergencyLevel::Critical, 1, b"x", &many);
+        let parsed = deserialize_emergency_broadcast(&bytes[1..])
+            .expect("the serializer must not produce a body its own parser refuses");
+        assert_eq!(parsed.cosigners.len(), MAX_EMERGENCY_COSIGNERS);
+        assert_eq!(parsed.cosigners[..], many[..MAX_EMERGENCY_COSIGNERS]);
+    }
+
+    #[test]
+    fn test_emergency_broadcast_refuses_an_unknown_level() {
+        let mut bytes =
+            serialize_emergency_broadcast(EmergencyLevel::Urgent, 1, b"go", &[])[1..].to_vec();
+        bytes[0] = 4;
+        assert!(matches!(
+            deserialize_emergency_broadcast(&bytes),
+            Err(CodecError::InvalidDiscriminant { value: 4 })
+        ));
+    }
+
     #[test]
     fn test_emergency_broadcast_no_cosigners() {
         let message = b"Priority relay boost";
-        let bytes = serialize_emergency_broadcast(EmergencyLevel::Priority, message, &[]);
-        let (level, msg, cs) = deserialize_emergency_broadcast(&bytes[1..]).unwrap();
-        assert_eq!(level, EmergencyLevel::Priority);
-        assert_eq!(msg, message);
-        assert!(cs.is_empty());
+        let bytes = serialize_emergency_broadcast(EmergencyLevel::Priority, 7, message, &[]);
+        let parsed = deserialize_emergency_broadcast(&bytes[1..]).unwrap();
+        assert_eq!(parsed.level, EmergencyLevel::Priority);
+        assert_eq!(parsed.signed_at, 7);
+        assert_eq!(parsed.message, message);
+        assert!(parsed.cosigners.is_empty());
     }
 
     #[test]

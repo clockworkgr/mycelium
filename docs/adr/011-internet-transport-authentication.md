@@ -523,3 +523,34 @@ the same peer and won, and that connection is perfectly usable.
    binary codec for the mesh envelope (§4) because the Cap'n Proto toolchain is
    not available in this environment; a second encoding scheme for one transport
    is not worth the inconsistency.
+
+## Note (2026-11-12)
+
+The claim above that the "no newer" rule "stops a captured older record being
+replayed to roll an address back" holds only while the store still holds the
+newer record. It does not survive capacity pressure: at `max_records` the
+store evicts whatever is closest to expiring and admits the newcomer, so a
+peer can fill it with self-signed records for identities it generates — both
+free — evict a victim's current record, and then replay that victim's older,
+still-fresh one. Nothing is left to compare it against, so it is accepted and
+lookups answer with the stale address.
+
+Found by reviewing this record against the code during T-36 and recorded as
+ROADMAP T-38. ADR-016 settles how: a persisted `NodeId → newest published_at`
+mark that is **never evicted inside the replay window**, with admission of an
+unseen publisher refused instead when the table is full. A per-publisher quota
+is explicitly *not* the defence — a publisher is an identity and identities are
+free, so an attacker rotates keypairs and stays inside every quota — and
+survives only as fairness. Until that lands, the rollback protection here
+should be read as "while the current record is held".
+
+The claim above that "a record for a wildcard listen address is neither stored
+nor published" is likewise narrower than it reads. The check lives in the
+internet transport's publish path, which refuses to sign `0.0.0.0`, and not in
+`store_record`: a correctly signed wildcard record *from a peer* is admitted
+like any other and served to `FindValue`. Nothing can dial it, so it occupies
+a slot and answers a lookup with an address that cannot work. The rule belongs
+in common admission, and is recorded as an acceptance bullet on T-38 with the
+rest of the admission work.
+
+Appended rather than edited in place, because these records are append-only.

@@ -15,6 +15,9 @@ use mycelium_core::routing::coordinator::{RoutingCoordinator, RoutingDecision};
 use mycelium_core::transport::manager::TransportManager;
 use mycelium_core::transport::{TransportError, TransportEvent};
 use mycelium_crypto::double_ratchet::RatchetHeader;
+use mycelium_crypto::emergency::{
+    BroadcastContext, EMERGENCY_MAX_CLOCK_SKEW_SECS, EMERGENCY_VALIDITY_SECS,
+};
 use mycelium_crypto::group::{GroupError, SenderKey, SenderKeyGroup};
 use mycelium_crypto::identity::{node_id_from_public_key, Identity};
 use mycelium_crypto::session::{SessionError, SessionManager};
@@ -36,6 +39,7 @@ use mycelium_storage::sessions::SessionRecord;
 use crate::battery::BatteryManager;
 use crate::config::NodeConfig;
 use crate::events::NodeEvent;
+use crate::flood_dedup::{channel_flood_key, EmergencyDedup, FloodCopy, FloodDedup, FloodMark};
 use crate::rate_limiter::RateLimiter;
 
 /// Errors from high-level node operations.
@@ -112,6 +116,63 @@ const DISCOVERY_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// treated as a simultaneous initiation (see `handle_session_init`).
 const SIMULTANEOUS_INIT_WINDOW: Duration = Duration::from_secs(60);
 
+/// Entries either flood-dedup map holds before the oldest eighth is evicted.
+const FLOOD_DEDUP_CAPACITY: usize = 10_000;
+
+/// How long a channel-message flood is remembered. A channel message has no
+/// signed freshness bound, so the figure is a plain bound on how long a loop
+/// or a re-delivery can take; before ROADMAP T-14 the set never expired at
+/// all.
+const CHANNEL_DEDUP_TTL: Duration = Duration::from_secs(900);
+
+/// How long an emergency broadcast is remembered: the whole window in which
+/// one can still be accepted — `EMERGENCY_VALIDITY_SECS` back, plus the
+/// clock skew a receiver tolerates forward — and then a second more.
+///
+/// That relationship is the point: an entry is forgotten only once no
+/// broadcast it could be about would pass the freshness check, which is what
+/// makes eviction safe where clearing the set was not (ADR-013, ROADMAP
+/// T-36). The extra second covers the two clocks disagreeing at the edge:
+/// freshness is compared in whole wall-clock seconds, retention in monotonic
+/// time, so a broadcast dated exactly `+EMERGENCY_MAX_CLOCK_SKEW_SECS` would
+/// otherwise be acceptable for a fraction of a second after its entry had
+/// aged out.
+const EMERGENCY_DEDUP_TTL: Duration =
+    Duration::from_secs(EMERGENCY_VALIDITY_SECS + EMERGENCY_MAX_CLOCK_SKEW_SECS + 1);
+
+/// Remaining TTL a flooded message is allowed to claim.
+///
+/// The envelope's TTL is cleartext and nothing authenticates it, so a relay
+/// can inflate it and have a message flood far past what its originator
+/// intended. Clamping on receipt also bounds the other side of the reach
+/// rule: since a node forwards a message again only when a copy reaches
+/// further than the one it kept, and reach only increases, it can forward a
+/// given message at most `MAX_FLOOD_TTL + 1` times however many copies
+/// arrive (ADR-013).
+///
+/// The *checking* is not bounded this way: a copy that claims more reach and
+/// then fails verification records nothing, so it can be sent again. See
+/// ADR-013 — the answer is an originator signature (ROADMAP T-37), not a
+/// memory of copies that failed, which would itself be a way to suppress the
+/// genuine one.
+const MAX_FLOOD_TTL: u8 = 20;
+
+/// Co-signer entries a receiver spends real work on before giving up on a
+/// broadcast.
+///
+/// `handle_emergency_broadcast` now does its checking *before* it remembers
+/// anything (ADR-013), so a long co-signer list is an attacker's lever on
+/// that work. The budget covers the expensive part — a trust-graph traversal
+/// and an Ed25519 verification — and is charged only for entries that get
+/// that far: a duplicate id, or an id we hold no identity key for, is
+/// dismissed by an indexed lookup and costs nothing.
+///
+/// Three valid co-signatures are required, so a legitimate alert has no
+/// reason to carry sixteen candidates we hold keys for; and to pad the list
+/// with entries that reach the budget an attacker would have to know which
+/// contacts the receiver has, which is not public.
+const MAX_COSIGNER_CANDIDATES: usize = 16;
+
 /// Maintenance ticks between signed-prekey rotations: weekly, at the 30 s tick.
 ///
 /// Coupled to `MAX_RETAINED_SIGNED_PREKEYS` and to the 7-day prekey-bundle
@@ -155,8 +216,13 @@ pub struct Node {
         Arc<RwLock<Option<Arc<mycelium_core::transport::internet::InternetTransport>>>>,
     /// Broadcast channel for node events (consumed by API server / WebSocket clients).
     pub event_tx: tokio::sync::broadcast::Sender<NodeEvent>,
-    /// Dedup set for channel messages (prevents re-processing flooded messages).
-    seen_channel_messages: Arc<RwLock<HashSet<MessageId>>>,
+    /// Flood dedup for channel messages, keyed on what identifies the
+    /// message rather than on its cleartext envelope id (ADR-013).
+    seen_channel_messages: Arc<RwLock<FloodDedup>>,
+    /// Flood dedup for emergency broadcasts: kept apart from channel traffic,
+    /// and apart per level, so neither channel volume nor a cheap level-1
+    /// flood can evict a co-signed level-3 entry (ADR-013).
+    seen_emergency_broadcasts: Arc<RwLock<EmergencyDedup>>,
     /// Members we have already sent our current sender key to, per group.
     /// Not persisted: after a restart the key is simply re-sent once.
     key_sent_to: Arc<RwLock<HashMap<[u8; 32], HashSet<NodeId>>>>,
@@ -254,7 +320,14 @@ impl Node {
             bt_classic_transport: Arc::new(RwLock::new(None)),
             internet_transport: Arc::new(RwLock::new(None)),
             event_tx,
-            seen_channel_messages: Arc::new(RwLock::new(HashSet::new())),
+            seen_channel_messages: Arc::new(RwLock::new(FloodDedup::new(
+                CHANNEL_DEDUP_TTL,
+                FLOOD_DEDUP_CAPACITY,
+            ))),
+            seen_emergency_broadcasts: Arc::new(RwLock::new(EmergencyDedup::new(
+                EMERGENCY_DEDUP_TTL,
+                FLOOD_DEDUP_CAPACITY,
+            ))),
             key_sent_to: Arc::new(RwLock::new(HashMap::new())),
             local_group_hash,
         }
@@ -431,6 +504,7 @@ impl Node {
         let battery = self.battery.clone();
         let event_tx = self.event_tx.clone();
         let seen_channel_messages = self.seen_channel_messages.clone();
+        let seen_emergency_broadcasts = self.seen_emergency_broadcasts.clone();
         let key_sent_to = self.key_sent_to.clone();
         let local_group_hash = self.local_group_hash;
         let cancel = self.cancel.clone();
@@ -469,6 +543,7 @@ impl Node {
                                     &battery,
                                     &event_tx,
                                     &seen_channel_messages,
+                                    &seen_emergency_broadcasts,
                                     local_group_hash,
                                     &key_sent_to,
                                 ).await;
@@ -1665,7 +1740,8 @@ impl Node {
         pending_routes: &RwLock<HashMap<NodeId, PendingDiscovery>>,
         battery: &RwLock<BatteryManager>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
-        seen_channel_messages: &RwLock<HashSet<MessageId>>,
+        seen_channel_messages: &RwLock<FloodDedup>,
+        seen_emergency_broadcasts: &RwLock<EmergencyDedup>,
         local_group_hash: Option<[u8; 8]>,
         key_sent_to: &RwLock<HashMap<[u8; 32], HashSet<NodeId>>>,
     ) {
@@ -1952,6 +2028,25 @@ impl Node {
                         | WirePayloadType::AodvRerr
                 );
                 let is_broadcast = envelope.destination == NodeId::ZERO;
+
+                // A flood is addressed to everyone or it is nothing. One
+                // addressed to a particular node would otherwise be unicast
+                // across the mesh by the generic path below, never reaching
+                // the handler that refuses it — pointless traffic that also
+                // skips the per-originator rate limit, since emergency
+                // broadcasts are not charged for it (ADR-013).
+                let is_flood = matches!(
+                    payload_type,
+                    WirePayloadType::ChannelMessage | WirePayloadType::EmergencyBroadcast
+                );
+                if is_flood && !is_broadcast {
+                    debug!(
+                        "{:?} from {} is addressed to {} rather than broadcast, dropping",
+                        payload_type, envelope.source, envelope.destination
+                    );
+                    return;
+                }
+
                 if !is_aodv
                     && !is_broadcast
                     && envelope.destination != local_id
@@ -2238,7 +2333,7 @@ impl Node {
                             trust_graph,
                             transport_manager,
                             local_id,
-                            seen_channel_messages,
+                            seen_emergency_broadcasts,
                             event_tx,
                             db,
                         )
@@ -4053,6 +4148,33 @@ impl Node {
         }
     }
 
+    // --- Flooding ---
+
+    /// Forward a flooded message to every peer but the originator, ourselves
+    /// and the hop it came from.
+    ///
+    /// The TTL is clamped on the way out, not just on the way in, so a copy
+    /// that arrived with an inflated TTL cannot be passed on with one.
+    async fn flood_onward(
+        envelope: &Envelope,
+        peer: NodeId,
+        local_id: NodeId,
+        transport_manager: &TransportManager,
+    ) {
+        if envelope.ttl == 0 {
+            return;
+        }
+        let mut fwd = envelope.clone();
+        fwd.ttl = fwd.ttl.min(MAX_FLOOD_TTL);
+        fwd.forward();
+        let fwd_data = fwd.serialize();
+        for p in transport_manager.known_peers().await {
+            if p != envelope.source && p != local_id && p != peer {
+                let _ = transport_manager.send(&p, &fwd_data).await;
+            }
+        }
+    }
+
     // --- Channel message handler ---
 
     /// Handle an incoming channel message: dedup, store if subscribed, flood to peers.
@@ -4064,9 +4186,25 @@ impl Node {
         db: &Database,
         transport_manager: &TransportManager,
         local_id: NodeId,
-        seen: &RwLock<HashSet<MessageId>>,
+        seen: &RwLock<FloodDedup>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
     ) {
+        // A flood is addressed to everyone, and only to everyone. A copy
+        // addressed to *this* node still verifies — the destination is not
+        // part of what identifies the message, and cannot be, since a flood
+        // carries no destination — but it reaches this handler instead of
+        // being routed away, and forwarding preserves that destination: every
+        // downstream node would then unicast it back towards us rather than
+        // flooding it, and would dismiss the genuine broadcast behind it as a
+        // duplicate. Refused before anything is remembered (ADR-013).
+        if envelope.destination != NodeId::ZERO {
+            debug!(
+                "{} from {} is addressed to {} rather than broadcast, ignoring",
+                "Channel message", envelope.source, envelope.destination
+            );
+            return;
+        }
+
         let (channel_id, content_type, data) = match wire::deserialize_channel_message(body) {
             Ok(v) => v,
             Err(e) => {
@@ -4075,19 +4213,44 @@ impl Node {
             }
         };
 
-        // Dedup: skip if we've already seen this message_id
-        {
-            let mut seen_set = seen.write().await;
-            if !seen_set.insert(envelope.message_id) {
+        // Dedup on what identifies the message, not on its envelope id. The
+        // id is cleartext and unauthenticated, so keying on it alone let any
+        // relay suppress a channel message by sending a bogus copy under the
+        // same id (the emergency form of this is ROADMAP T-36). Entries now
+        // expire by age instead of the set being cleared wholesale (T-14),
+        // and a copy that reaches further than the one we kept is forwarded
+        // again, so a spent-TTL copy cannot stop the flood either (ADR-013).
+        let copy = {
+            let key = channel_flood_key(
+                &envelope.message_id,
+                &envelope.source,
+                &channel_id,
+                content_type,
+                &data,
+            );
+            let reach = envelope.ttl.min(MAX_FLOOD_TTL);
+            seen.write().await.accept(FloodMark {
+                key,
+                reach,
+                // A channel message carries no signed validity window, so
+                // retention is the monotonic TTL alone.
+                keep_until: 0,
+            })
+        };
+        match copy {
+            FloodCopy::New => {}
+            FloodCopy::Further => {
+                // Same message, more reach: carry it on without storing or
+                // reporting it a second time.
+                Self::flood_onward(envelope, peer, local_id, transport_manager).await;
+                return;
+            }
+            FloodCopy::Duplicate => {
                 debug!(
                     "Duplicate channel message {}, skipping",
                     envelope.message_id
                 );
                 return;
-            }
-            // Cap the dedup set to prevent unbounded growth
-            if seen_set.len() > 10_000 {
-                seen_set.clear();
             }
         }
 
@@ -4123,21 +4286,35 @@ impl Node {
 
         // Flood to all connected peers except the originator and the hop
         // that just delivered it to us.
-        if envelope.ttl > 0 {
-            let mut fwd = envelope.clone();
-            fwd.forward();
-            let fwd_data = fwd.serialize();
-            let peers = transport_manager.known_peers().await;
-            for p in peers {
-                if p != envelope.source && p != local_id && p != peer {
-                    let _ = transport_manager.send(&p, &fwd_data).await;
-                }
-            }
-        }
+        Self::flood_onward(envelope, peer, local_id, transport_manager).await;
     }
 
     // --- Emergency broadcast handler ---
 
+    /// Handle an incoming emergency broadcast: check it, then remember it,
+    /// then flood it.
+    ///
+    /// The order is the fix. The dedup insert used to come **first**, so any
+    /// relay could answer a legitimate critical alert with a bogus copy
+    /// carrying the same cleartext `message_id`; the real alert then arrived
+    /// and was dropped as a duplicate. One unverifiable packet suppressed a
+    /// verified mesh-wide alert (ROADMAP T-36, ADR-013).
+    ///
+    /// Nothing is remembered until it has been accepted, and what is
+    /// remembered is the broadcast digest rather than the envelope id — so a
+    /// copy differing in anything the receiver acts on is a different entry,
+    /// and a copy differing in nothing *is* the alert.
+    ///
+    /// Reading the set before checking a copy is still fine, and happens
+    /// first: an entry exists only because this node accepted that exact
+    /// broadcast, so a hit means the checking has already been done and a
+    /// replay costs a hash and a lookup instead of sixteen signature
+    /// verifications. What it does not decide is whether to *forward*: a copy
+    /// that reaches further than the one we kept is checked and forwarded, so
+    /// a relay cannot stop the flood by delivering a captured alert with its
+    /// TTL spent, nor make us pass on a stripped copy in place of the one we
+    /// verified (the digest covers the alert, not the approvals attached to
+    /// it).
     #[allow(clippy::too_many_arguments)]
     async fn handle_emergency_broadcast(
         envelope: &Envelope,
@@ -4146,11 +4323,27 @@ impl Node {
         trust_graph: &RwLock<TrustGraph>,
         transport_manager: &TransportManager,
         local_id: NodeId,
-        seen: &RwLock<HashSet<MessageId>>,
+        seen: &RwLock<EmergencyDedup>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
         db: &Database,
     ) {
-        let (level, message_bytes, cosigners) = match wire::deserialize_emergency_broadcast(body) {
+        // A flood is addressed to everyone, and only to everyone. A copy
+        // addressed to *this* node still verifies — the destination is not
+        // part of what identifies the message, and cannot be, since a flood
+        // carries no destination — but it reaches this handler instead of
+        // being routed away, and forwarding preserves that destination: every
+        // downstream node would then unicast it back towards us rather than
+        // flooding it, and would dismiss the genuine broadcast behind it as a
+        // duplicate. Refused before anything is remembered (ADR-013).
+        if envelope.destination != NodeId::ZERO {
+            debug!(
+                "{} from {} is addressed to {} rather than broadcast, ignoring",
+                "Emergency broadcast", envelope.source, envelope.destination
+            );
+            return;
+        }
+
+        let broadcast = match wire::deserialize_emergency_broadcast(body) {
             Ok(v) => v,
             Err(e) => {
                 debug!("Bad emergency broadcast: {}", e);
@@ -4158,19 +4351,41 @@ impl Node {
             }
         };
 
-        // Dedup
-        {
-            let mut seen_set = seen.write().await;
-            if !seen_set.insert(envelope.message_id) {
-                debug!(
-                    "Duplicate emergency broadcast {}, skipping",
-                    envelope.message_id
-                );
-                return;
-            }
-            if seen_set.len() > 10_000 {
-                seen_set.clear();
-            }
+        // Freshness first: it is the cheapest check, and it is what bounds
+        // replay once a dedup entry has been evicted by age. A co-signature
+        // covers `signed_at`, so for level 3 this is an authenticated date.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if let Err(reason) = mycelium_crypto::emergency::check_freshness(broadcast.signed_at, now) {
+            debug!(
+                "Emergency broadcast from {} refused: {:?} (signed_at={}, now={})",
+                envelope.source, reason, broadcast.signed_at, now
+            );
+            return;
+        }
+
+        let ctx = BroadcastContext {
+            broadcast_id: &envelope.message_id,
+            originator: &envelope.source,
+            level: broadcast.level,
+            signed_at: broadcast.signed_at,
+            message: &broadcast.message,
+        };
+        let digest = mycelium_crypto::emergency::broadcast_digest(&ctx);
+        let reach = envelope.ttl.min(MAX_FLOOD_TTL);
+
+        // A copy of something already accepted that carries no further reach
+        // is dropped here, before any verification: re-checking it is work an
+        // attacker can ask for by replaying one captured alert, and a 1-hop
+        // neighbour is not rate-limited at all.
+        if seen.read().await.probe(broadcast.level, &digest, reach) == FloodCopy::Duplicate {
+            debug!(
+                "Duplicate emergency broadcast {}, skipping",
+                envelope.message_id
+            );
+            return;
         }
 
         // Trust threshold checks
@@ -4179,15 +4394,15 @@ impl Node {
 
         // Thresholds per spec §9.5: Priority > 0.3, Urgent > 0.6, Critical
         // needs 3+ co-signers above 0.8 whose signatures verify (ADR-010).
-        let accepted = match level {
+        let accepted = match broadcast.level {
             wire::EmergencyLevel::Priority => sender_trust > 0.3,
             wire::EmergencyLevel::Urgent => sender_trust > 0.6,
             wire::EmergencyLevel::Critical => {
-                if cosigners.len() < 3 {
+                if broadcast.cosigners.len() < 3 {
                     debug!(
                         "Critical emergency from {} rejected: only {} cosigners (need 3+)",
                         envelope.source,
-                        cosigners.len()
+                        broadcast.cosigners.len()
                     );
                     false
                 } else {
@@ -4195,34 +4410,49 @@ impl Node {
                     // key we hold for that id *and* the id is trusted above
                     // 0.8. Bare ids prove nothing: anyone can list three
                     // trusted NodeIds they do not control.
-                    let mut seen: Vec<NodeId> = Vec::with_capacity(cosigners.len());
+                    //
+                    // The cheap filters run over the whole list and the
+                    // budget is charged only once an entry reaches the
+                    // expensive checks, so padding the list with ids we hold
+                    // no key for cannot crowd out the three that count
+                    // (ADR-013).
+                    let mut counted: Vec<NodeId> = Vec::new();
                     let mut valid = 0usize;
-                    for cs in &cosigners {
-                        if seen.contains(&cs.node_id) {
+                    let mut candidates = 0usize;
+                    for cs in &broadcast.cosigners {
+                        if valid >= 3 || candidates >= MAX_COSIGNER_CANDIDATES {
+                            break;
+                        }
+                        if counted.contains(&cs.node_id) {
                             debug!("Duplicate emergency co-signer {}", cs.node_id);
                             continue;
                         }
-                        seen.push(cs.node_id);
+                        counted.push(cs.node_id);
 
-                        let key = db.get_contact_identity_key(&cs.node_id);
-                        if let Err(reason) = mycelium_crypto::emergency::verify_cosigner(
-                            cs,
-                            key,
-                            &envelope.message_id,
-                            &envelope.source,
-                            level,
-                            &message_bytes,
-                        ) {
+                        // An unverifiable approval is no approval, and saying
+                        // so costs one indexed lookup.
+                        let Some(key) = db.get_contact_identity_key(&cs.node_id) else {
                             debug!(
-                                "Emergency co-signature from {} not counted: {:?}",
-                                cs.node_id, reason
+                                "No identity key held for emergency co-signer {}",
+                                cs.node_id
+                            );
+                            continue;
+                        };
+                        candidates += 1;
+
+                        if tg.trust_score(&local_id, &cs.node_id).value <= 0.8 {
+                            debug!(
+                                "Emergency co-signer {} is not trusted above 0.8",
+                                cs.node_id
                             );
                             continue;
                         }
-                        if tg.trust_score(&local_id, &cs.node_id).value <= 0.8 {
+                        if let Err(reason) =
+                            mycelium_crypto::emergency::verify_cosigner(cs, Some(key), &ctx)
+                        {
                             debug!(
-                                "Emergency co-signer {} verified but not trusted above 0.8",
-                                cs.node_id
+                                "Emergency co-signature from {} not counted: {:?}",
+                                cs.node_id, reason
                             );
                             continue;
                         }
@@ -4234,7 +4464,7 @@ impl Node {
                              and trusted (need 3)",
                             envelope.source,
                             valid,
-                            cosigners.len()
+                            broadcast.cosigners.len()
                         );
                     }
                     valid >= 3
@@ -4246,37 +4476,51 @@ impl Node {
         if !accepted {
             debug!(
                 "Emergency broadcast from {} rejected: level={:?}, sender_trust={:.2}",
-                envelope.source, level, sender_trust
+                envelope.source, broadcast.level, sender_trust
             );
             return;
         }
 
-        let message_text = String::from_utf8_lossy(&message_bytes).to_string();
-        info!(
-            "Emergency broadcast accepted: level={:?}, from={}, msg={}",
-            level, envelope.source, message_text
+        // Accepted — and only now remembered, so that a copy we refused can
+        // never stand in for one we would have taken.
+        let copy = seen.write().await.accept(
+            broadcast.level,
+            FloodMark {
+                key: digest,
+                reach,
+                // Hold the entry until this broadcast could no longer be
+                // accepted on its date, whatever the monotonic clock does: a
+                // backward clock correction must not retire the entry while
+                // the alert it covers is still fresh (ADR-013).
+                keep_until: broadcast.signed_at.saturating_add(EMERGENCY_VALIDITY_SECS),
+            },
         );
+        if copy == FloodCopy::Duplicate {
+            // Another copy of the same broadcast was accepted while this one
+            // was being checked; it has already been reported and forwarded.
+            return;
+        }
 
-        // Notify via event
-        let _ = event_tx.send(NodeEvent::EmergencyBroadcast {
-            source: envelope.source,
-            level: level as u8,
-            message: message_text,
-        });
+        if copy == FloodCopy::New {
+            let message_text = String::from_utf8_lossy(&broadcast.message).to_string();
+            info!(
+                "Emergency broadcast accepted: level={:?}, from={}, msg={}",
+                broadcast.level, envelope.source, message_text
+            );
+
+            // Notify via event
+            let _ = event_tx.send(NodeEvent::EmergencyBroadcast {
+                source: envelope.source,
+                level: broadcast.level as u8,
+                message: message_text,
+            });
+        }
 
         // Flood to all peers (bypass AODV routing for all emergency levels),
-        // never back to the hop it came from.
-        if envelope.ttl > 0 {
-            let mut fwd = envelope.clone();
-            fwd.forward();
-            let fwd_data = fwd.serialize();
-            let peers = transport_manager.known_peers().await;
-            for p in peers {
-                if p != envelope.source && p != local_id && p != peer {
-                    let _ = transport_manager.send(&p, &fwd_data).await;
-                }
-            }
-        }
+        // never back to the hop it came from. `FloodCopy::Further` lands here
+        // too: same alert, more reach, so it travels on without being
+        // reported a second time.
+        Self::flood_onward(envelope, peer, local_id, transport_manager).await;
     }
 
     // --- Receipt handler ---
@@ -4668,6 +4912,29 @@ mod tests {
         assert_ne!(
             text,
             build_ad(b, a, content_type_to_byte(ContentType::Text))
+        );
+    }
+
+    /// Age-based eviction is only safe while a forgotten entry cannot be one
+    /// whose broadcast would still be accepted. That holds exactly when the
+    /// dedup TTL covers the whole window in which a broadcast is fresh:
+    /// `EMERGENCY_VALIDITY_SECS` back, plus the clock skew a receiver
+    /// tolerates forward (T-36, ADR-013).
+    ///
+    /// The entry's `keep_until` enforces the same thing against a wall clock
+    /// that moves, so this is belt and braces: it is what keeps retention
+    /// right when the two clocks agree, which is the ordinary case.
+    ///
+    /// If either constant moves, this is the relationship that has to be
+    /// re-established — the previous code cleared the set wholesale, which
+    /// broke it unconditionally.
+    #[test]
+    fn test_emergency_dedup_outlives_the_freshness_window() {
+        assert!(
+            EMERGENCY_DEDUP_TTL
+                > Duration::from_secs(EMERGENCY_VALIDITY_SECS + EMERGENCY_MAX_CLOCK_SKEW_SECS),
+            "a dedup entry must outlive every broadcast it could be about, \
+             strictly, since the freshness bound is evaluated in whole seconds"
         );
     }
 }

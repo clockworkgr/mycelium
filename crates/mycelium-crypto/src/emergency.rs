@@ -1,51 +1,82 @@
-//! Level-3 emergency co-signature construction and verification.
+//! Emergency broadcast identity, co-signatures and freshness.
 //!
 //! A level-3 broadcast floods the entire mesh and bypasses routing rules
 //! (MYCELIUM_SPEC.md §9.5), so it requires three co-signers the receiver
 //! trusts above 0.8. Carrying bare NodeIds proved nothing: anyone could list
 //! three trusted ids they did not control. Co-signers now sign the broadcast
 //! and the receiver verifies every signature (ROADMAP T-05, ADR-010).
+//!
+//! The digest those signatures cover also *identifies* the broadcast, so the
+//! receiver keys flood dedup on it rather than on the envelope's cleartext
+//! `message_id` (ADR-013), and it includes `signed_at` so a captured alert
+//! stops being acceptable once `EMERGENCY_VALIDITY_SECS` has passed
+//! (ROADMAP T-36).
 
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use mycelium_protocol::types::{MessageId, NodeId};
-use mycelium_protocol::wire::{EmergencyCosigner, EmergencyLevel, EMERGENCY_COSIGN_CONTEXT};
+use mycelium_protocol::wire::{EmergencyCosigner, EmergencyLevel, EMERGENCY_BROADCAST_CONTEXT};
 
 use crate::identity::{node_id_from_public_key, Identity};
 
-/// The bytes a co-signer signs.
+/// How long an emergency broadcast stays acceptable after it was raised.
 ///
-/// Binds the approval to **this** broadcast: its id, the originator, the level
-/// and the exact message. Without the id, an intercepted critical alert could
-/// be re-flooded under a fresh envelope id indefinitely — the content-only
-/// digest would still verify, and the receiving node's dedup set is keyed on
-/// the envelope id it no longer matches.
-pub fn cosign_digest(
-    broadcast_id: &MessageId,
-    originator: &NodeId,
-    level: EmergencyLevel,
-    message: &[u8],
-) -> [u8; 32] {
+/// It bounds replay: a captured alert is refused once it has passed, which is
+/// what lets the flood-dedup set evict entries by age instead of keeping
+/// every id it has ever seen. Same value as a DHT record's TTL (ADR-011).
+pub const EMERGENCY_VALIDITY_SECS: u64 = 3600;
+
+/// How far ahead of the local clock a broadcast may be dated.
+///
+/// Covers ordinary clock skew without letting an originator park an alert
+/// that outlives every honest one (ADR-011's rule for signed records).
+pub const EMERGENCY_MAX_CLOCK_SKEW_SECS: u64 = 300;
+
+/// What identifies one emergency broadcast.
+///
+/// Every field is covered by the digest, so a copy differing in any of them
+/// is a different broadcast — to a co-signature and to flood dedup alike.
+#[derive(Debug, Clone, Copy)]
+pub struct BroadcastContext<'a> {
+    /// The envelope's `message_id`. Not repeated in the body.
+    pub broadcast_id: &'a MessageId,
+    pub originator: &'a NodeId,
+    pub level: EmergencyLevel,
+    /// Unix seconds at which the originator raised the alert.
+    pub signed_at: u64,
+    pub message: &'a [u8],
+}
+
+/// The digest that identifies a broadcast: what a co-signer signs, and what a
+/// receiver keys flood dedup on.
+///
+/// Binds the approval to **this** broadcast: its id, the originator, the
+/// level, when it was raised and the exact message.
+///
+/// - **`broadcast_id`** stops an approval being lifted onto another alert.
+/// - **`originator`** stops it being reused by a different sender.
+/// - **`level`** stops a level-1 approval being promoted to level 3.
+/// - **`signed_at`** bounds replay in time. Without it a captured alert
+///   verified forever, and the only thing standing between it and a second
+///   mesh-wide flood was a dedup set that cleared itself at 10 000 entries.
+/// - **`message_len`** before `message` stops a length-extension ambiguity
+///   between two broadcasts whose concatenated fields coincide.
+pub fn broadcast_digest(ctx: &BroadcastContext<'_>) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(EMERGENCY_COSIGN_CONTEXT);
-    hasher.update(broadcast_id.as_bytes());
-    hasher.update(originator.as_bytes());
-    hasher.update([level as u8]);
-    hasher.update((message.len() as u32).to_le_bytes());
-    hasher.update(message);
+    hasher.update(EMERGENCY_BROADCAST_CONTEXT);
+    hasher.update(ctx.broadcast_id.as_bytes());
+    hasher.update(ctx.originator.as_bytes());
+    hasher.update([ctx.level as u8]);
+    hasher.update(ctx.signed_at.to_le_bytes());
+    hasher.update((ctx.message.len() as u32).to_le_bytes());
+    hasher.update(ctx.message);
     hasher.finalize().into()
 }
 
 /// Co-sign a level-3 broadcast.
-pub fn cosign(
-    signer: &Identity,
-    broadcast_id: &MessageId,
-    originator: &NodeId,
-    level: EmergencyLevel,
-    message: &[u8],
-) -> EmergencyCosigner {
-    let digest = cosign_digest(broadcast_id, originator, level, message);
+pub fn cosign(signer: &Identity, ctx: &BroadcastContext<'_>) -> EmergencyCosigner {
+    let digest = broadcast_digest(ctx);
     EmergencyCosigner {
         node_id: signer.node_id(),
         signature: signer.sign(&digest).to_bytes(),
@@ -75,10 +106,7 @@ pub enum CosignerRejection {
 pub fn verify_cosigner(
     cosigner: &EmergencyCosigner,
     identity_key: Option<[u8; 32]>,
-    broadcast_id: &MessageId,
-    originator: &NodeId,
-    level: EmergencyLevel,
-    message: &[u8],
+    ctx: &BroadcastContext<'_>,
 ) -> Result<(), CosignerRejection> {
     let key = identity_key.ok_or(CosignerRejection::UnknownIdentityKey)?;
 
@@ -91,11 +119,35 @@ pub fn verify_cosigner(
     let verifying =
         VerifyingKey::from_bytes(&key).map_err(|_| CosignerRejection::MalformedIdentityKey)?;
     let signature = Signature::from_bytes(&cosigner.signature);
-    let digest = cosign_digest(broadcast_id, originator, level, message);
+    let digest = broadcast_digest(ctx);
 
     verifying
         .verify(&digest, &signature)
         .map_err(|_| CosignerRejection::BadSignature)
+}
+
+/// Why a broadcast was refused on its date.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshnessRejection {
+    /// Dated further ahead than `EMERGENCY_MAX_CLOCK_SKEW_SECS`.
+    FromFuture,
+    /// Raised more than `EMERGENCY_VALIDITY_SECS` ago.
+    Expired,
+}
+
+/// Bound a broadcast's `signed_at` against the local clock.
+///
+/// Both ends matter. Without the upper bound an attacker could post-date a
+/// captured alert and have it outlive every honest one; without the lower
+/// bound a year-old alert, co-signatures and all, would still verify.
+pub fn check_freshness(signed_at: u64, now: u64) -> Result<(), FreshnessRejection> {
+    if signed_at > now.saturating_add(EMERGENCY_MAX_CLOCK_SKEW_SECS) {
+        return Err(FreshnessRejection::FromFuture);
+    }
+    if now > signed_at.saturating_add(EMERGENCY_VALIDITY_SECS) {
+        return Err(FreshnessRejection::Expired);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -118,29 +170,28 @@ mod tests {
         }
     }
 
+    impl Fixture {
+        fn ctx(&self) -> BroadcastContext<'_> {
+            BroadcastContext {
+                broadcast_id: &self.broadcast_id,
+                originator: &self.originator,
+                level: EmergencyLevel::Critical,
+                signed_at: 1_762_000_000,
+                message: &self.message,
+            }
+        }
+    }
+
     fn verify(
         f: &Fixture,
         cs: &EmergencyCosigner,
         key: Option<[u8; 32]>,
     ) -> Result<(), CosignerRejection> {
-        verify_cosigner(
-            cs,
-            key,
-            &f.broadcast_id,
-            &f.originator,
-            EmergencyLevel::Critical,
-            &f.message,
-        )
+        verify_cosigner(cs, key, &f.ctx())
     }
 
     fn sign(f: &Fixture) -> EmergencyCosigner {
-        cosign(
-            &f.signer,
-            &f.broadcast_id,
-            &f.originator,
-            EmergencyLevel::Critical,
-            &f.message,
-        )
+        cosign(&f.signer, &f.ctx())
     }
 
     #[test]
@@ -175,66 +226,71 @@ mod tests {
         );
     }
 
-    /// A signature must not transfer to another message, level or originator.
+    /// A signature must not transfer to another message, level, originator or
+    /// time.
     #[test]
     fn test_signature_is_bound_to_the_broadcast() {
         let f = setup();
         let cs = sign(&f);
         let key = Some(f.signer.public_key_bytes());
+        let other = Identity::generate().node_id();
 
-        assert_eq!(
-            verify_cosigner(
-                &cs,
-                key,
-                &f.broadcast_id,
-                &f.originator,
-                EmergencyLevel::Critical,
-                b"different message"
+        let cases: [(&str, BroadcastContext<'_>); 4] = [
+            (
+                "must not transfer to another message",
+                BroadcastContext {
+                    message: b"different message",
+                    ..f.ctx()
+                },
             ),
-            Err(CosignerRejection::BadSignature),
-            "must not transfer to another message"
-        );
-        assert_eq!(
-            verify_cosigner(
-                &cs,
-                key,
-                &f.broadcast_id,
-                &f.originator,
-                EmergencyLevel::Urgent,
-                &f.message
+            (
+                "must not transfer to another level",
+                BroadcastContext {
+                    level: EmergencyLevel::Urgent,
+                    ..f.ctx()
+                },
             ),
-            Err(CosignerRejection::BadSignature),
-            "must not transfer to another level"
-        );
-        assert_eq!(
-            verify_cosigner(
-                &cs,
-                key,
-                &f.broadcast_id,
-                &Identity::generate().node_id(),
-                EmergencyLevel::Critical,
-                &f.message
+            (
+                "must not transfer to another originator",
+                BroadcastContext {
+                    originator: &other,
+                    ..f.ctx()
+                },
             ),
-            Err(CosignerRejection::BadSignature),
-            "must not transfer to another originator"
-        );
+            (
+                "must not transfer to another signing time",
+                BroadcastContext {
+                    signed_at: f.ctx().signed_at + 1,
+                    ..f.ctx()
+                },
+            ),
+        ];
+
+        for (why, ctx) in cases {
+            assert_eq!(
+                verify_cosigner(&cs, key, &ctx),
+                Err(CosignerRejection::BadSignature),
+                "{why}"
+            );
+        }
     }
 
     /// An intercepted critical alert must not be re-floodable under a fresh
-    /// envelope id: the receiver's dedup set is keyed on that id, so a
+    /// envelope id: the receiver's dedup set is keyed on the digest, so a
     /// content-only digest would let the same approval be replayed forever.
     #[test]
     fn test_signature_cannot_be_replayed_under_a_new_broadcast_id() {
         let f = setup();
         let cs = sign(&f);
+        let other_id = MessageId::random();
         assert_eq!(
             verify_cosigner(
                 &cs,
                 Some(f.signer.public_key_bytes()),
-                &MessageId::random(),
-                &f.originator,
-                EmergencyLevel::Critical,
-                &f.message
+                &BroadcastContext {
+                    broadcast_id: &other_id,
+                    ..f.ctx()
+                }
             ),
             Err(CosignerRejection::BadSignature),
             "a co-signature must not verify for a different broadcast id"
@@ -250,5 +306,47 @@ mod tests {
             verify(&f, &cs, Some(f.signer.public_key_bytes())),
             Err(CosignerRejection::IdentityMismatch)
         );
+    }
+
+    /// The freshness window is what makes age-based dedup eviction safe: once
+    /// a broadcast is outside it, forgetting its digest costs nothing.
+    #[test]
+    fn test_freshness_bounds_both_ends() {
+        let now = 1_762_000_000;
+        assert_eq!(check_freshness(now, now), Ok(()));
+        assert_eq!(
+            check_freshness(now + EMERGENCY_MAX_CLOCK_SKEW_SECS, now),
+            Ok(()),
+            "skew up to the tolerance is accepted"
+        );
+        assert_eq!(
+            check_freshness(now + EMERGENCY_MAX_CLOCK_SKEW_SECS + 1, now),
+            Err(FreshnessRejection::FromFuture)
+        );
+        assert_eq!(
+            check_freshness(now - EMERGENCY_VALIDITY_SECS, now),
+            Ok(()),
+            "exactly at the validity edge is still acceptable"
+        );
+        assert_eq!(
+            check_freshness(now - EMERGENCY_VALIDITY_SECS - 1, now),
+            Err(FreshnessRejection::Expired)
+        );
+    }
+
+    /// A clock before 1970, or a `signed_at` near `u64::MAX`, must not panic
+    /// or wrap into acceptance.
+    #[test]
+    fn test_freshness_saturates_at_the_extremes() {
+        assert_eq!(check_freshness(0, 0), Ok(()));
+        assert_eq!(
+            check_freshness(u64::MAX, 0),
+            Err(FreshnessRejection::FromFuture)
+        );
+        assert_eq!(
+            check_freshness(0, u64::MAX),
+            Err(FreshnessRejection::Expired)
+        );
+        assert_eq!(check_freshness(u64::MAX, u64::MAX), Ok(()));
     }
 }

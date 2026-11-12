@@ -29,7 +29,13 @@ pub async fn broadcast(
     })?;
 
     let message_id = MessageId::random();
-    let payload = wire::serialize_emergency_broadcast(level, req.message.as_bytes(), &[]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // `signed_at` is what bounds replay of this alert at every receiver, and
+    // it is covered by any co-signature collected over it (ADR-013).
+    let payload = wire::serialize_emergency_broadcast(level, now, req.message.as_bytes(), &[]);
 
     let envelope = Envelope {
         source: state.node.node_id,
@@ -39,10 +45,7 @@ pub async fn broadcast(
         hop_count: 0,
         flags: MessageFlags::NONE,
         lamport_clock: 0,
-        device_timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        device_timestamp: now,
         protocol_version: ProtocolVersion::CURRENT,
         payload,
     };

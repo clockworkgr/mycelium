@@ -1,6 +1,6 @@
 # Mycelium Roadmap
 
-**Last updated:** 2026-11-11 · **Current version:** 0.1 (pre-release)
+**Last updated:** 2026-11-12 · **Current version:** 0.1 (pre-release)
 
 The companion document is [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md), which
 specifies the protocol and describes what is built. This document tracks only
@@ -9,12 +9,11 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-11 against the working tree, after the T-06/07/09/10/11
-work:
+Verified on 2026-11-12 against the working tree, after the T-36 work:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **397 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **423 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -50,15 +49,42 @@ shipped and claimed to work.
 ADR-009), T-07 (ratchet/chain durability + zeroization), T-09 (authenticated
 internet transport, binary framing, signed DHT records, ADR-011), T-10
 (discovery timeout on its own sweep, one attempt per destination), T-11
-(origin-aware DTN eviction, persisted origin + spray history). Seven tasks
-remain below. Three of them came out of reviewing T-09's ADRs against the
-code: T-34 is the defect T-09 fixed, still open on the local transports, and
-T-35 and T-36 are defects in the T-06 and T-05 work that the ADRs' own claims
-turned out not to hold.
+(origin-aware DTN eviction, persisted origin + spray history).
+
+**Landed 2026-11-12:** T-36 (emergency broadcasts are checked before they are
+remembered, keyed on their digest, bounded in time by a signed `signed_at`,
+and the flood-dedup set expires by age instead of clearing itself — ADR-013).
+T-35's bookkeeping half landed the day before (ADR-012); what remains of it is
+below.
+
+T-34, T-35, T-37 and T-38 came out of reviewing ADRs against the code: T-34 is
+the defect T-09 fixed, still open on the local transports; T-35 is a defect in
+the T-06 work; T-37 is what reviewing ADR-010 during T-36 turned up next — an
+emergency broadcast's origin is not authenticated at all; and T-38 is how
+capacity eviction undoes the rollback protection ADR-011 claims.
+
+**Decided 2026-11-12, not yet implemented.** Every P0 below now has its design
+on record: T-37 (ADR-014), T-35's remainder (ADR-015), T-38 (ADR-016), T-14's
+row identity (ADR-017), T-01 (ADR-018), T-04 (ADR-019), T-08 (ADR-020) and
+T-34 (ADR-021). Each ADR names the task that implements it and flips its own
+status in that commit; the acceptance criteria below carry the decisions.
+
+Planned order: **T-37, then T-35, then T-38**, with T-14's migration after —
+by severity, since anyone holding the group seed phrase can inject a mesh-wide
+alert today, while T-35's residual costs one discarded handshake. The remaining
+four (T-01, T-04, T-08, T-34) are designed but unsequenced.
+
+Two standing rules from those decisions: constants are **shapes now, numbers
+later** — the DHT publisher quota, the level-1/2 reach limits and the dedup
+retention period are to be measured against the testbed (T-19) or hardware
+(T-15), not guessed; and the radio features (T-04, T-34) keep "Implemented,
+untested on hardware" until T-15's report, however complete the software
+tests are.
 
 ### T-01 · FFI robustness
 
-**Area:** `mycelium-ffi` · **Spec:** §17.2
+**Area:** `mycelium-ffi` · **Spec:** §17.2 · **ADR-018** (design decided
+2026-11-12)
 
 Four distinct problems in the FFI layer, all of which can crash or hang the
 mobile app:
@@ -79,8 +105,11 @@ in Dart rather than through generated bindings, so a signature change will fail
 at runtime instead of at build time.
 
 **Acceptance:**
-- Every `extern "C"` function body is inside `catch_unwind`; a panic returns the
-  error code and sets `last_error` instead of unwinding.
+- Every `extern "C"` function body is inside `catch_unwind`, applied by one
+  macro rather than hand-written per function; a panic stores its message in
+  the existing `LAST_ERROR` channel and returns the failure value for that
+  signature — negative for `i32`, null for a pointer, false for a bool. The
+  process is **not** aborted (ADR-018).
 - A re-entrancy guard makes an FFI call from a runtime thread return an error
   rather than deadlock.
 - `mycelium_set_node_display_name` either updates the running node's display
@@ -89,21 +118,32 @@ at runtime instead of at build time.
 - The handle is reference-counted; `node_free` on an outstanding reference is
   safe.
 - `dart run ffigen` regenerated; no hand-written FFI lookups remain.
-- A test asserts that a deliberately panicking path returns an error code.
+- A test per return shape asserts that a deliberately panicking path returns
+  that shape's sentinel and leaves a readable message: a guard that is never
+  exercised is not a guard.
 
 ### T-04 · Group-discovery proof of possession
 
-**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §10.2
+**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §10.2 · **ADR-019**
+(design decided 2026-11-12)
 
 The seed-phrase group hash is 8 cleartext bytes in a beacon, and matching it
 earns an automatic vouch. Anyone who overhears one beacon can replay the hash
 and be auto-trusted by the whole group — which collapses the Sybil defence
 (§6.2) for exactly the population that onboarding is meant to protect.
 
-**Acceptance:**
-- Auto-vouch requires a challenge/response proving possession of the derived
-  key, not merely knowledge of its prefix.
-- A replayed beacon hash alone never produces a vouch.
+**Acceptance** (design per ADR-019):
+- A beacon match is a hint, not a credential. The verifier sends a fresh nonce
+  and the peer must return
+  `HMAC(group_discovery_key, nonce ‖ verifier_id ‖ responder_id)`; the vouch
+  happens only on a correct response. Both ids are in the MAC so a response
+  cannot be lifted into another pairing.
+- The beacon hash itself stays static — a rotating hint would not prove
+  possession and adds a bucket constant and a clock to agree on.
+- Two new payload types, each rate-limited per peer, since answering a
+  challenge is work a stranger can ask for.
+- The group key's two uses (discovery hash, challenge MAC) are
+  domain-separated.
 - Test: a node that knows only a captured hash fails the exchange; a node with
   the passphrase succeeds.
 
@@ -132,31 +172,48 @@ level 3 is unavailable until this is built.
   message, since a co-signer is vouching for a mesh-wide flood.
 - `POST /v1/emergency/broadcast` accepts or gathers co-signatures for level 3
   and returns a clear error when fewer than three are obtained.
+- The originator signs the broadcast **including** its co-signer list, so a
+  relay can neither strip approvals a downstream node could have verified nor
+  pad the list; flood-dedup identity then covers the approvals (ADR-013,
+  T-37). Without this, a relay can forward a weaker approval set than it
+  received and a receiver cannot tell an approval it cannot verify from one
+  invented on the spot.
 - An end-to-end test: four nodes, three approve, the flood is accepted; with
   two approvals it is refused everywhere.
 
 ### T-08 · Identity key at rest
 
-**Area:** `mycelium-daemon`, `mycelium-ffi`, platform · **Spec:** §5.7, §14.5, §22
+**Area:** `mycelium-daemon`, `mycelium-ffi`, platform · **Spec:** §5.7, §14.5,
+§22 · **ADR-020** (design decided 2026-11-12)
 
 `<data_dir>/identity.key` is plaintext at mode 0600, and the SQLCipher database
 key is `SHA-256(b"mycelium-db-key:" ‖ identity_bytes)`. One file read therefore
 yields the identity *and* every stored message. Encryption at rest currently
 protects against nothing an attacker with filesystem access cannot bypass.
 
-**Acceptance:**
+**Acceptance** (designs per ADR-020):
 - On mobile the identity key is held in Android Keystore / iOS Keychain and
   never written to the app's data directory.
-- On desktop/OpenWRT, where no keystore exists, the key is encrypted with a
-  user-supplied passphrase or the limitation is documented explicitly in the
-  spec's threat model.
-- The database key is derived through a KDF that does not expose the identity
-  key if the database key leaks.
-- A migration moves existing plaintext identities without data loss.
+- On desktop and OpenWRT the OS keyring holds it where one exists (Secret
+  Service, macOS Keychain), and a passphrase supplied at start where one does
+  not — with no plaintext fallback, since a fallback is what everything would
+  use. The daemon refuses to run without one.
+- The database has its **own random key**, stored wrapped by the same keystore,
+  keyring or passphrase. Neither key is a function of the other, so a leak of
+  one yields nothing about the other and the database can be rekeyed without
+  touching the identity.
+- **No migration.** A data directory written by an older build is refused with
+  a message saying to re-onboard; the protocol is `0.1-draft` with no deployed
+  nodes, and an in-place re-encryption would hold two copies of a secret on
+  disk at the riskiest moment for data that exists only on developer machines.
+  Revisit when a node first runs on someone else's device.
+- The threat model says plainly that a keyring unlocked by the login session
+  protects against a stolen disk, not against code running as that user.
 
 ### T-34 · Local transport peer identity is asserted, not proved
 
-**Area:** `mycelium-core`, Android Kotlin, iOS Swift · **Spec:** §8.4, §22
+**Area:** `mycelium-core`, Android Kotlin, iOS Swift · **Spec:** §8.4, §22 ·
+**ADR-011**, **ADR-021** (design decided 2026-11-12)
 
 The BLE Node ID characteristic (`…7891`) serves a bare 32-byte NodeId and the
 Identity characteristic (`…7894`) takes one; Wi-Fi Direct's `Hello` exchanges
@@ -176,18 +233,27 @@ accepting one. The local transports need it in a form their platform layers can
 carry — the Identity characteristic becomes a key plus a signature over a
 channel-binding value rather than an id.
 
-**Acceptance:**
-- A peer's NodeId is derived from a proved identity key on BLE and Wi-Fi
-  Direct; no code path installs a peer from an asserted id.
-- The proof is bound to the connection, so a replayed identity frame
-  authenticates nobody.
+**Acceptance** (designs per ADR-021):
+- ADR-011's authenticated-channel handshake runs over the local transports'
+  fragmentation layer, rather than a second BLE-shaped proof: one proof format
+  and one implementation across BLE, Wi-Fi Direct and internet.
+- A peer's NodeId is derived from the proved identity key; `…7891` stops being
+  an input and no code path installs a peer from an asserted id. Wi-Fi Direct's
+  `Hello` is removed rather than left as a weaker second path.
+- The Rust side and both platform bridges land in **one task**, so there is no
+  build where a peer is installed from an asserted id and no flag to remember
+  to flip. The bridges stop reporting a discovered peer by id and must rebuild
+  their address-to-peer bookkeeping around a handshake that completes later.
 - Test: a peer that replays a captured identity exchange installs no transport
   peer and no route; one that holds the key succeeds.
-- Spec §8.4 and §22 updated, and an ADR for the local-transport handshake.
+- Spec §8.4 and §22 updated. The marker stays "Implemented, untested on
+  hardware" until T-15's report — the handshake has to survive real
+  reassembly and reconnection churn before it can claim more.
 
 ### T-35 · Unconfirmed-handshake bookkeeping is not maintained
 
-**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §5.2, §14.3 · **ADR-009**
+**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §5.2, §14.3 ·
+**ADR-009**, **ADR-012**, **ADR-015** (design decided 2026-11-12)
 
 A `SessionReject` is unauthenticated, and ADR-009 bounds the damage by acting
 only on an *unconfirmed* handshake: the worst a forgery should achieve is one
@@ -250,49 +316,126 @@ initiator will act on: accept the altered copy, then replay the original.
    lost on restart, so a discarded init can be replayed afterwards for an
    actionable rejection. The evidence has to outlive both.
 
-**Acceptance:**
-- An init that a responder would treat as equivalent to another cannot be given
-  a second identity: the raw ephemeral is bound cryptographically, with a
-  reciprocal-key regression test.
-- A one-time prekey is spent only once the first message has authenticated, and
-  an unknown nested payload type is refused.
-- Replay suppression for accepted *and* discarded inits survives a restart and
-  does not depend on the initiation timer.
+**Acceptance** (designs per ADR-015):
+- The raw init header's bytes are an input to the X3DH key derivation, so a
+  copy carrying an equivalent ephemeral (`u⁻¹ mod p`) derives a different key
+  and its first message does not decrypt. Regression test: `u` and `u⁻¹` must
+  not both work.
+- A one-time prekey is retired only once the enclosed first message
+  authenticates; a message-less init that would spend one is refused, as is an
+  unknown nested payload type.
+- A rejection is sent only when no session with that peer exists, which
+  replaces the 60-second initiation timer and survives a restart because
+  sessions are persisted. The cost is accepted: a stale session plus a dead
+  bundle recovers by timeout.
 - With all three closed, a forged or provoked `SessionReject` changes nothing:
   no discarded handshake, no dropped bundle, no failed message.
 - Tests for each, delivering the altered copy before the original.
 
-### T-36 · Emergency broadcast dedup suppresses valid alerts and allows replay
+### T-37 · Emergency broadcasts are not origin-authenticated
 
-**Area:** `mycelium-node` · **Spec:** §9.5 · **ADR-010**
+**Area:** `mycelium-node`, `mycelium-protocol` · **Spec:** §9.5 · **ADR-010**,
+**ADR-013**, **ADR-014** (design decided 2026-11-12)
 
-Two defects in the dedup set that guards emergency floods, the one message
-type that bypasses routing limits:
+Two related defects, found while fixing T-36:
 
-1. The `message_id` is inserted **before** the trust threshold and
-   co-signature checks. A `message_id` is cleartext in every envelope, so any
-   node that relays a legitimate critical alert can immediately send a bogus
-   copy carrying the same id; the real alert then arrives and is dropped as a
-   duplicate. One unverifiable packet suppresses a verified mesh-wide alert.
-2. At 10 000 entries the set is **cleared wholesale**. A captured,
-   correctly-signed critical alert can then be flooded again under its
-   original id and will be accepted, because the signed digest
-   (`broadcast_id ‖ originator ‖ level ‖ message`) has no freshness bound. An
-   attacker can force the clear by flooding distinct ids first.
-
-Found while reviewing ADR-010 against the code during T-09. Related to T-14,
-which covers expiry for the channel-flood dedup set; this one additionally
-needs the verification order fixed and a notion of signed freshness.
+1. **Nothing authenticates the originator.** Levels 1 and 2 carry no signature
+   at all, and `envelope.source` is cleartext and unverified, so any neighbour
+   can emit a level-2 "Urgent" claiming a trusted id. It passes the trust gate,
+   which scores the id in the packet rather than the peer that sent it, and is
+   flooded onward. The sender needs no standing of its own — an unvouched
+   stranger gets five messages an hour from the per-neighbour limit, which is
+   plenty for one alert. Being vouched (by hand, or auto-vouched because its
+   beacon carried a matching group-discovery hash, a hash anyone in range can
+   copy — T-04) removes the bound entirely. Level 3 is bound by its co-signatures, which cover
+   the originator, so this is levels 1 and 2. T-36 stopped a forgery
+   *suppressing* a real alert; it does not stop one being injected.
+2. **The levels do not differ in behaviour at all.** `handle_emergency_broadcast`
+   floods any accepted broadcast to every peer, while spec §9.5 reserves
+   mesh-wide flooding for level 3 and gives level 1 "boosted priority in relay
+   queues" and level 2 "bypasses per-identity rate limits". None of those
+   three distinctions is implemented: every level floods, nothing consults the
+   level when queueing a relay, and the per-originator rate limit is skipped
+   for *all* emergency levels (it is charged only for `EncryptedMessage`,
+   `GroupMessage` and `ChannelMessage`) while the per-neighbour limit applies
+   to all of them. So the only thing a level selects today is its trust
+   threshold. Code and spec disagree; which one is wrong is a design
+   decision, since a level-1 alert addressed to `NodeId::ZERO` reaches nobody
+   without a flood.
 
 **Acceptance:**
-- An id is remembered only after the broadcast verifies, so an invalid copy
-  cannot suppress a valid alert with the same id.
-- Accepted ids are retained for as long as a signed broadcast is considered
-  fresh, with eviction by age rather than by clearing the set.
-- The signed payload carries, or the receiver derives, a freshness bound so a
-  captured alert cannot be replayed indefinitely.
-- Tests: a forged copy with a legitimate id does not suppress the real alert;
-  a replay after eviction pressure is refused.
+- An emergency broadcast carries the originator's `identity_key(32)` and a
+  `signature(64)` over the broadcast digest, at every level. A receiver drops
+  it unless `SHA-256(identity_key) == envelope.source` and the signature
+  verifies, checked *before* the trust gate (ADR-014). Carrying the key is
+  what lets a receiver with no prior contact verify an alert.
+- The signature is over its own digest — `broadcast_digest ‖ cosigner_count ‖
+  each (node_id ‖ signature)` under a distinct context — so the approval set
+  cannot be stripped or padded in flight (ADR-014). Flood dedup stays keyed on
+  `broadcast_digest`, *not* on that digest: keying on it would let the
+  originator pad and re-sign one alert into arbitrarily many accepted entries.
+  A copy with a different authenticated approval list is forwarded again only
+  under a bounded counter per `broadcast_digest`. This is the half T-36 could not close: a receiver
+  cannot distinguish an approval it cannot verify from one invented on the
+  spot. No circularity, since a co-signer signs the alert digest and the
+  originator signs last, over the approvals it collected — which means a
+  level-3 alert cannot be signed until T-05's collection has finished.
+- An originator with no identity cannot raise an alert, and the API refuses to
+  send one rather than sending what no receiver will take.
+- Each level's behaviour matches spec §9.5: level 1 gets relay-queue priority
+  and a reach below a flood, level 2 is exempt from the per-originator rate
+  limit (and only level 2), level 3 is the only level that floods mesh-wide
+  (ADR-014). That needs a per-level reach limit rather than the single
+  `MAX_FLOOD_TTL` clamp, and a priority notion in the relay path.
+- Tests: a level-2 alert forged under a trusted id is dropped; a genuine one
+  is accepted; the flood scope per level is asserted.
+
+---
+
+### T-38 · DHT record eviction undoes the rollback protection
+
+**Area:** `mycelium-core` · **Spec:** §8.4 · **ADR-011**, **ADR-016**
+(design decided 2026-11-12)
+
+ADR-011 states that a replayed old address cannot displace a current one:
+`store_record` refuses a record no newer than the one it holds. That rule
+depends on *holding* the current record, and capacity eviction throws it away.
+At `max_records` the store drops whatever is closest to expiring and admits
+the newcomer, so a peer can fill it with records for identities it generates
+itself — a record is self-signed, and identities are free — evict a victim's
+current record, and then replay that victim's older, still-fresh record. It is
+accepted, and lookups answer with the stale address.
+
+The consequence is the one ADR-011 exists to prevent: traffic for the victim
+sent to an address it no longer holds, chosen by the attacker.
+
+Found by reviewing ADR-011 against the code during T-36. The eviction policy
+and the rollback rule need to be reconciled: a high-water mark per NodeId that
+outlives the record, admission bounded per publisher so one identity cannot
+fill the store, or both.
+
+**Acceptance** (designs per ADR-016 — both halves, not either):
+- A record for a wildcard address (`0.0.0.0`, `::`) is refused in
+  `store_record`, not only in the publish path. Today the internet transport
+  declines to sign one while a peer's correctly signed wildcard record is
+  admitted and served to `FindValue`, where nothing can dial it (ADR-011's
+  appended note).
+- A persisted `NodeId → newest published_at` table outlives the record, so a
+  record older than one ever held for that id is refused whether or not that
+  record is still resident. **A mark inside the replay window is never
+  evicted**: when the table is full, a publisher it has never seen is refused
+  instead. That inversion is the decision, because identities are free — a
+  per-publisher quota does not survive an attacker rotating keypairs, and an
+  evictable table inherits the attack it was meant to stop. Test rotating
+  publishers explicitly.
+- Admission is still bounded per publisher, as fairness rather than as the
+  rollback defence: one identity must not crowd out records for peers the node
+  actually talks to.
+- Admission order is fixed and each refusal is tested: signature and NodeId
+  binding, freshness, wildcard address, high-water mark, publisher quota,
+  capacity.
+- Tests: eviction pressure followed by a replay of an evicted record is
+  refused; a store filled by one publisher still admits records from others.
 
 ---
 
@@ -479,13 +622,43 @@ connections, not how it authenticates them.
 `NodeEvent` has no channel variant, so an incoming channel message reaches API
 clients as `MessageReceived` — a direct message from the channel poster. The
 WebSocket `channel_message` event exists but is not fed from the receive path
-for relayed channel traffic. Separately, channel flood dedup never expires by
-time, so the dedup set grows without bound on a long-lived supernode.
+for relayed channel traffic. Channel flood dedup no longer grows without
+bound: entries expire by age and the set evicts its oldest rather than
+clearing itself (landed 2026-11-12 with T-36, ADR-013).
+
+Separately, `store_channel_message` is an `INSERT OR IGNORE` keyed on the
+envelope's `message_id`. A forged copy stored first therefore keeps the row,
+and the genuine message's content never appears in local history — even though
+the flood now carries it onward, because dedup is keyed on a digest of the
+message rather than its id. This half is a suppression defect of the same
+class as T-36 and is worth weighing as P0 when this task is scheduled; it is
+bounded only by channel messages being unauthenticated in the first place, so
+anyone can post anything under any source id.
+
+The handler also discards the result of `store_channel_message`, so a storage
+failure is silent: a message for a channel whose `channels` row is missing
+hits the foreign key and vanishes with nothing in the logs. Not reachable
+through the REST API, which calls `ensure_channel_exists` before subscribing.
+
+And because a channel message carries no signed date, its dedup entry is a
+plain 900 s bound rather than a validity window (ADR-013): once it expires the
+same captured message is accepted, reported to API clients and flooded again.
+A freshness bound a relay can rewrite is not a bound, so this needs the
+originator signature too.
 
 **Acceptance:**
 - `NodeEvent::ChannelMessageReceived` exists and drives the WebSocket
   `channel_message` event; channel traffic never appears as a direct message.
-- Flood dedup entries expire on a time basis with a bounded set size.
+- ~~Flood dedup entries expire on a time basis with a bounded set size.~~
+  Landed 2026-11-12 with T-36.
+- A channel message carries an originator signature, so a captured one cannot
+  be re-flooded after its dedup entry expires and a forged one cannot be
+  stored at all. This is the piece the other two bullets defer to.
+- A stored channel message's primary key is the digest its flood is keyed on,
+  with the envelope `message_id` kept as a column and a migration for existing
+  rows (ADR-017). Channel origin authentication is deliberately *not* part of
+  this: it needs the key-availability design ADR-014 settles for emergencies,
+  and is its own task.
 - Test: a relayed channel message produces a `channel_message` event and no
   `message` event.
 

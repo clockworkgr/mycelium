@@ -282,7 +282,7 @@ defined.
 | `0x81` | `ChannelSubscribe` | 32 | Channel subscription announcement |
 | `0x82` | `ChannelUnsubscribe` | 32 | Channel unsubscription |
 | `0x83` | `ChannelModeration` | 65 | Signed moderation action |
-| `0x90` | `EmergencyBroadcast` | 2 | Tiered emergency alert |
+| `0x90` | `EmergencyBroadcast` | 14 | Tiered emergency alert: level + `signed_at` + message + co-signatures (§9.5, ADR-013) |
 
 `SenderKeyDistribution` (`0x71`) is valid **only** as the plaintext of a
 pairwise `EncryptedMessage` carrying the `SYSTEM` flag. A bare `0x71` envelope
@@ -960,9 +960,10 @@ lost the tie-break never rewrites the contact of the one that was kept.
 `SHA-256(public_key)`. A record is refused if the signature fails, if it is
 dated more than 300 s ahead, if it is older than the 3600 s TTL, if it is no
 newer than one already held (so a replayed older record cannot roll an address
-back), or if the store is full. The store is capped at 4096 records, swept of
-expired entries before each insert, and evicts the entry closest to expiry when
-at capacity. A record found over the network is subjected to the same checks
+back *while that record is held* — see ROADMAP T-38, since capacity eviction
+discards what the rule compares against), or if the store is full. The store is
+capped at 4096 records, swept of expired entries before each insert, and evicts
+the entry closest to expiry when at capacity. A record found over the network is subjected to the same checks
 and returned only if they pass. A DHT request carries no sender identity: the
 sender is whoever holds that channel's key, and in-flight requests are tracked
 per connection so no peer can answer another's. A node offers its own record to
@@ -1080,7 +1081,11 @@ routing to a destination.
 
 - **Topic channels** — named channels that nodes subscribe to. Subscriptions
   are announced; messages flood to connected peers within TTL, deduplicated by
-  message id.
+  a digest of the message — id, source, channel, content type and body — and
+  not by the envelope id alone, which any relay can copy. A copy that arrives
+  with more remaining TTL than the one already seen is forwarded again, so a
+  spent-TTL copy cannot halt a flood, and a copy addressed to one node rather
+  than to `NodeId::ZERO` is refused (ADR-013).
 - **Regional channels** — **Planned**, dependent on the geographic overlay
   (§7.4).
 - **Moderation** — the creator has moderation powers and can delegate.
@@ -1091,8 +1096,15 @@ routing to a destination.
 Floods skip the originator, ourselves and the previous hop.
 
 **Known gap:** an incoming channel message is reported to API clients as a
-direct message because `NodeEvent` has no channel variant, and flood dedup
-never expires by time. See ROADMAP T-14.
+direct message because `NodeEvent` has no channel variant, and a stored
+channel message is keyed on the envelope's `message_id` under
+`INSERT OR IGNORE`, so a forged copy stored first keeps the row even though
+the flood now carries the genuine message onward. Flood dedup itself expires
+by age with a bounded set (ADR-013), but a channel message carries no signed
+date — `device_timestamp` is a relay's to edit — so its dedup entry is a plain
+900 s bound rather than a validity window: once it expires, a captured message
+is accepted, reported and flooded again. All three need the originator
+signature in ROADMAP T-14.
 
 ### 9.5 Emergency broadcast
 
@@ -1108,21 +1120,85 @@ Thresholds are enforced as specified. Emergency messages carry the sender's
 identity — they are deliberately non-anonymous, for accountability — and a
 false emergency is intended to incur a trust penalty.
 
+**Body.** `level(1) ‖ signed_at(8 LE) ‖ msg_len(4 LE) ‖ message ‖
+cosigner_count(1) ‖ cosigners(N × 96)`, parsed strictly: the length must match
+exactly and the level must be one of the three.
+
 **Co-signatures are verified.** A co-signer entry is
-`node_id(32) + signature(64)`; the signature covers
-`broadcast_id ‖ originator ‖ level ‖ message`, so an approval cannot be
-replayed under a new envelope id, reused by another originator, or promoted to
-a higher level. A receiver counts an entry only when it holds an identity key
-for that NodeId, the key hashes to the id, the signature verifies, and the
-co-signer's trust exceeds 0.8; three distinct such entries are required
-(ADR-010). Identity keys are recorded by the ingress paths that already verify
-them against the NodeId.
+`node_id(32) + signature(64)`; the signature covers the broadcast digest
+
+```
+SHA-256( b"mycelium-emergency-broadcast-v2:"
+       ‖ broadcast_id (16)      // the envelope's message_id
+       ‖ originator  (32)
+       ‖ level        (1)
+       ‖ signed_at    (8 LE)
+       ‖ message_len  (4 LE)
+       ‖ message )
+```
+
+so an approval cannot be replayed under a new envelope id, reused by another
+originator, promoted to a higher level or re-dated. A receiver counts an entry
+only when it holds an identity key for that NodeId, the key hashes to the id,
+the signature verifies, and the co-signer's trust exceeds 0.8; three distinct
+such entries are required, and at most 16 entries reach the trust and
+signature checks — entries whose identity key the receiver does not hold are
+dismissed by an indexed lookup first, so padding a list cannot hide genuine
+approvals behind it (ADR-010, ADR-013). Identity keys are recorded by the
+ingress paths that already verify them against the NodeId.
+
+**Freshness.** A broadcast dated more than 300 s ahead of the receiver's clock,
+or raised more than 3600 s ago, is refused — the rule §8.4 applies to signed
+DHT records, and for the same reasons. This is what bounds replay: a captured
+alert stops verifying, instead of the bound resting on a dedup cache.
+
+**Addressing.** A broadcast whose envelope destination is not `NodeId::ZERO`
+is refused. Such a copy verifies — the destination is in neither the digest
+nor the signatures — but it is not routed away, and forwarding would preserve
+a destination that makes every downstream node unicast it back instead of
+flooding it, leaving the genuine broadcast behind it looking like a duplicate.
+The same rule applies to channel messages (ADR-013).
+
+**Flood dedup.** A broadcast is remembered only **after** it has been
+accepted, and is keyed on the digest above rather than on the envelope's
+cleartext `message_id`. A copy of something already accepted that carries no
+more remaining TTL is dropped before any verification — the entry is proof the
+work was done — while one that reaches further is verified and forwarded
+again, without being reported locally a second time. Remaining TTL is clamped
+to 20 in both directions, which bounds that re-forwarding (though not the
+re-checking) and stops an inflated TTL flooding past the originator's intent.
+
+An entry is dropped by **age** only when both clocks agree it is spent: the
+monotonic retention (3901 s — validity plus skew, plus a second for rounding)
+has elapsed, *and* the wall clock is more than 300 s past the second at which
+its broadcast stops being acceptable. Retention must be monotonic because a
+flood's age is measured from arrival, freshness must be wall-clock because it
+is measured against a time the originator wrote, and expiring on either alone
+lets a clock correction retire an entry whose broadcast is still acceptable —
+a replay — or retire one early. Separately, at **capacity** the oldest eighth
+is evicted rather than the set being cleared; that is the one way a live entry
+can be lost while the node runs, and it is why the sets are kept apart. The
+sets are not persisted, so a restart inside a broadcast's validity window lets
+it be accepted once more. Channel and emergency
+floods use separate sets, and the emergency sets are kept apart per level, so
+neither channel volume nor a cheap level-1 flood can evict a co-signed level-3
+entry. Remembering an id *before* checking the broadcast let one unverifiable
+packet suppress a verified alert; clearing the set let a captured one be
+replayed (ADR-013).
 
 **Known gap:** nothing *collects* co-signatures. There is no request protocol
 and no approval UI, and `POST /v1/emergency/broadcast` sends an empty list, so
 a level-3 broadcast is refused by every receiver. Unusable is the correct
 failure direction for a mesh-wide flood, but level 3 is not available until
 collection exists. See ROADMAP T-05.
+
+**Known gap:** a broadcast is not origin-authenticated. Levels 1 and 2 carry no
+signature of their own, and `envelope.source` is cleartext and unverified, so
+any neighbour can emit a level-2 alert claiming a trusted id: it passes the
+trust gate, bypasses the per-identity rate limit and is flooded. A forgery can
+no longer suppress a real alert (ADR-013), but it can still be injected. The
+handler also floods every accepted level, where the table above reserves
+mesh-wide flooding for level 3. See ROADMAP T-37.
 
 ### 9.6 Multi-device support
 
@@ -1356,7 +1432,7 @@ actions (deliver local bundles, spray copies) and flushes
 | `GroupMessage` | `handle_group_message` | Sender-key decrypt → store |
 | `SenderKeyDistribution` | `install_sender_key` | Install key, merge roster |
 | `ChannelMessage` | `handle_channel_message` | Verify subscription → store → flood |
-| `EmergencyBroadcast` | `handle_emergency` | Trust gate → flood at level 3 |
+| `EmergencyBroadcast` | `handle_emergency_broadcast` | Freshness → trust/co-signature gate → remember → flood |
 
 The checks below are conformance requirements. Each one closes an attack that
 a plain reading of the protocol allows:
@@ -1385,8 +1461,17 @@ a plain reading of the protocol allows:
 - **Sender keys** — only inside pairwise-encrypted `SYSTEM` messages (§4.2).
 - **Rate limiting** — charge a direct neighbour once; charge DTN quota only on
   store; reset violation counters hourly.
-- **Flooding** — channel and emergency floods skip the originator, ourselves
-  and the previous hop; RERR rebroadcasts skip the hop they came from.
+- **Emergency freshness and dedup** — refuse a broadcast dated beyond the
+  300 s skew tolerance or raised more than 3600 s ago; remember it only after
+  it is accepted, keyed on its digest, never on the envelope id (§9.5,
+  ADR-013).
+- **Flooding** — a channel message or emergency broadcast is accepted only
+  when its destination is `NodeId::ZERO`; floods skip the originator,
+  ourselves and the previous hop; RERR rebroadcasts skip the hop they came
+  from. A flood is deduplicated on a digest of the message, entries expire by
+  age rather than the set being cleared, remaining TTL is clamped to 20 on
+  receipt and on forwarding, and a copy that reaches further than the one
+  already seen is forwarded again.
 - **DTN** — a `DtnRelay` for another node always reaches `handle_dtn_relay`,
   which stores it with the wire copies/TTL when no route exists. All three
   local-delivery paths funnel through `finalize_incoming_message()`
@@ -1816,9 +1901,9 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 9.1 | Content types | **Implemented** | All seven |
 | 9.2 | Lamport ordering | **Implemented** | Tick on send, merge on receive |
 | 9.3 | Receipts | **Partial** | Recipient-only, WS push, UI indicators. Dropped when no route exists, so DTN deliveries are never acknowledged (T-27) |
-| 9.4 | Public channels | **Implemented** | Wire types, storage, flooding, 6 REST endpoints, 2 screens. Channel `NodeEvent` + dedup expiry open (T-14) |
+| 9.4 | Public channels | **Implemented** | Wire types, storage, flooding, 6 REST endpoints, 2 screens. Dedup expires by age and is keyed on the message (ADR-013); the channel `NodeEvent` variant is still open (T-14) |
 | 9.4 | Regional channels | **Planned** | Needs the geographic overlay |
-| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified and replay-bound (ADR-010). Nothing collects co-signatures, so level 3 is refused everywhere (T-05) |
+| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, `signed_at` freshness bound, dedup after verification keyed on the digest (ADR-010, ADR-013). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); broadcasts are not origin-authenticated (T-37) |
 | 9.6 | Multi-device / CRDT sync | **Planned** | v0.3 |
 | 10.1 | Beacon | **Implemented** | Node type, battery, neighbour count, group hash; LoRa broadcast |
 | 10.2 | Seed phrase groups | **Partial** | Derivation + beacon match + auto-vouch; no proof of possession (T-04) |

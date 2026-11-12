@@ -145,3 +145,32 @@ key to bind — and it is not a claim about transport peer identity. BLE and Wi-
 of possession (ROADMAP T-34), and the internet transport only began proving it
 in ADR-011. Appended rather than edited in place, because these records are
 append-only.
+
+## Note (2026-11-12)
+
+The digest above is **superseded by ADR-013**, which this record predates.
+Following it as written now produces approvals no receiver will count. What
+changed, and why:
+
+- The context string is `b"mycelium-emergency-broadcast-v2:"`, and the digest
+  includes `signed_at(8 LE)` between `level` and `message_len`. v1 signatures
+  must not be readable as v2 ones, hence the bump.
+- `cosign_digest` is now `broadcast_digest`, because the same digest also
+  *identifies* the broadcast: flood dedup is keyed on it rather than on the
+  envelope's cleartext `message_id`, which any relay can copy.
+- "**`broadcast_id`** stops replay" above is too strong. It stops an approval
+  being transferred to another alert; it does not stop the same alert being
+  re-flooded, because the id is part of what is replayed. `signed_at` and the
+  validity window are what bound replay in time.
+- A receiver counts three distinct valid co-signatures as before, but at most
+  sixteen entries reach the trust and signature checks. Entries it holds no
+  identity key for are dismissed by an indexed lookup first, so a padded list
+  cannot hide genuine approvals behind it.
+- A broadcast is remembered only *after* it has been accepted, and only when
+  its envelope destination is `NodeId::ZERO`.
+
+What ADR-013 does not change: the co-signer entry layout
+(`node_id(32) + signature(64)`), the verification rules per entry, the trust
+threshold, or where identity keys come from.
+
+Appended rather than edited in place, because these records are append-only.

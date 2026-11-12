@@ -25,7 +25,9 @@ Then, as needed:
 3. [`CONTRIBUTING.md`](CONTRIBUTING.md) — build setup, test commands, project
    structure, commit conventions.
 4. [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-001 …
-   ADR-012). Append-only; never rewrite one.
+   ADR-021). Append-only; never rewrite one. ADR-014 … ADR-021 are decided but
+   not yet implemented — one per open P0 — and each names its ROADMAP task and
+   flips its own status in the commit that implements it.
 5. [`docs/plugin-api.md`](docs/plugin-api.md) — transport plugin development
    guide (external audience).
 
@@ -64,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 397 tests).
+- `cargo test` runs the whole workspace (currently 423 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -256,7 +258,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-11: 397 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-12: 423 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -272,7 +274,8 @@ The highest-priority open items (all P0, all defects in shipped features): FFI
 panic guards (`T-01`), group-discovery proof of possession (`T-04`), emergency
 co-signer signatures (`T-05`, wire format and verification landed; collecting
 co-signatures is not built), identity key at rest (`T-08`), BLE/Wi-Fi Direct
-peer identity, which is asserted rather than proved (`T-34`), the
-unconfirmed-handshake bookkeeping a forged `SessionReject` exploits (`T-35`),
-and emergency-broadcast dedup, which lets one unverifiable packet suppress a
-valid alert (`T-36`).
+peer identity, which is asserted rather than proved (`T-34`), what remains of
+the forged-`SessionReject` work (`T-35`, bookkeeping landed in ADR-012),
+emergency broadcasts, whose origin is not authenticated at all (`T-37`), and
+DHT record eviction, which undoes ADR-011's rollback protection (`T-38`).
+T-36 landed on 2026-11-12 (ADR-013).
