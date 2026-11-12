@@ -282,7 +282,7 @@ defined.
 | `0x81` | `ChannelSubscribe` | 32 | Channel subscription announcement |
 | `0x82` | `ChannelUnsubscribe` | 32 | Channel unsubscription |
 | `0x83` | `ChannelModeration` | 65 | Signed moderation action |
-| `0x90` | `EmergencyBroadcast` | 14 | Tiered emergency alert: level + `signed_at` + message + co-signatures (§9.5, ADR-013) |
+| `0x90` | `EmergencyBroadcast` | 110 | Tiered emergency alert: level + `signed_at` + originator key and signature + message + co-signatures (§9.5, ADR-013, ADR-014) |
 
 `SenderKeyDistribution` (`0x71`) is valid **only** as the plaintext of a
 pairwise `EncryptedMessage` carrying the `SYSTEM` flag. A bare `0x71` envelope
@@ -1120,9 +1120,35 @@ Thresholds are enforced as specified. Emergency messages carry the sender's
 identity — they are deliberately non-anonymous, for accountability — and a
 false emergency is intended to incur a trust penalty.
 
-**Body.** `level(1) ‖ signed_at(8 LE) ‖ msg_len(4 LE) ‖ message ‖
-cosigner_count(1) ‖ cosigners(N × 96)`, parsed strictly: the length must match
-exactly and the level must be one of the three.
+**Body.** `level(1) ‖ signed_at(8 LE) ‖ identity_key(32) ‖ signature(64) ‖
+msg_len(4 LE) ‖ message ‖ cosigner_count(1) ‖ cosigners(N × 96)`, parsed
+strictly: the length must match exactly and the level must be one of the
+three. At most 255 co-signers fit, and a sender cuts the list to that before
+signing, since signing a longer one would produce a broadcast whose own
+signature cannot verify.
+
+**The originator is authenticated.** The broadcast carries the originator's
+Ed25519 key and a signature over
+
+```
+SHA-256( b"mycelium-emergency-origin-v1:"
+       ‖ broadcast_digest (32)
+       ‖ cosigner_count   (1)
+       ‖ for each: node_id(32) ‖ signature(64) )
+```
+
+A receiver drops the broadcast unless `SHA-256(identity_key) ==
+envelope.source` and the signature verifies, **before** the trust gate — that
+gate scores the id in the packet rather than the peer that sent it, so until
+the signature verifies there is nothing to score. The key is carried rather
+than looked up so a receiver with no prior contact can check an alert at all;
+what makes that safe is the §14.3 binding. Because the digest covers the
+approval list, a relay can neither strip approvals a downstream node could
+have verified nor pad the list (ADR-014).
+
+A co-signature covers the broadcast id and date, so both are fixed before
+approvals are collected: a sender drafts the alert, co-signers sign that
+draft, and the originator signs last over what it collected.
 
 **Co-signatures are verified.** A co-signer entry is
 `node_id(32) + signature(64)`; the signature covers the broadcast digest
@@ -1161,12 +1187,19 @@ The same rule applies to channel messages (ADR-013).
 
 **Flood dedup.** A broadcast is remembered only **after** it has been
 accepted, and is keyed on the digest above rather than on the envelope's
-cleartext `message_id`. A copy of something already accepted that carries no
-more remaining TTL is dropped before any verification — the entry is proof the
-work was done — while one that reaches further is verified and forwarded
-again, without being reported locally a second time. Remaining TTL is clamped
-to 20 in both directions, which bounds that re-forwarding (though not the
-re-checking) and stops an inflated TTL flooding past the originator's intent.
+cleartext `message_id`. A copy that brings nothing new is dropped before any
+verification — the entry is proof the work was done — while one that does is
+verified and forwarded again, without being reported locally a second time.
+
+"Something new" is reach **per approval list**: an entry holds up to three
+`(approval-list digest, reach already forwarded)` pairs, and a copy qualifies
+if it reaches further than its own list did, or if it carries a list the entry
+has no slot for yet. One figure per entry would not do, because a relay can
+deliver a new list with its TTL spent — recording the list while forwarding
+nothing — and the copy that could carry it would then look like a duplicate;
+and a copy claiming a fourth list must not get past the ceiling by carrying a
+higher TTL. Remaining TTL is clamped to 20 in both directions, which stops an
+inflated TTL flooding past the originator's intent.
 
 An entry is dropped by **age** only when both clocks agree it is spent: the
 monotonic retention (3901 s — validity plus skew, plus a second for rounding)
@@ -1192,13 +1225,19 @@ a level-3 broadcast is refused by every receiver. Unusable is the correct
 failure direction for a mesh-wide flood, but level 3 is not available until
 collection exists. See ROADMAP T-05.
 
-**Known gap:** a broadcast is not origin-authenticated. Levels 1 and 2 carry no
-signature of their own, and `envelope.source` is cleartext and unverified, so
-any neighbour can emit a level-2 alert claiming a trusted id: it passes the
-trust gate, bypasses the per-identity rate limit and is flooded. A forgery can
-no longer suppress a real alert (ADR-013), but it can still be injected. The
-handler also floods every accepted level, where the table above reserves
-mesh-wide flooding for level 3. See ROADMAP T-37.
+**Known gap:** the levels do not yet differ in behaviour. Every accepted
+broadcast floods at the same clamped reach, nothing consults the level when
+relaying, and the per-originator rate limit is skipped for all of them — so a
+level selects only its trust threshold and, at level 3, its co-signature
+requirement. The table above describes the intent; ADR-014 decides the
+implementation and ROADMAP T-37 carries it.
+
+**Known gap:** an alert is `217 + message_bytes + 96 × approvals` bytes on the
+wire, against the BLE transport's 512-byte message cap — so three approvals
+leave 7 bytes of message, and none leave 295. A node refuses to raise an alert
+larger than its narrowest registered transport rather than flooding only the
+links that can carry it, but the alert still does not fit. See ROADMAP T-39,
+which blocks co-signature collection (T-05) for BLE.
 
 ### 9.6 Multi-device support
 
@@ -1432,16 +1471,20 @@ actions (deliver local bundles, spray copies) and flushes
 | `GroupMessage` | `handle_group_message` | Sender-key decrypt → store |
 | `SenderKeyDistribution` | `install_sender_key` | Install key, merge roster |
 | `ChannelMessage` | `handle_channel_message` | Verify subscription → store → flood |
-| `EmergencyBroadcast` | `handle_emergency_broadcast` | Freshness → trust/co-signature gate → remember → flood |
+| `EmergencyBroadcast` | `handle_emergency_broadcast` | Freshness → origin signature → trust/co-signature gate → remember → flood |
 
 The checks below are conformance requirements. Each one closes an attack that
 a plain reading of the protocol allows:
 
 - **Identity binding** — drop `PrekeyResponse` (direct or cached while
-  forwarding), `SessionInit` and `SessionReject` unless
+  forwarding), `SessionInit`, `SessionReject` and `EmergencyBroadcast` unless
   `SHA-256(identity_key) == envelope.source`. Other handlers in the table
   above carry no key to bind: `PrekeyRequest`, for instance, has an empty
   body.
+- **Authenticated origin** — an `EmergencyBroadcast` is dropped unless its
+  signature verifies over the alert *and* its approval list, checked before
+  the trust gate, which scores a claimed id rather than the sender (§9.5,
+  ADR-014).
 - **Authenticated rejection** — a `SessionReject` is acted on only if its
   signature verifies under that key *and* its `init_transcript` is the one
   recorded for the `SessionInit` awaiting confirmation (§5.2, ADR-012).
@@ -1903,7 +1946,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 9.3 | Receipts | **Partial** | Recipient-only, WS push, UI indicators. Dropped when no route exists, so DTN deliveries are never acknowledged (T-27) |
 | 9.4 | Public channels | **Implemented** | Wire types, storage, flooding, 6 REST endpoints, 2 screens. Dedup expires by age and is keyed on the message (ADR-013); the channel `NodeEvent` variant is still open (T-14) |
 | 9.4 | Regional channels | **Planned** | Needs the geographic overlay |
-| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, `signed_at` freshness bound, dedup after verification keyed on the digest (ADR-010, ADR-013). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); broadcasts are not origin-authenticated (T-37) |
+| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); the levels do not yet differ in behaviour (T-37); a co-signed alert exceeds the BLE cap (T-39) |
 | 9.6 | Multi-device / CRDT sync | **Planned** | v0.3 |
 | 10.1 | Beacon | **Implemented** | Node type, battery, neighbour count, group hash; LoRa broadcast |
 | 10.2 | Seed phrase groups | **Partial** | Derivation + beacon match + auto-vouch; no proof of possession (T-04) |

@@ -174,3 +174,44 @@ What ADR-013 does not change: the co-signer entry layout
 threshold, or where identity keys come from.
 
 Appended rather than edited in place, because these records are append-only.
+
+## Note (2026-11-13)
+
+"Rejection reasons are kept coarse in logs" above was not true of the code, and
+is now. The handler logged a line per co-signer naming the id and
+distinguishing a missing key from insufficient trust from a bad signature —
+which is exactly the breakdown this record said it would not disclose, since
+together those lines say which identity keys a node holds and whom it trusts.
+T-36 made it worse by splitting the key lookup from the trust check for its
+verification budget.
+
+Totals by reason were the first attempt at a fix, and they are not one: a
+prober listing a single id three times reads its own answer out of the
+breakdown — two duplicates, and "unknown key" or "untrusted" for the id it
+asked about. Aggregation hides nothing when the attacker chooses the list.
+
+Nor is the *count* safe, which was the second attempt. The verification budget
+(ADR-013) is charged only for entries whose key the node holds, so a prober
+lists fifteen known-key entries with bad signatures, then the id it is asking
+about, then one approval that would count: if the probed key is held, the
+budget runs out before that last entry and the count is zero; if it is not,
+the count is one. No signature from the probed id is needed.
+
+So a refused critical alert logs that it was refused for too few counted
+co-signatures, and no numbers at all.
+
+What this costs: an operator can no longer tell from the log *why* an alert
+was refused, or how close it came. They can still answer it locally — the
+contacts table says which identity keys they hold, the trust graph says whom
+they trust — without the log handing the same answer to whoever is probing.
+
+**What is left, and why it stays.** The budget's ordering is itself observable
+to an attacker who can already produce three counting approvals: by padding
+with known-key entries it can make the budget run out before its own valid
+ones, so whether the alert floods depends on whether this node holds the
+padded ids' keys. Charging the budget for *every* entry instead would close
+that and reopen something worse — padding with unknown ids would hide genuine
+approvals behind it, which is a way to suppress a real alert (T-36's first
+review round). Suppressing an alert is worse than telling an attacker who
+already holds three trusted signers which keys we have, so the ordering
+stands.

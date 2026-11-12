@@ -305,6 +305,19 @@ impl TransportManager {
         let pt = self.peer_transports.read().await;
         pt.keys().copied().collect()
     }
+
+    /// The smallest MTU among the registered transports, or `None` when none
+    /// are registered.
+    ///
+    /// What a *flooded* message must fit: it goes to every peer, so the
+    /// narrowest link decides. A sender that ignores this floods the subset of
+    /// the mesh whose links are wide enough and stops silently at the rest —
+    /// on BLE, which refuses an oversized message outright, that means every
+    /// phone (ROADMAP T-39).
+    pub async fn min_mtu(&self) -> Option<usize> {
+        let transports = self.transports.read().await;
+        transports.iter().map(|t| t.mtu()).min()
+    }
 }
 
 impl Default for TransportManager {
@@ -315,6 +328,35 @@ impl Default for TransportManager {
 
 #[cfg(test)]
 mod tests {
+    /// A flooded message must fit the narrowest link, so the manager reports
+    /// that rather than the widest or the preferred one. BLE's 512 bytes is
+    /// what an emergency alert is measured against on a phone (ROADMAP T-39).
+    #[tokio::test]
+    async fn test_min_mtu_is_the_narrowest_registered_transport() {
+        use super::*;
+        use crate::transport::ble::BleTransport;
+        use crate::transport::mock::{MockNetwork, MockTransport};
+
+        let local = NodeId([1u8; 32]);
+        let manager = TransportManager::new();
+        assert_eq!(manager.min_mtu().await, None, "no transports, no limit");
+
+        let mock = Arc::new(MockTransport::new(local, MockNetwork::new()).await);
+        let mock_mtu = mock.mtu();
+        manager.add_transport(mock).await;
+        assert_eq!(manager.min_mtu().await, Some(mock_mtu));
+
+        let ble = Arc::new(BleTransport::new(local));
+        let ble_mtu = ble.mtu();
+        manager.add_transport(ble).await;
+        assert!(ble_mtu < mock_mtu, "BLE is the narrow one here");
+        assert_eq!(
+            manager.min_mtu().await,
+            Some(ble_mtu),
+            "the narrowest transport decides what a flood may be"
+        );
+    }
+
     use super::*;
     use crate::transport::mock::{MockLinkConfig, MockNetwork, MockTransport};
 

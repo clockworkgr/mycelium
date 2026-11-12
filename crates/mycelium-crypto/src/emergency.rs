@@ -16,7 +16,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use mycelium_protocol::types::{MessageId, NodeId};
-use mycelium_protocol::wire::{EmergencyCosigner, EmergencyLevel, EMERGENCY_BROADCAST_CONTEXT};
+use mycelium_protocol::wire::{
+    EmergencyCosigner, EmergencyLevel, EMERGENCY_BROADCAST_CONTEXT, EMERGENCY_ORIGIN_CONTEXT,
+};
 
 use crate::identity::{node_id_from_public_key, Identity};
 
@@ -81,6 +83,80 @@ pub fn cosign(signer: &Identity, ctx: &BroadcastContext<'_>) -> EmergencyCosigne
         node_id: signer.node_id(),
         signature: signer.sign(&digest).to_bytes(),
     }
+}
+
+/// The bytes the **originator** signs: the alert, and the approval list it
+/// collected.
+///
+/// Signing the alert digest alone would leave the approvals unauthenticated,
+/// so a relay could forward a copy carrying fewer of them — and if the ones it
+/// kept were verifiable here but not downstream, that node would refuse an
+/// alert the full set would have satisfied (ADR-013, ADR-014).
+///
+/// There is no circularity: a co-signer signs `broadcast_digest`, which does
+/// not include the list, and the originator signs last, over what it
+/// collected. For levels 1 and 2 the list is empty and signing is immediate.
+///
+/// This digest is deliberately **not** the flood-dedup identity. Holding the
+/// signing key, an originator could otherwise pad the list with junk entries
+/// and re-sign, minting arbitrarily many identities for one alert — each
+/// accepted, each flooded — with no new co-signatures. One alert is one entry,
+/// keyed on `broadcast_digest`, however its approvals are presented.
+pub fn origin_digest(alert: &[u8; 32], cosigners: &[EmergencyCosigner]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(EMERGENCY_ORIGIN_CONTEXT);
+    hasher.update(alert);
+    hasher.update([cosigners.len() as u8]);
+    for cosigner in cosigners {
+        hasher.update(cosigner.node_id.as_bytes());
+        hasher.update(cosigner.signature);
+    }
+    hasher.finalize().into()
+}
+
+/// Sign a broadcast as its originator.
+pub fn sign_broadcast(
+    signer: &Identity,
+    ctx: &BroadcastContext<'_>,
+    cosigners: &[EmergencyCosigner],
+) -> [u8; 64] {
+    let digest = origin_digest(&broadcast_digest(ctx), cosigners);
+    signer.sign(&digest).to_bytes()
+}
+
+/// Why a broadcast's origin was not accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginRejection {
+    /// The carried key is not a valid Ed25519 point.
+    MalformedIdentityKey,
+    /// The carried key does not hash to the claimed source NodeId.
+    IdentityMismatch,
+    /// The signature does not verify over the origin digest.
+    BadSignature,
+}
+
+/// Verify that `source` really raised this alert, with these approvals.
+///
+/// The key is carried in the broadcast rather than looked up, so a receiver
+/// with no prior contact can still check it; what makes that safe is the
+/// binding `SHA-256(identity_key) == source`, the rule every other ingress
+/// path enforces (MYCELIUM_SPEC.md §14.3).
+pub fn verify_origin(
+    identity_key: &[u8; 32],
+    source: &NodeId,
+    ctx: &BroadcastContext<'_>,
+    cosigners: &[EmergencyCosigner],
+    signature: &[u8; 64],
+) -> Result<(), OriginRejection> {
+    if node_id_from_public_key(identity_key) != *source {
+        return Err(OriginRejection::IdentityMismatch);
+    }
+    let verifying = VerifyingKey::from_bytes(identity_key)
+        .map_err(|_| OriginRejection::MalformedIdentityKey)?;
+    let digest = origin_digest(&broadcast_digest(ctx), cosigners);
+    verifying
+        .verify(&digest, &Signature::from_bytes(signature))
+        .map_err(|_| OriginRejection::BadSignature)
 }
 
 /// Why a co-signature was not counted.
@@ -162,10 +238,14 @@ mod tests {
     }
 
     fn setup() -> Fixture {
+        let signer = Identity::generate();
         Fixture {
-            signer: Identity::generate(),
+            // The same identity stands in for the originator and the
+            // co-signer here; the origin tests need a key that hashes to the
+            // source, and the co-signature tests do not care.
+            originator: signer.node_id(),
+            signer,
             broadcast_id: MessageId::random(),
-            originator: Identity::generate().node_id(),
             message: b"flood warning".to_vec(),
         }
     }
@@ -305,6 +385,136 @@ mod tests {
         assert_eq!(
             verify(&f, &cs, Some(f.signer.public_key_bytes())),
             Err(CosignerRejection::IdentityMismatch)
+        );
+    }
+
+    /// A relay must not be able to edit the approval list: the originator's
+    /// signature covers it, so stripping or padding breaks the alert.
+    #[test]
+    fn test_the_origin_signature_covers_the_approval_list() {
+        let f = setup();
+        let approvals = vec![sign(&f), sign(&f)];
+        let signature = sign_broadcast(&f.signer, &f.ctx(), &approvals);
+        let key = f.signer.public_key_bytes();
+        let source = f.signer.node_id();
+
+        assert_eq!(
+            verify_origin(&key, &source, &f.ctx(), &approvals, &signature),
+            Ok(())
+        );
+        assert_eq!(
+            verify_origin(&key, &source, &f.ctx(), &approvals[..1], &signature),
+            Err(OriginRejection::BadSignature),
+            "a stripped approval list must break the origin signature"
+        );
+        let mut padded = approvals.clone();
+        padded.push(EmergencyCosigner {
+            node_id: NodeId([4u8; 32]),
+            signature: [5u8; 64],
+        });
+        assert_eq!(
+            verify_origin(&key, &source, &f.ctx(), &padded, &signature),
+            Err(OriginRejection::BadSignature),
+            "a padded approval list must break it too"
+        );
+    }
+
+    /// The carried key is only worth anything because it is bound to the id it
+    /// claims. Without that check an attacker signs with a key of its own.
+    #[test]
+    fn test_the_origin_key_must_hash_to_the_claimed_source() {
+        let f = setup();
+        let signature = sign_broadcast(&f.signer, &f.ctx(), &[]);
+        assert_eq!(
+            verify_origin(
+                &f.signer.public_key_bytes(),
+                &NodeId([9u8; 32]),
+                &f.ctx(),
+                &[],
+                &signature
+            ),
+            Err(OriginRejection::IdentityMismatch)
+        );
+
+        // An attacker's own key, over an alert claiming someone else.
+        let attacker = Identity::generate();
+        let forged = sign_broadcast(&attacker, &f.ctx(), &[]);
+        assert_eq!(
+            verify_origin(
+                &attacker.public_key_bytes(),
+                &f.signer.node_id(),
+                &f.ctx(),
+                &[],
+                &forged
+            ),
+            Err(OriginRejection::IdentityMismatch),
+            "a signature by the wrong key must not pass as the claimed source"
+        );
+    }
+
+    /// An origin signature must not transfer to another alert.
+    #[test]
+    fn test_the_origin_signature_is_bound_to_the_alert() {
+        let f = setup();
+        let signature = sign_broadcast(&f.signer, &f.ctx(), &[]);
+        let key = f.signer.public_key_bytes();
+        let source = f.signer.node_id();
+        let other_id = MessageId::random();
+
+        for (why, ctx) in [
+            (
+                "another message",
+                BroadcastContext {
+                    message: b"different",
+                    ..f.ctx()
+                },
+            ),
+            (
+                "another level",
+                BroadcastContext {
+                    level: EmergencyLevel::Priority,
+                    ..f.ctx()
+                },
+            ),
+            (
+                "another id",
+                BroadcastContext {
+                    broadcast_id: &other_id,
+                    ..f.ctx()
+                },
+            ),
+            (
+                "another date",
+                BroadcastContext {
+                    signed_at: f.ctx().signed_at + 1,
+                    ..f.ctx()
+                },
+            ),
+        ] {
+            assert_eq!(
+                verify_origin(&key, &source, &ctx, &[], &signature),
+                Err(OriginRejection::BadSignature),
+                "must not transfer to {why}"
+            );
+        }
+    }
+
+    /// The origin digest and the alert digest are different things, and the
+    /// alert digest is what dedup keys on — see `origin_digest`.
+    #[test]
+    fn test_padding_approvals_does_not_change_the_alert_digest() {
+        let f = setup();
+        let alert = broadcast_digest(&f.ctx());
+        let padded = vec![sign(&f)];
+        assert_eq!(
+            alert,
+            broadcast_digest(&f.ctx()),
+            "the alert digest does not depend on approvals"
+        );
+        assert_ne!(
+            origin_digest(&alert, &[]),
+            origin_digest(&alert, &padded),
+            "the origin digest does"
         );
     }
 

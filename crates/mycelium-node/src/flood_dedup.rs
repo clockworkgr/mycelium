@@ -50,6 +50,18 @@ use mycelium_protocol::types::{MessageId, NodeId};
 use mycelium_protocol::wire::EmergencyLevel;
 use sha2::{Digest, Sha256};
 
+/// How many distinct *authenticated* approval lists one flood may be
+/// forwarded with: the first, plus two improvements.
+///
+/// A relay can strip approvals, and the originator's signature is what lets a
+/// receiver tell a genuine improvement from an invented one (ADR-014). But the
+/// originator holds that signing key: it can pad the list with junk and
+/// re-sign as often as it likes, so "forward again when the approvals change"
+/// needs a ceiling or it is an amplifier. Two improvements is enough for the
+/// case this exists for — a stripped copy arriving before the full one — and
+/// bounded enough that padding buys almost nothing.
+const MAX_APPROVAL_LISTS: usize = 3;
+
 /// How often the map is swept for expired entries while it has room.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -128,14 +140,36 @@ pub struct FloodMark {
     /// own and retention is the monotonic TTL alone, which is what a channel
     /// message gets.
     pub keep_until: u64,
+    /// Digest of everything this copy carries *about* the message that is not
+    /// part of its identity — for an emergency broadcast, the originator's
+    /// signature over the approval list (ADR-014). A copy whose value differs
+    /// from the one already forwarded is worth forwarding again, up to
+    /// `MAX_APPROVAL_REVISIONS` times. `[0; 32]` for a message with no such
+    /// payload, which is what a channel message gets.
+    pub origin: [u8; 32],
+}
+
+/// One approval list this flood has been forwarded with, and how far.
+struct ForwardedList {
+    origin: [u8; 32],
+    /// Furthest remaining TTL forwarded for *this* list.
+    reach: u8,
 }
 
 struct Entry {
     seen: Instant,
-    /// Furthest remaining TTL seen for this key.
-    reach: u8,
     /// See `FloodMark::keep_until`.
     keep_until: u64,
+    /// Reach already forwarded, per approval list, bounded by
+    /// `MAX_APPROVAL_LISTS`.
+    ///
+    /// Reach has to be tracked per list rather than per entry. A single pair
+    /// cannot say both "this list has travelled 20 hops" and "that list has
+    /// travelled none": a relay delivering a new list with its TTL spent
+    /// would otherwise either pin the old list's reach, stopping the new one,
+    /// or let any copy with a higher TTL past the ceiling by claiming a new
+    /// list.
+    forwarded: Vec<ForwardedList>,
 }
 
 /// Bounded, age-expiring record of floods already seen.
@@ -167,21 +201,31 @@ impl FloodDedup {
     /// that claims more reach must not have that claim recorded until it has
     /// been checked, or a bogus copy could pin a reach the genuine one then
     /// fails to beat.
-    pub fn probe(&self, key: &[u8; 32], reach: u8) -> FloodCopy {
-        self.probe_at(key, reach, Instant::now(), unix_now())
+    pub fn probe(&self, mark: &FloodMark) -> FloodCopy {
+        self.probe_at(mark, Instant::now(), unix_now())
     }
 
     /// `probe` with explicit clocks, for tests.
-    pub fn probe_at(&self, key: &[u8; 32], reach: u8, now: Instant, now_secs: u64) -> FloodCopy {
-        match self.entries.get(key) {
+    pub fn probe_at(&self, mark: &FloodMark, now: Instant, now_secs: u64) -> FloodCopy {
+        match self.entries.get(&mark.key) {
             Some(entry) if !Self::spent(entry, self.ttl, now, now_secs) => {
-                if reach > entry.reach {
+                if Self::carries_more(entry, mark) {
                     FloodCopy::Further
                 } else {
                     FloodCopy::Duplicate
                 }
             }
             _ => FloodCopy::New,
+        }
+    }
+
+    /// Whether this copy brings something the kept ones do not: more reach for
+    /// a list already forwarded, or a list not forwarded yet with room left
+    /// for it.
+    fn carries_more(entry: &Entry, mark: &FloodMark) -> bool {
+        match entry.forwarded.iter().find(|f| f.origin == mark.origin) {
+            Some(forwarded) => mark.reach > forwarded.reach,
+            None => entry.forwarded.len() < MAX_APPROVAL_LISTS,
         }
     }
 
@@ -202,11 +246,30 @@ impl FloodDedup {
                 // Keep the longer window: a copy must not be able to shorten
                 // how long its own message is remembered.
                 entry.keep_until = entry.keep_until.max(mark.keep_until);
-                if mark.reach > entry.reach {
-                    entry.reach = mark.reach;
-                    return FloodCopy::Further;
+                match entry.forwarded.iter_mut().find(|f| f.origin == mark.origin) {
+                    // A list we have carried before: worth carrying again only
+                    // if this copy reaches further than it got last time.
+                    Some(forwarded) => {
+                        if mark.reach > forwarded.reach {
+                            forwarded.reach = mark.reach;
+                            return FloodCopy::Further;
+                        }
+                        return FloodCopy::Duplicate;
+                    }
+                    // A list we have not carried, if there is room for it. The
+                    // ceiling is on *lists*, not on sends, so bumping the TTL
+                    // cannot buy another one.
+                    None => {
+                        if entry.forwarded.len() < MAX_APPROVAL_LISTS {
+                            entry.forwarded.push(ForwardedList {
+                                origin: mark.origin,
+                                reach: mark.reach,
+                            });
+                            return FloodCopy::Further;
+                        }
+                        return FloodCopy::Duplicate;
+                    }
                 }
-                return FloodCopy::Duplicate;
             }
             // Known but spent: overwritten below as if absent.
         } else if self.entries.len() >= self.capacity {
@@ -220,8 +283,11 @@ impl FloodDedup {
             mark.key,
             Entry {
                 seen: now,
-                reach: mark.reach,
                 keep_until: mark.keep_until,
+                forwarded: vec![ForwardedList {
+                    origin: mark.origin,
+                    reach: mark.reach,
+                }],
             },
         );
         FloodCopy::New
@@ -306,8 +372,8 @@ impl EmergencyDedup {
     }
 
     /// What this copy is worth at `level`, without remembering anything.
-    pub fn probe(&self, level: EmergencyLevel, key: &[u8; 32], reach: u8) -> FloodCopy {
-        self.level(level).probe(key, reach)
+    pub fn probe(&self, level: EmergencyLevel, mark: &FloodMark) -> FloodCopy {
+        self.level(level).probe(mark)
     }
 
     /// Remember an accepted copy at `level`, and say what it was worth.
@@ -361,6 +427,7 @@ mod tests {
             key: key(n),
             reach: FAR,
             keep_until: 0,
+            origin: [0u8; 32],
         }
     }
 
@@ -369,6 +436,17 @@ mod tests {
             key: key(n),
             reach,
             keep_until,
+            origin: [0u8; 32],
+        }
+    }
+
+    /// A mark for the same message carrying a different approval list.
+    fn mark_revised(n: u8, reach: u8, origin: u8) -> FloodMark {
+        FloodMark {
+            key: key(n),
+            reach,
+            keep_until: 0,
+            origin: [origin; 32],
         }
     }
 
@@ -424,7 +502,7 @@ mod tests {
         // still acceptable and the entry must still be here.
         let aged = t0 + Duration::from_secs(61);
         assert_eq!(
-            dedup.probe_at(&key(1), FAR, aged, 1090),
+            dedup.probe_at(&mark_with(1, FAR, 1100), aged, 1090),
             FloodCopy::Duplicate,
             "an entry whose message is still fresh must not be forgotten"
         );
@@ -437,14 +515,18 @@ mod tests {
         // sweeping cannot be undone: an entry dropped the instant its window
         // closed is gone if the clock then steps back and reopens it.
         assert_eq!(
-            dedup.probe_at(&key(1), FAR, aged, 1101),
+            dedup.probe_at(&mark_with(1, FAR, 0), aged, 1101),
             FloodCopy::Duplicate,
             "an entry must outlive its window by the grace, not expire at it"
         );
 
         // Past the window and the grace, it goes.
         assert_eq!(
-            dedup.probe_at(&key(1), FAR, aged, 1101 + CLOCK_REGRESSION_GRACE_SECS),
+            dedup.probe_at(
+                &mark_with(1, FAR, 0),
+                aged,
+                1101 + CLOCK_REGRESSION_GRACE_SECS
+            ),
             FloodCopy::New,
             "past both clocks and the grace the entry is spent"
         );
@@ -458,7 +540,11 @@ mod tests {
         let t0 = Instant::now();
         dedup.accept_at(mark_with(1, FAR, 1100), t0, 1000);
         assert_eq!(
-            dedup.probe_at(&key(1), FAR, t0 + Duration::from_secs(1), 9_999_999),
+            dedup.probe_at(
+                &mark_with(1, FAR, 0),
+                t0 + Duration::from_secs(1),
+                9_999_999
+            ),
             FloodCopy::Duplicate,
             "the TTL has not elapsed, whatever the wall clock says"
         );
@@ -473,7 +559,11 @@ mod tests {
         dedup.accept_at(mark_with(1, 1, 1000), t0, 1000);
         let aged = t0 + Duration::from_secs(61);
         assert_eq!(
-            dedup.probe_at(&key(1), 1, aged, 1100 + CLOCK_REGRESSION_GRACE_SECS),
+            dedup.probe_at(
+                &mark_with(1, 1, 0),
+                aged,
+                1100 + CLOCK_REGRESSION_GRACE_SECS
+            ),
             FloodCopy::Duplicate,
             "the longer window must survive a copy claiming a shorter one"
         );
@@ -492,7 +582,7 @@ mod tests {
             FloodCopy::New
         );
         assert_eq!(
-            dedup.probe_at(&key(1), 20, t0, 1000),
+            dedup.probe_at(&mark_with(1, 20, 0), t0, 1000),
             FloodCopy::Further,
             "a copy with reach left must not be dismissed as a duplicate"
         );
@@ -520,7 +610,10 @@ mod tests {
         let mut dedup = FloodDedup::new(Duration::from_secs(60), 16);
         let t0 = Instant::now();
 
-        assert_eq!(dedup.probe_at(&key(1), 20, t0, 1000), FloodCopy::New);
+        assert_eq!(
+            dedup.probe_at(&mark_with(1, 20, 0), t0, 1000),
+            FloodCopy::New
+        );
         assert_eq!(
             dedup.len(),
             0,
@@ -528,9 +621,12 @@ mod tests {
         );
 
         dedup.accept_at(mark_with(1, 5, 0), t0, 1000);
-        assert_eq!(dedup.probe_at(&key(1), 20, t0, 1000), FloodCopy::Further);
         assert_eq!(
-            dedup.probe_at(&key(1), 20, t0, 1000),
+            dedup.probe_at(&mark_with(1, 20, 0), t0, 1000),
+            FloodCopy::Further
+        );
+        assert_eq!(
+            dedup.probe_at(&mark_with(1, 20, 0), t0, 1000),
             FloodCopy::Further,
             "a probe must stay answerable the same way until a copy is accepted"
         );
@@ -566,17 +662,17 @@ mod tests {
         );
 
         assert_eq!(
-            dedup.probe_at(&key(0), FAR, later, later_secs),
+            dedup.probe_at(&mark_with(0, FAR, 0), later, later_secs),
             FloodCopy::New,
             "the oldest entry should have been evicted"
         );
         assert_eq!(
-            dedup.probe_at(&key(15), FAR, later, later_secs),
+            dedup.probe_at(&mark_with(15, FAR, 0), later, later_secs),
             FloodCopy::Duplicate,
             "the newest entries must survive eviction"
         );
         assert_eq!(
-            dedup.probe_at(&key(99), FAR, later, later_secs),
+            dedup.probe_at(&mark_with(99, FAR, 0), later, later_secs),
             FloodCopy::Duplicate,
             "the entry that caused the eviction must itself be remembered"
         );
@@ -602,7 +698,8 @@ mod tests {
 
         let still_known = (0..capacity)
             .filter(|n| {
-                dedup.probe_at(&key(*n as u8), FAR, later, later_secs) == FloodCopy::Duplicate
+                dedup.probe_at(&mark_with(*n as u8, FAR, 0), later, later_secs)
+                    == FloodCopy::Duplicate
             })
             .count();
         assert!(
@@ -631,12 +728,12 @@ mod tests {
         let now = t0 + Duration::from_secs(capacity as u64);
         let now_secs = 1000 + capacity as u64;
         assert_eq!(
-            dedup.probe_at(&key(0), FAR, now, now_secs),
+            dedup.probe_at(&mark_with(0, FAR, 0), now, now_secs),
             FloodCopy::New,
             "the oldest is gone"
         );
         assert_eq!(
-            dedup.probe_at(&key(capacity as u8), FAR, now, now_secs),
+            dedup.probe_at(&mark_with(capacity as u8, FAR, 0), now, now_secs),
             FloodCopy::Duplicate,
             "the newest is kept"
         );
@@ -655,6 +752,7 @@ mod tests {
             key: key(200),
             reach: FAR,
             keep_until: 0,
+            origin: [0u8; 32],
         };
         assert_eq!(
             dedup.accept_at(EmergencyLevel::Critical, alert, t0, 1000),
@@ -671,6 +769,7 @@ mod tests {
                     key: junk,
                     reach: FAR,
                     keep_until: 0,
+                    origin: [0u8; 32],
                 },
                 t0 + Duration::from_millis(n as u64),
                 1000,
@@ -678,9 +777,129 @@ mod tests {
         }
 
         assert_eq!(
-            dedup.probe(EmergencyLevel::Critical, &alert.key, FAR),
+            dedup.probe(EmergencyLevel::Critical, &alert),
             FloodCopy::Duplicate,
             "the level-3 entry must survive any amount of level-1 traffic"
+        );
+    }
+
+    /// A copy carrying a different authenticated approval list is worth
+    /// forwarding again — a relay may have stripped the first one — but the
+    /// originator holds the signing key, so the ceiling is what stops it
+    /// minting improvements forever (ADR-014).
+    #[test]
+    fn test_only_a_bounded_number_of_approval_lists_is_carried() {
+        let mut dedup = FloodDedup::new(Duration::from_secs(60), 16);
+        let t0 = Instant::now();
+
+        assert_eq!(
+            dedup.accept_at(mark_revised(1, FAR, 1), t0, 1000),
+            FloodCopy::New
+        );
+        for list in 2..=MAX_APPROVAL_LISTS as u8 {
+            assert_eq!(
+                dedup.accept_at(mark_revised(1, FAR, list), t0, 1000),
+                FloodCopy::Further,
+                "list {list} is within the ceiling"
+            );
+        }
+        assert_eq!(
+            dedup.accept_at(mark_revised(1, FAR, 99), t0, 1000),
+            FloodCopy::Duplicate,
+            "past the ceiling another approval list buys nothing"
+        );
+        assert_eq!(
+            dedup.probe_at(&mark_revised(1, FAR, 100), t0, 1000),
+            FloodCopy::Duplicate,
+            "and a probe agrees, so no verification is spent on it"
+        );
+    }
+
+    /// The ceiling is on approval *lists*, not on sends: a copy claiming a new
+    /// list must not get past it by carrying a higher TTL.
+    #[test]
+    fn test_a_higher_ttl_does_not_buy_another_approval_list() {
+        let mut dedup = FloodDedup::new(Duration::from_secs(60), 16);
+        let t0 = Instant::now();
+
+        // Fill the ceiling with spent copies, so every later copy has more
+        // reach than anything recorded.
+        dedup.accept_at(mark_revised(1, 0, 1), t0, 1000);
+        for list in 2..=MAX_APPROVAL_LISTS as u8 {
+            assert_eq!(
+                dedup.accept_at(mark_revised(1, 0, list), t0, 1000),
+                FloodCopy::Further
+            );
+        }
+        for (reach, list) in [(1u8, 90u8), (2, 91), (20, 92)] {
+            assert_eq!(
+                dedup.accept_at(mark_revised(1, reach, list), t0, 1000),
+                FloodCopy::Duplicate,
+                "reach {reach} must not buy a slot for list {list}"
+            );
+        }
+    }
+
+    /// Replaying an earlier list must not consume the room a later one needs.
+    /// A(20) → B(0) → A(20) → B(20): the last copy is the only one that can
+    /// carry B anywhere, so it has to be worth forwarding.
+    #[test]
+    fn test_replaying_a_list_does_not_crowd_out_the_one_behind_it() {
+        let mut dedup = FloodDedup::new(Duration::from_secs(60), 16);
+        let t0 = Instant::now();
+        let a = |reach| mark_revised(1, reach, 1);
+        let b = |reach| mark_revised(1, reach, 2);
+
+        assert_eq!(dedup.accept_at(a(20), t0, 1000), FloodCopy::New);
+        assert_eq!(
+            dedup.accept_at(b(0), t0, 1000),
+            FloodCopy::Further,
+            "the new list is recorded, though its TTL leaves nothing to send"
+        );
+        assert_eq!(
+            dedup.accept_at(a(20), t0, 1000),
+            FloodCopy::Duplicate,
+            "replaying the first list at the reach it already had buys nothing"
+        );
+        assert_eq!(
+            dedup.probe_at(&b(20), t0, 1000),
+            FloodCopy::Further,
+            "and the second list can still travel"
+        );
+        assert_eq!(dedup.accept_at(b(20), t0, 1000), FloodCopy::Further);
+    }
+
+    /// A new approval list delivered with its TTL spent must not pin the old
+    /// list's reach: the copy that can actually carry it comes next, and it
+    /// would otherwise look like a duplicate.
+    #[test]
+    fn test_a_new_approval_list_does_not_inherit_the_old_reach() {
+        let mut dedup = FloodDedup::new(Duration::from_secs(60), 16);
+        let t0 = Instant::now();
+
+        assert_eq!(
+            dedup.accept_at(mark_revised(1, 20, 1), t0, 1000),
+            FloodCopy::New
+        );
+        // The new list arrives spent: recorded, but nothing to forward.
+        assert_eq!(
+            dedup.accept_at(mark_revised(1, 0, 2), t0, 1000),
+            FloodCopy::Further
+        );
+        // The copy that can carry it must still be worth forwarding.
+        assert_eq!(
+            dedup.probe_at(&mark_revised(1, 20, 2), t0, 1000),
+            FloodCopy::Further,
+            "the spent copy must not have pinned the previous list's reach"
+        );
+        assert_eq!(
+            dedup.accept_at(mark_revised(1, 20, 2), t0, 1000),
+            FloodCopy::Further
+        );
+        assert_eq!(
+            dedup.accept_at(mark_revised(1, 20, 2), t0, 1000),
+            FloodCopy::Duplicate,
+            "and once carried, it is a duplicate like any other"
         );
     }
 

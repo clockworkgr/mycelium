@@ -64,6 +64,8 @@ pub enum NodeError {
     GroupError(#[from] GroupError),
     #[error("sending to self")]
     SendToSelf,
+    #[error("alert is {size} bytes, over the {limit}-byte limit a flooded message must fit")]
+    AlertTooLarge { size: usize, limit: usize },
     #[error("group not found")]
     GroupNotFound,
 }
@@ -228,6 +230,16 @@ pub struct Node {
     key_sent_to: Arc<RwLock<HashMap<[u8; 32], HashSet<NodeId>>>>,
     /// Truncated hash of local group discovery key for beacon matching.
     pub local_group_hash: Option<[u8; 8]>,
+}
+
+/// An emergency broadcast whose id and date are fixed, so co-signatures can
+/// be collected over them before the originator signs (ADR-010, ADR-014).
+#[derive(Debug, Clone)]
+pub struct EmergencyDraft {
+    pub message_id: MessageId,
+    pub signed_at: u64,
+    pub level: wire::EmergencyLevel,
+    pub message: Vec<u8>,
 }
 
 /// Everything the send pipeline needs. Built from `&Node` for public
@@ -1355,6 +1367,131 @@ impl Node {
         Self::distribute_sender_key(ctx, group_id, &[]).await;
     }
 
+    /// Begin an emergency broadcast: fix its id and date so co-signatures can
+    /// be collected over them.
+    ///
+    /// A co-signature covers the broadcast id and the signing time (ADR-010),
+    /// so both have to exist *before* approvals are gathered — the id cannot
+    /// be minted at send time or the approvals would be over something else.
+    /// Collecting them is ROADMAP T-05; this is the shape that makes it
+    /// possible.
+    pub fn draft_emergency(&self, level: wire::EmergencyLevel, message: &[u8]) -> EmergencyDraft {
+        EmergencyDraft {
+            message_id: MessageId::random(),
+            signed_at: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            level,
+            message: message.to_vec(),
+        }
+    }
+
+    /// What a co-signer signs for `draft` — the digest ADR-010 defines.
+    pub fn emergency_cosign_digest(&self, draft: &EmergencyDraft) -> [u8; 32] {
+        mycelium_crypto::emergency::broadcast_digest(&self.broadcast_context(draft))
+    }
+
+    fn broadcast_context<'a>(&'a self, draft: &'a EmergencyDraft) -> BroadcastContext<'a> {
+        BroadcastContext {
+            broadcast_id: &draft.message_id,
+            originator: &self.node_id,
+            level: draft.level,
+            signed_at: draft.signed_at,
+            message: &draft.message,
+        }
+    }
+
+    /// Sign a drafted emergency broadcast and flood it.
+    ///
+    /// Signing belongs here rather than in the API, because the identity does
+    /// and because the signature covers the approval list (ADR-014): the
+    /// originator signs last, over whatever co-signatures it collected, so
+    /// this is the only place that can produce a valid one.
+    pub async fn raise_emergency(
+        &self,
+        draft: EmergencyDraft,
+        cosigners: &[wire::EmergencyCosigner],
+    ) -> Result<MessageId, NodeError> {
+        // One cap, applied before both signing and serialization: the count is
+        // a single byte, and signing a list longer than the wire can carry
+        // would produce a broadcast whose own signature cannot verify.
+        let cosigners = &cosigners[..cosigners.len().min(wire::MAX_EMERGENCY_COSIGNERS)];
+
+        let message_id = draft.message_id;
+        let signed_at = draft.signed_at;
+        let level = draft.level;
+        let message = draft.message.as_slice();
+        let clock_val = {
+            let mut clock = self.lamport_clock.write().await;
+            clock.tick();
+            clock.0
+        };
+
+        let ctx = self.broadcast_context(&draft);
+        let signature = mycelium_crypto::emergency::sign_broadcast(&self.identity, &ctx, cosigners);
+
+        let envelope = Envelope {
+            source: self.node_id,
+            destination: NodeId::ZERO,
+            message_id,
+            ttl: MAX_FLOOD_TTL,
+            hop_count: 0,
+            flags: MessageFlags::NONE,
+            lamport_clock: clock_val,
+            device_timestamp: signed_at,
+            protocol_version: ProtocolVersion::CURRENT,
+            payload: wire::serialize_emergency_broadcast(
+                level,
+                signed_at,
+                &self.identity.public_key_bytes(),
+                &signature,
+                message,
+                cosigners,
+            ),
+        };
+
+        let data = envelope.serialize();
+
+        // A flood goes to every peer, so the narrowest registered transport
+        // decides what can be raised at all. Sending anyway would cross the
+        // wide links and stop at every BLE peer, since BLE refuses an
+        // oversized message outright — the mesh would be truncated silently
+        // while the API reported success. Refused here instead, so the
+        // originator learns.
+        //
+        // This is a stopgap for ROADMAP T-39, which has to make a co-signed
+        // alert (522 bytes with three approvals) fit BLE at all, by
+        // message-level fragmentation or a smaller co-signer entry. A node
+        // with no BLE registered is limited only by its own transports.
+        if let Some(limit) = self.transport_manager.min_mtu().await {
+            if data.len() > limit {
+                return Err(NodeError::AlertTooLarge {
+                    size: data.len(),
+                    limit,
+                });
+            }
+        }
+
+        for peer in self.transport_manager.known_peers().await {
+            if peer != self.node_id {
+                // An emergency flood is best-effort, but a failure here is
+                // worth saying out loud: a `ExceedsMtu` on a co-signed alert
+                // means it cannot traverse BLE at all (ROADMAP T-39).
+                if let Err(e) = self.transport_manager.send(&peer, &data).await {
+                    warn!(
+                        "Emergency broadcast {} not sent to {} ({} bytes): {}",
+                        message_id,
+                        peer,
+                        data.len(),
+                        e
+                    );
+                }
+            }
+        }
+        Ok(message_id)
+    }
+
     pub async fn send_group_message(
         &self,
         group_id: [u8; 32],
@@ -2333,6 +2470,7 @@ impl Node {
                             trust_graph,
                             transport_manager,
                             local_id,
+                            identity.public_key_bytes(),
                             seen_emergency_broadcasts,
                             event_tx,
                             db,
@@ -2861,6 +2999,21 @@ impl Node {
                         "Accepted session from {}, safety number: {}",
                         envelope.source, safety_number
                     );
+                    // The key is proved here — `SHA-256(identity_key)` matched
+                    // the source above — so record it, as the message-carrying
+                    // path does. Without this, a peer that establishes a
+                    // session with an init carrying no message has no stored
+                    // key, and ADR-010's co-signature verification can never
+                    // count its approvals; later encrypted traffic does not
+                    // repair it, because nothing else carries the key.
+                    if let Err(e) =
+                        db.set_contact_identity_key(&envelope.source, &init.identity_key)
+                    {
+                        debug!(
+                            "Could not record identity key for {}: {}",
+                            envelope.source, e
+                        );
+                    }
                     // See the message-carrying path below: accepting clears
                     // our own unconfirmed handshake, so what it recorded is
                     // reported here (T-35).
@@ -4170,7 +4323,18 @@ impl Node {
         let fwd_data = fwd.serialize();
         for p in transport_manager.known_peers().await {
             if p != envelope.source && p != local_id && p != peer {
-                let _ = transport_manager.send(&p, &fwd_data).await;
+                // Best-effort, but not silent: a co-signed emergency alert is
+                // over BLE's message cap, and a flood that stops there should
+                // say so rather than look like a delivered one (T-39).
+                if let Err(e) = transport_manager.send(&p, &fwd_data).await {
+                    debug!(
+                        "Flood of {} not relayed to {} ({} bytes): {}",
+                        envelope.message_id,
+                        p,
+                        fwd_data.len(),
+                        e
+                    );
+                }
             }
         }
     }
@@ -4233,8 +4397,10 @@ impl Node {
                 key,
                 reach,
                 // A channel message carries no signed validity window, so
-                // retention is the monotonic TTL alone.
+                // retention is the monotonic TTL alone — and nothing
+                // authenticated beyond the body, so no approval payload.
                 keep_until: 0,
+                origin: [0u8; 32],
             })
         };
         match copy {
@@ -4323,6 +4489,7 @@ impl Node {
         trust_graph: &RwLock<TrustGraph>,
         transport_manager: &TransportManager,
         local_id: NodeId,
+        local_identity_key: [u8; 32],
         seen: &RwLock<EmergencyDedup>,
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
         db: &Database,
@@ -4374,16 +4541,50 @@ impl Node {
             message: &broadcast.message,
         };
         let digest = mycelium_crypto::emergency::broadcast_digest(&ctx);
-        let reach = envelope.ttl.min(MAX_FLOOD_TTL);
+        let mark = FloodMark {
+            key: digest,
+            reach: envelope.ttl.min(MAX_FLOOD_TTL),
+            // Hold the entry until this broadcast could no longer be accepted
+            // on its date, whatever the monotonic clock does: a backward clock
+            // correction must not retire the entry while the alert it covers
+            // is still fresh (ADR-013).
+            keep_until: broadcast.signed_at.saturating_add(EMERGENCY_VALIDITY_SECS),
+            // The approval list, as the originator signed it. A copy carrying
+            // a different one is worth forwarding again — a relay may have
+            // stripped the first — but only within the dedup set's budget,
+            // because the originator could otherwise mint improvements
+            // forever (ADR-014).
+            origin: mycelium_crypto::emergency::origin_digest(&digest, &broadcast.cosigners),
+        };
 
-        // A copy of something already accepted that carries no further reach
-        // is dropped here, before any verification: re-checking it is work an
+        // A copy of something already accepted that brings nothing new is
+        // dropped here, before any verification: re-checking it is work an
         // attacker can ask for by replaying one captured alert, and a 1-hop
         // neighbour is not rate-limited at all.
-        if seen.read().await.probe(broadcast.level, &digest, reach) == FloodCopy::Duplicate {
+        if seen.read().await.probe(broadcast.level, &mark) == FloodCopy::Duplicate {
             debug!(
                 "Duplicate emergency broadcast {}, skipping",
                 envelope.message_id
+            );
+            return;
+        }
+
+        // The origin, before the trust gate. The gate scores the id in the
+        // packet rather than the peer that sent it, so until the signature
+        // verifies there is nothing to score: an unvouched stranger in radio
+        // range could otherwise name any source its neighbours trust
+        // (ROADMAP T-37, ADR-014). Checking it here also bounds the work a
+        // forged copy can ask for — one verification instead of sixteen.
+        if let Err(reason) = mycelium_crypto::emergency::verify_origin(
+            &broadcast.identity_key,
+            &envelope.source,
+            &ctx,
+            &broadcast.cosigners,
+            &broadcast.signature,
+        ) {
+            debug!(
+                "Emergency broadcast claiming {} refused: origin {:?}",
+                envelope.source, reason
             );
             return;
         }
@@ -4416,6 +4617,17 @@ impl Node {
                     // expensive checks, so padding the list with ids we hold
                     // no key for cannot crowd out the three that count
                     // (ADR-013).
+                    // A refused alert logs nothing about its co-signatures —
+                    // not the reasons, and not the number counted. Both are
+                    // oracles for what this node holds, which ADR-010
+                    // promises not to give. Reasons, because a prober listing
+                    // one id repeatedly reads its own answer out of the
+                    // breakdown. The count, because the candidate budget is
+                    // charged only for entries whose key we hold: list
+                    // fifteen known-key entries with bad signatures, then the
+                    // id being probed, then one valid approval, and the count
+                    // is 0 if we hold the probed key (the budget ran out
+                    // before the valid entry) and 1 if we do not.
                     let mut counted: Vec<NodeId> = Vec::new();
                     let mut valid = 0usize;
                     let mut candidates = 0usize;
@@ -4424,47 +4636,41 @@ impl Node {
                             break;
                         }
                         if counted.contains(&cs.node_id) {
-                            debug!("Duplicate emergency co-signer {}", cs.node_id);
                             continue;
                         }
                         counted.push(cs.node_id);
 
-                        // An unverifiable approval is no approval, and saying
-                        // so costs one indexed lookup.
-                        let Some(key) = db.get_contact_identity_key(&cs.node_id) else {
-                            debug!(
-                                "No identity key held for emergency co-signer {}",
-                                cs.node_id
-                            );
+                        // Our own approval counts. The contacts table never
+                        // holds this node's own identity, so looking there
+                        // first made a receiver that co-signed the alert
+                        // discard its own signature and refuse an alert it had
+                        // approved.
+                        let held = if cs.node_id == local_id {
+                            Some(local_identity_key)
+                        } else {
+                            // An unverifiable approval is no approval, and
+                            // saying so costs one indexed lookup.
+                            db.get_contact_identity_key(&cs.node_id)
+                        };
+                        let Some(key) = held else {
                             continue;
                         };
                         candidates += 1;
 
                         if tg.trust_score(&local_id, &cs.node_id).value <= 0.8 {
-                            debug!(
-                                "Emergency co-signer {} is not trusted above 0.8",
-                                cs.node_id
-                            );
                             continue;
                         }
-                        if let Err(reason) =
-                            mycelium_crypto::emergency::verify_cosigner(cs, Some(key), &ctx)
+                        if mycelium_crypto::emergency::verify_cosigner(cs, Some(key), &ctx).is_err()
                         {
-                            debug!(
-                                "Emergency co-signature from {} not counted: {:?}",
-                                cs.node_id, reason
-                            );
                             continue;
                         }
                         valid += 1;
                     }
                     if valid < 3 {
                         debug!(
-                            "Critical emergency from {} rejected: {} of {} co-signatures valid \
-                             and trusted (need 3)",
-                            envelope.source,
-                            valid,
-                            broadcast.cosigners.len()
+                            "Critical emergency from {} rejected: too few counted \
+                             co-signatures",
+                            envelope.source
                         );
                     }
                     valid >= 3
@@ -4483,18 +4689,7 @@ impl Node {
 
         // Accepted — and only now remembered, so that a copy we refused can
         // never stand in for one we would have taken.
-        let copy = seen.write().await.accept(
-            broadcast.level,
-            FloodMark {
-                key: digest,
-                reach,
-                // Hold the entry until this broadcast could no longer be
-                // accepted on its date, whatever the monotonic clock does: a
-                // backward clock correction must not retire the entry while
-                // the alert it covers is still fresh (ADR-013).
-                keep_until: broadcast.signed_at.saturating_add(EMERGENCY_VALIDITY_SECS),
-            },
-        );
+        let copy = seen.write().await.accept(broadcast.level, mark);
         if copy == FloodCopy::Duplicate {
             // Another copy of the same broadcast was accepted while this one
             // was being checked; it has already been reported and forwarded.

@@ -376,3 +376,44 @@ design decision rather than a dedup fix. Recorded as ROADMAP T-37.
    protection, but it needs per-originator state that survives restarts on
    every node in the mesh, for a message type that arrives from nodes a
    receiver has never heard from. A validity window needs no state at all.
+
+## Note (2026-11-13)
+
+**ADR-014 supersedes parts of this record.** Following it as written now
+produces packets every receiver refuses.
+
+- **The body has two more fields.** It is `level(1) ‖ signed_at(8 LE) ‖
+  identity_key(32) ‖ signature(64) ‖ msg_len(4 LE) ‖ message ‖
+  cosigner_count(1) ‖ cosigners(N × 96)`, and the minimum body is 110 bytes,
+  not 14. The originator's signature over the alert *and* its approval list is
+  mandatory at every level, and is checked before the trust gate.
+- **"Emergency broadcasts are not origin-authenticated" no longer holds.** That
+  paragraph described the state this record left behind; ADR-014 closes it. A
+  stranger can no longer name a source its neighbours trust, and a relay can
+  no longer strip or pad the approvals.
+- **"A relay can weaken the approval set it passes on" is closed too**, by the
+  same signature — along with the reasoning here about why no bookkeeping in
+  this layer could close it. That reasoning was right: the answer was
+  authentication, not bookkeeping.
+- **The dedup identity stays `broadcast_digest`.** This record's "what this
+  does not fix" suggested the origin signature would let the dedup identity
+  cover the approvals. It must not: the originator holds the signing key, so
+  it could pad the list and re-sign into arbitrarily many accepted entries,
+  which is this record's own capacity argument broken. One alert is one entry.
+- **Reach is tracked per approval list, not per entry.** The reach rule above
+  describes one figure per entry. An entry now keeps up to three
+  `(approval-list digest, reach forwarded)` pairs, and a copy is worth
+  forwarding only if it reaches further than *its own* list already did, or
+  brings a list with a free slot. A single pair could not express "this list
+  travelled 20 hops, that one travelled none", which let a spent-TTL copy of a
+  new list block the copy that could carry it, and let a higher TTL buy a slot
+  past the ceiling.
+- **The "21 sends per node" bound above is withdrawn.** It was already
+  corrected here for *rejected* copies; with per-list reach the forwarding
+  bound is `MAX_APPROVAL_LISTS` (3) distinct lists, each advancing only while
+  its own reach increases, so the figure is bounded but no longer 21.
+
+What this record still governs unchanged: verify-before-remember, the digest
+as the dedup key, `signed_at` and the freshness window, dual-clock retention
+with its grace, per-level and per-flood-type sets, the destination rule, and
+the strict body parsing.

@@ -4,8 +4,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 
-use mycelium_protocol::codec::Envelope;
-use mycelium_protocol::types::{MessageFlags, MessageId, NodeId, ProtocolVersion};
 use mycelium_protocol::wire;
 
 use crate::state::AppState;
@@ -28,34 +26,24 @@ pub async fn broadcast(
         )
     })?;
 
-    let message_id = MessageId::random();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // `signed_at` is what bounds replay of this alert at every receiver, and
-    // it is covered by any co-signature collected over it (ADR-013).
-    let payload = wire::serialize_emergency_broadcast(level, now, req.message.as_bytes(), &[]);
-
-    let envelope = Envelope {
-        source: state.node.node_id,
-        destination: NodeId::ZERO, // broadcast
-        message_id,
-        ttl: 20, // higher TTL for emergencies
-        hop_count: 0,
-        flags: MessageFlags::NONE,
-        lamport_clock: 0,
-        device_timestamp: now,
-        protocol_version: ProtocolVersion::CURRENT,
-        payload,
-    };
-
-    // Flood to all connected peers
-    let data = envelope.serialize();
-    let peers = state.node.transport_manager.known_peers().await;
-    for p in peers {
-        let _ = state.node.transport_manager.send(&p, &data).await;
-    }
+    // The node signs and floods it: the identity lives there, and the
+    // signature covers the approval list, so only the originator can produce
+    // one (ADR-014). `signed_at` is what bounds replay of this alert at every
+    // receiver (ADR-013). Co-signature collection is ROADMAP T-05, so the
+    // list is empty and a level-3 alert is still refused by every receiver.
+    let draft = state.node.draft_emergency(level, req.message.as_bytes());
+    let message_id = state.node.raise_emergency(draft, &[]).await.map_err(|e| {
+        // An alert too large for the smallest transport an emergency must
+        // cross is refused here rather than flooded to the subset of the
+        // mesh that can carry it (ROADMAP T-39).
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ApiError {
+                error: e.to_string(),
+                code: 400,
+            }),
+        )
+    })?;
 
     // Record in event log
     state.record_event(

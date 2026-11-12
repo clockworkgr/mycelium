@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use mycelium_core::transport::mock::{MockLinkConfig, MockNetwork, MockTransport};
 use mycelium_core::transport::{Transport, TransportEvent};
+use mycelium_crypto::emergency::OriginRejection;
 use mycelium_crypto::emergency::{self, BroadcastContext};
 use mycelium_crypto::identity::Identity;
 use mycelium_node::config::NodeConfig;
@@ -37,7 +38,10 @@ struct Harness {
     bob_id: NodeId,
     relay: Arc<MockTransport>,
     network: Arc<MockNetwork>,
-    originator: NodeId,
+    /// The alert's originator. An identity rather than an id, because a
+    /// broadcast now carries its key and a signature over the alert and its
+    /// approvals (ADR-014).
+    originator: Identity,
     cosigners: Vec<Identity>,
 }
 
@@ -63,9 +67,11 @@ async fn harness() -> Harness {
         .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Three co-signers Bob trusts directly (1-hop trust is 1.0, above the
-    // 0.8 threshold) and whose Ed25519 keys he holds.
-    let cosigners: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    // Four co-signers Bob trusts directly (1-hop trust is 1.0, above the 0.8
+    // threshold) and whose Ed25519 keys he holds. Four rather than three so a
+    // test can strip one and still clear the "three valid" gate, which is the
+    // only way to tell the origin signature is doing the work.
+    let cosigners: Vec<Identity> = (0..4).map(|_| Identity::generate()).collect();
     {
         let mut tg = bob.trust_graph.write().await;
         for c in &cosigners {
@@ -85,7 +91,7 @@ async fn harness() -> Harness {
             .expect("contact saved");
     }
 
-    let originator = Identity::generate().node_id();
+    let originator = Identity::generate();
     Harness {
         bob,
         bob_id,
@@ -97,6 +103,11 @@ async fn harness() -> Harness {
 }
 
 impl Harness {
+    fn originator_id(&self) -> NodeId {
+        self.originator.node_id()
+    }
+
+    /// An alert signed by its originator, as a genuine one is.
     fn envelope(
         &self,
         id: MessageId,
@@ -105,8 +116,30 @@ impl Harness {
         message: &[u8],
         cosigners: &[EmergencyCosigner],
     ) -> Envelope {
+        self.envelope_signed_by(&self.originator, id, level, signed_at, message, cosigners)
+    }
+
+    /// An alert claiming `self.originator` as its source but signed by
+    /// `signer` — what an attacker in radio range can produce.
+    fn envelope_signed_by(
+        &self,
+        signer: &Identity,
+        id: MessageId,
+        level: EmergencyLevel,
+        signed_at: u64,
+        message: &[u8],
+        cosigners: &[EmergencyCosigner],
+    ) -> Envelope {
+        let ctx = BroadcastContext {
+            broadcast_id: &id,
+            originator: &self.originator_id(),
+            level,
+            signed_at,
+            message,
+        };
+        let signature = emergency::sign_broadcast(signer, &ctx, cosigners);
         Envelope {
-            source: self.originator,
+            source: self.originator_id(),
             destination: NodeId::ZERO,
             message_id: id,
             ttl: 20,
@@ -115,7 +148,14 @@ impl Harness {
             lamport_clock: 0,
             device_timestamp: signed_at,
             protocol_version: ProtocolVersion::CURRENT,
-            payload: wire::serialize_emergency_broadcast(level, signed_at, message, cosigners),
+            payload: wire::serialize_emergency_broadcast(
+                level,
+                signed_at,
+                &signer.public_key_bytes(),
+                &signature,
+                message,
+                cosigners,
+            ),
         }
     }
 
@@ -129,7 +169,7 @@ impl Harness {
     ) -> Vec<EmergencyCosigner> {
         let ctx = BroadcastContext {
             broadcast_id: id,
-            originator: &self.originator,
+            originator: &self.originator_id(),
             level,
             signed_at,
             message,
@@ -468,6 +508,183 @@ async fn test_an_alert_addressed_to_us_is_not_a_flood() {
     h.bob.stop().await;
 }
 
+/// The defect T-37 closes: the trust gate scores the id in the packet, not the
+/// peer that sent it, so an attacker needed no standing of its own — name a
+/// source the receiver trusts and the alert was accepted and flooded. Only a
+/// signature bound to that source stops it (ADR-014).
+#[tokio::test]
+async fn test_an_alert_signed_by_the_wrong_key_is_refused() {
+    let h = harness().await;
+    let (downstream, _) = h.downstream().await;
+    let mut relayed = downstream.events();
+
+    // Bob trusts the originator directly, so the trust gate would pass.
+    {
+        let mut tg = h.bob.trust_graph.write().await;
+        tg.add_vouch(h.bob_id, h.originator_id());
+    }
+
+    let signed_at = unix_now();
+    let message = b"evacuate sector 7";
+    let attacker = Identity::generate();
+
+    let mut events = h.bob.event_tx.subscribe();
+
+    // Level 2 is the sharp case: no co-signatures are involved, so before the
+    // origin signature there was nothing at all to check.
+    let forged = h.envelope_signed_by(
+        &attacker,
+        MessageId::random(),
+        EmergencyLevel::Urgent,
+        signed_at,
+        message,
+        &[],
+    );
+    h.deliver(&forged).await;
+    assert_eq!(
+        next_alert(&mut events, Duration::from_millis(300)).await,
+        None,
+        "an alert signed by a key that does not hash to its source is not an alert"
+    );
+    assert!(
+        forwarded_alert(&mut relayed, Duration::from_millis(200))
+            .await
+            .is_none(),
+        "and nothing of it is passed on"
+    );
+
+    // The same alert from the originator itself is accepted, so the refusal
+    // above is about the signature and nothing else.
+    let genuine = h.envelope(
+        MessageId::random(),
+        EmergencyLevel::Urgent,
+        signed_at,
+        message,
+        &[],
+    );
+    h.deliver(&genuine).await;
+    assert_eq!(
+        next_alert(&mut events, Duration::from_secs(2))
+            .await
+            .as_deref(),
+        Some("evacuate sector 7"),
+        "a genuine level-2 alert from a trusted originator must be accepted"
+    );
+
+    h.bob.stop().await;
+}
+
+/// A relay must not be able to weaken the approval list it passes on: the
+/// originator's signature covers it, so a stripped copy is refused outright
+/// rather than accepted with fewer approvals (ADR-014).
+#[tokio::test]
+async fn test_an_alert_with_a_stripped_approval_list_is_refused() {
+    let h = harness().await;
+    let id = MessageId::random();
+    let signed_at = unix_now();
+    let message = b"evacuate sector 7";
+    let approvals = h.approvals(&id, EmergencyLevel::Critical, signed_at, message);
+
+    // Signed over four approvals, delivered carrying three — so the copy
+    // still clears the "three distinct valid co-signatures" gate, and only
+    // the origin signature can tell it was edited.
+    assert_eq!(approvals.len(), 4, "the harness provides four approvals");
+    let full = h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals);
+    let mut stripped = full.clone();
+    stripped.payload = wire::serialize_emergency_broadcast(
+        EmergencyLevel::Critical,
+        signed_at,
+        &h.originator.public_key_bytes(),
+        &full_signature(&full),
+        message,
+        &approvals[..3],
+    );
+
+    let mut events = h.bob.event_tx.subscribe();
+
+    h.deliver(&stripped).await;
+    assert_eq!(
+        next_alert(&mut events, Duration::from_millis(300)).await,
+        None,
+        "the origin signature covers the approval list, so a stripped copy fails it"
+    );
+
+    h.deliver(&full).await;
+    assert_eq!(
+        next_alert(&mut events, Duration::from_secs(2))
+            .await
+            .as_deref(),
+        Some("evacuate sector 7"),
+        "the full alert is still accepted afterwards"
+    );
+
+    h.bob.stop().await;
+}
+
+/// A relay that strips approvals is refused, so the full copy behind it has to
+/// get through — and be forwarded, since downstream nodes may hold keys for
+/// the approvals this one could not check. It must not raise a second alert
+/// locally (ADR-014).
+#[tokio::test]
+async fn test_a_fuller_approval_list_is_forwarded_without_raising_a_second_alert() {
+    let h = harness().await;
+    let (downstream, _) = h.downstream().await;
+    let mut relayed = downstream.events();
+
+    let id = MessageId::random();
+    let signed_at = unix_now();
+    let message = b"evacuate sector 7";
+    let approvals = h.approvals(&id, EmergencyLevel::Critical, signed_at, message);
+
+    // Both are genuine alerts from the originator; the second carries one
+    // more approval, which is a different signed list and so a new origin.
+    let three = h.envelope(
+        id,
+        EmergencyLevel::Critical,
+        signed_at,
+        message,
+        &approvals[..3],
+    );
+    let four = h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals);
+
+    let mut events = h.bob.event_tx.subscribe();
+
+    h.deliver(&three).await;
+    assert_eq!(
+        next_alert(&mut events, Duration::from_secs(2))
+            .await
+            .as_deref(),
+        Some("evacuate sector 7")
+    );
+    assert!(
+        forwarded_alert(&mut relayed, Duration::from_secs(2))
+            .await
+            .is_some(),
+        "the first copy is flooded onward"
+    );
+
+    h.deliver(&four).await;
+    let onward = forwarded_alert(&mut relayed, Duration::from_secs(2)).await;
+    assert!(
+        onward.is_some(),
+        "a copy with a fuller approval list must travel too"
+    );
+    assert_eq!(
+        next_alert(&mut events, Duration::from_millis(300)).await,
+        None,
+        "but the alert must not be reported to this node twice"
+    );
+
+    h.bob.stop().await;
+}
+
+/// The signature out of an alert envelope, for building a copy that keeps it.
+fn full_signature(envelope: &Envelope) -> [u8; 64] {
+    wire::deserialize_emergency_broadcast(&envelope.payload[1..])
+        .expect("a signed alert parses")
+        .signature
+}
+
 /// Flood termination still has to work: a verbatim re-delivery of an accepted
 /// alert raises nothing a second time.
 #[tokio::test]
@@ -538,13 +755,20 @@ async fn test_a_channel_message_addressed_to_us_is_not_a_flood() {
     let channel = [7u8; 32];
     h.bob
         .db
-        .create_channel(&channel, "test", &h.originator)
+        .create_channel(&channel, "test", &h.originator_id())
         .expect("channel row");
     h.bob.db.subscribe_channel(&channel).expect("subscribed");
 
     let id = MessageId::random();
-    let forged = channel_envelope(h.originator, h.bob_id, id, 20, &channel, b"forged");
-    let genuine = channel_envelope(h.originator, NodeId::ZERO, id, 20, &channel, b"genuine");
+    let forged = channel_envelope(h.originator_id(), h.bob_id, id, 20, &channel, b"forged");
+    let genuine = channel_envelope(
+        h.originator_id(),
+        NodeId::ZERO,
+        id,
+        20,
+        &channel,
+        b"genuine",
+    );
 
     h.deliver(&forged).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -586,7 +810,7 @@ async fn test_a_forged_channel_copy_does_not_suppress_the_real_message() {
     let id = MessageId::random();
 
     h.deliver(&channel_envelope(
-        h.originator,
+        h.originator_id(),
         NodeId::ZERO,
         id,
         20,
@@ -601,7 +825,7 @@ async fn test_a_forged_channel_copy_does_not_suppress_the_real_message() {
     );
 
     h.deliver(&channel_envelope(
-        h.originator,
+        h.originator_id(),
         NodeId::ZERO,
         id,
         20,
@@ -653,6 +877,277 @@ async fn test_a_flood_addressed_to_a_third_node_is_not_relayed() {
         next_alert(&mut events, Duration::from_millis(200)).await,
         None,
         "and it is not an alert for this node either"
+    );
+
+    h.bob.stop().await;
+}
+
+// --- Raising an alert through the node ------------------------------------
+
+/// A co-signature covers the broadcast id and the signing date, so both must
+/// be fixed before approvals are collected — a send path that minted a fresh
+/// id would make every collected approval useless (ADR-010, ADR-014).
+#[tokio::test]
+async fn test_an_alert_cosigned_over_its_draft_is_accepted() {
+    let alice_identity = Identity::generate();
+    let alice_id = alice_identity.node_id();
+    let alice = Node::new(
+        NodeConfig::default(),
+        Database::open_in_memory().expect("in-memory DB"),
+        alice_identity,
+    );
+
+    let bob_identity = Identity::generate();
+    let bob_id = bob_identity.node_id();
+    let bob = Node::new(
+        NodeConfig::default(),
+        Database::open_in_memory().expect("in-memory DB"),
+        bob_identity,
+    );
+
+    let network = MockNetwork::new();
+    alice
+        .transport_manager
+        .add_transport(Arc::new(
+            MockTransport::new(alice_id, network.clone()).await,
+        ))
+        .await;
+    bob.transport_manager
+        .add_transport(Arc::new(MockTransport::new(bob_id, network.clone()).await))
+        .await;
+    alice.start().await.expect("alice starts");
+    bob.start().await.expect("bob starts");
+    network
+        .add_link(alice_id, bob_id, MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Bob trusts three co-signers and holds their keys.
+    let cosigners: Vec<Identity> = (0..3).map(|_| Identity::generate()).collect();
+    {
+        let mut tg = bob.trust_graph.write().await;
+        for c in &cosigners {
+            tg.add_vouch(bob_id, c.node_id());
+        }
+    }
+    for c in &cosigners {
+        bob.db
+            .save_contact(&ContactRecord {
+                node_id: c.node_id(),
+                display_name: "cosigner".to_string(),
+                public_key: c.public_key_bytes().to_vec(),
+                trust_score: 1.0,
+                is_verified: true,
+                last_seen: None,
+            })
+            .expect("contact saved");
+    }
+
+    let mut events = bob.event_tx.subscribe();
+
+    // Draft first, collect approvals over the draft, then raise it.
+    let draft = alice.draft_emergency(EmergencyLevel::Critical, b"evacuate sector 7");
+    let digest = alice.emergency_cosign_digest(&draft);
+    let approvals: Vec<EmergencyCosigner> = cosigners
+        .iter()
+        .map(|c| EmergencyCosigner {
+            node_id: c.node_id(),
+            signature: c.sign(&digest).to_bytes(),
+        })
+        .collect();
+    alice
+        .raise_emergency(draft, &approvals)
+        .await
+        .expect("alice can raise it");
+
+    assert_eq!(
+        next_alert(&mut events, Duration::from_secs(2))
+            .await
+            .as_deref(),
+        Some("evacuate sector 7"),
+        "approvals collected over the draft must match the alert that is sent"
+    );
+
+    alice.stop().await;
+    bob.stop().await;
+}
+
+/// The co-signer count is one byte, so a longer list must be cut before both
+/// signing and serialization — cutting it after signing would produce
+/// broadcasts whose own signature can never verify.
+#[tokio::test]
+async fn test_an_oversized_approval_list_still_produces_a_verifiable_alert() {
+    let alice_identity = Identity::generate();
+    let alice_id = alice_identity.node_id();
+    let alice = Node::new(
+        NodeConfig::default(),
+        Database::open_in_memory().expect("in-memory DB"),
+        alice_identity,
+    );
+
+    let network = MockNetwork::new();
+    alice
+        .transport_manager
+        .add_transport(Arc::new(
+            MockTransport::new(alice_id, network.clone()).await,
+        ))
+        .await;
+    alice.start().await.expect("alice starts");
+
+    let observer_id = Identity::generate().node_id();
+    let observer = Arc::new(MockTransport::new(observer_id, network.clone()).await);
+    observer.start().await.expect("observer starts");
+    network
+        .add_link(alice_id, observer_id, MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut seen = observer.events();
+
+    let draft = alice.draft_emergency(EmergencyLevel::Critical, b"evacuate sector 7");
+    let digest = alice.emergency_cosign_digest(&draft);
+    let signed_at = draft.signed_at;
+    let id = draft.message_id;
+    let many: Vec<EmergencyCosigner> = (0..300)
+        .map(|_| {
+            let c = Identity::generate();
+            EmergencyCosigner {
+                node_id: c.node_id(),
+                signature: c.sign(&digest).to_bytes(),
+            }
+        })
+        .collect();
+    alice
+        .raise_emergency(draft, &many)
+        .await
+        .expect("the mock transport's MTU is wide enough to carry it");
+
+    let envelope = forwarded(
+        &mut seen,
+        Duration::from_secs(2),
+        wire::WirePayloadType::EmergencyBroadcast,
+    )
+    .await
+    .expect("alice floods the alert");
+    let parsed = wire::deserialize_emergency_broadcast(&envelope.payload[1..])
+        .expect("a 300-approval alert must still serialize to something parseable");
+    assert_eq!(parsed.cosigners.len(), wire::MAX_EMERGENCY_COSIGNERS);
+
+    let ctx = BroadcastContext {
+        broadcast_id: &id,
+        originator: &alice_id,
+        level: EmergencyLevel::Critical,
+        signed_at,
+        message: b"evacuate sector 7",
+    };
+    assert_eq!(
+        emergency::verify_origin(
+            &parsed.identity_key,
+            &alice_id,
+            &ctx,
+            &parsed.cosigners,
+            &parsed.signature
+        ),
+        Ok(()) as Result<(), OriginRejection>,
+        "the list must be cut before signing, not after"
+    );
+
+    alice.stop().await;
+}
+
+/// An alert is `217 + message_bytes + 96 × approvals` on the wire, so with a
+/// BLE transport registered and no approvals it has 295 bytes of message to
+/// spend — not characters, since a multi-byte character costs more than one.
+/// A node refuses the alert that does not fit rather than flooding the links
+/// that can carry it and stopping silently at every phone (T-39).
+#[tokio::test]
+async fn test_an_alert_too_large_for_the_narrowest_transport_is_refused() {
+    use mycelium_core::transport::ble::BleTransport;
+
+    let identity = Identity::generate();
+    let node_id = identity.node_id();
+    let node = Node::new(
+        NodeConfig::default(),
+        Database::open_in_memory().expect("in-memory DB"),
+        identity,
+    );
+    node.transport_manager
+        .add_transport(Arc::new(BleTransport::new(node_id)))
+        .await;
+
+    // ASCII, so 295 characters is 295 bytes.
+    let fits = "x".repeat(295);
+    let draft = node.draft_emergency(EmergencyLevel::Urgent, fits.as_bytes());
+    assert!(
+        node.raise_emergency(draft, &[]).await.is_ok(),
+        "295 bytes is the most that fits BLE's 512-byte message"
+    );
+
+    let one_too_many = "x".repeat(296);
+    let draft = node.draft_emergency(EmergencyLevel::Urgent, one_too_many.as_bytes());
+    match node.raise_emergency(draft, &[]).await {
+        Err(mycelium_node::node::NodeError::AlertTooLarge { size, limit }) => {
+            assert_eq!(size, 513);
+            assert_eq!(limit, 512);
+        }
+        other => panic!("expected a refusal at 513 bytes, got {other:?}"),
+    }
+
+    // 148 three-byte characters are 444 bytes and fit; 149 are 447 and do not
+    // reach the limit either, so take the first count that does: the point is
+    // that the limit counts bytes, so far fewer characters fit.
+    let multibyte = "€".repeat(99); // 297 bytes
+    assert_eq!(multibyte.len(), 297);
+    let draft = node.draft_emergency(EmergencyLevel::Urgent, multibyte.as_bytes());
+    assert!(
+        node.raise_emergency(draft, &[]).await.is_err(),
+        "99 three-byte characters are 297 bytes, over the same limit that 295 \
+         ASCII characters just met"
+    );
+}
+
+/// A receiver that co-signed the alert must count its own approval. The
+/// contacts table never holds a node's own identity, so looking there first
+/// made Bob discard the signature he had produced himself and refuse an alert
+/// he had approved (ADR-010).
+#[tokio::test]
+async fn test_a_receiver_counts_its_own_co_signature() {
+    let h = harness().await;
+
+    // Bob is one of the three approvers; the other two are harness
+    // co-signers, whose keys he holds and whom he trusts.
+    {
+        let mut tg = h.bob.trust_graph.write().await;
+        tg.add_vouch(h.bob_id, h.originator_id());
+    }
+
+    let id = MessageId::random();
+    let signed_at = unix_now();
+    let message = b"evacuate sector 7";
+    let ctx = BroadcastContext {
+        broadcast_id: &id,
+        originator: &h.originator_id(),
+        level: EmergencyLevel::Critical,
+        signed_at,
+        message,
+    };
+    let digest = emergency::broadcast_digest(&ctx);
+
+    let mut approvals = vec![EmergencyCosigner {
+        node_id: h.bob_id,
+        signature: h.bob.identity.sign(&digest).to_bytes(),
+    }];
+    approvals.extend(h.approvals(&id, EmergencyLevel::Critical, signed_at, message)[..2].to_vec());
+
+    let mut events = h.bob.event_tx.subscribe();
+    h.deliver(&h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals))
+        .await;
+
+    assert_eq!(
+        next_alert(&mut events, Duration::from_secs(2))
+            .await
+            .as_deref(),
+        Some("evacuate sector 7"),
+        "Bob's own approval is one of the three"
     );
 
     h.bob.stop().await;

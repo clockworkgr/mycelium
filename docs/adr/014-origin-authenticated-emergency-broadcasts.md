@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2026-11-12). **Implementation pending — ROADMAP T-37.**
+Accepted (2026-11-12). **Partially implemented (2026-11-13) — ROADMAP T-37.**
+The origin authentication below is built; the per-level behaviour is not. See
+the note at the end.
 
 ## Context
 
@@ -123,6 +125,26 @@ level-1 alert costs the network exactly as much as a mesh-wide emergency.
 - The originator signs after collecting approvals, so the signature cannot be
   computed until the co-signature exchange T-05 builds has finished. A level-3
   alert therefore has an ordering constraint its API shape must respect.
+- **An alert can no longer fit BLE.** On the wire an alert is
+
+  ```
+  217 + message_bytes + 96 × approvals
+  ```
+
+  (106-byte envelope, 111-byte body overhead including this record's key and
+  signature), against the BLE transport's 512-byte message cap, which it
+  enforces by refusing the send. So three approvals leave 7 bytes of message,
+  and no approvals leave 295 — where before this record they left 391. The
+  familiar "522 bytes" is one point on that line: three approvals and a
+  17-byte message. Recorded as ROADMAP T-39; the choices are message-level
+  fragmentation in the BLE transport or a smaller co-signer entry, and neither
+  belongs in this decision.
+
+  What this record does do about it: a node refuses to raise an alert larger
+  than the narrowest transport it has registered, and says so, rather than
+  flooding the links that can carry it and stopping silently at the rest. On a
+  phone that is BLE's 512 bytes; on a daemon with only internet links it is
+  whatever those allow.
 - The relay path gains a priority queue, and reach becomes per level. Both are
   new behaviour on the emergency path, which means new tests rather than
   adapted ones.
@@ -169,3 +191,37 @@ and 2 travel less far than a level-3 flood; the constants are to be set against
 the testbed (ROADMAP T-19) or real hardware (T-15), not guessed here, because
 what a useful reach is depends on mesh diameter and density. The rule they must
 satisfy: level 3's reach is `MAX_FLOOD_TTL`, and 1 and 2 are strictly below it.
+
+## Note (2026-11-13)
+
+The authentication half is implemented. What that meant in practice, beyond
+what is written above:
+
+- **The id and date are fixed before approvals are collected.** A co-signature
+  covers both (ADR-010), so a send path that minted the id itself would make
+  every collected approval useless. `Node::draft_emergency` fixes them,
+  `emergency_cosign_digest` says what a co-signer signs, and
+  `raise_emergency(draft, cosigners)` signs last and floods. The API delegates
+  to those rather than building envelopes itself.
+- **One cap, before signing and serializing.** The co-signer count is a single
+  byte; signing a longer list than the wire can carry produced broadcasts whose
+  own signature could never verify.
+- **Dedup tracks reach per approval list, not per alert.** The rule above —
+  forward a copy carrying a better-authenticated list, up to a ceiling — needs
+  to know how far *each* list has already travelled. One `(list, reach)` pair
+  per entry was not enough: a relay delivering a new list with its TTL spent
+  recorded the list while forwarding nothing, and then the copy that could
+  carry it looked like a duplicate; and once the ceiling was reached, any copy
+  with a higher TTL slipped past it whatever list it carried. An entry now
+  keeps up to three `(approval-list digest, reach forwarded)` pairs — the
+  first list plus two improvements — and a copy is worth forwarding only if it
+  reaches further than *its own* list already did, or brings a list with a
+  free slot.
+
+**What remains (the second half of this record):** the per-level behaviour.
+Every accepted broadcast still floods at the same reach, nothing consults the
+level when relaying, and the per-originator rate limit is skipped for all
+levels. The reach limits and the two-class send queue are the work; the queue's
+scope — floods only, all relayed traffic, or every outbound send — is the
+question to settle before building it, because it decides whether this is a
+contained change or one that touches every forward path.

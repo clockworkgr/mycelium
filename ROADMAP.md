@@ -1,6 +1,6 @@
 # Mycelium Roadmap
 
-**Last updated:** 2026-11-12 · **Current version:** 0.1 (pre-release)
+**Last updated:** 2026-11-13 · **Current version:** 0.1 (pre-release)
 
 The companion document is [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md), which
 specifies the protocol and describes what is built. This document tracks only
@@ -9,11 +9,12 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-12 against the working tree, after the T-36 work:
+Verified on 2026-11-13 against the working tree, after T-37's origin
+authentication:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **423 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **442 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -165,6 +166,10 @@ level-3 broadcast is now refused by every receiver. Unusable is the correct
 failure direction for a mesh-wide flood (it was previously forgeable), but
 level 3 is unavailable until this is built.
 
+**Blocked on T-39 for BLE:** a three-approval alert is 522 bytes against
+BLE's 512-byte cap, so collection delivers alerts that cannot traverse the
+project's primary transport until that is fixed.
+
 **Acceptance:**
 - A wire exchange by which an originator requests approval from trusted peers
   and receives signed co-signatures, with a bounded wait and no amplification.
@@ -172,12 +177,13 @@ level 3 is unavailable until this is built.
   message, since a co-signer is vouching for a mesh-wide flood.
 - `POST /v1/emergency/broadcast` accepts or gathers co-signatures for level 3
   and returns a clear error when fewer than three are obtained.
-- The originator signs the broadcast **including** its co-signer list, so a
+- ~~The originator signs the broadcast **including** its co-signer list, so a
   relay can neither strip approvals a downstream node could have verified nor
-  pad the list; flood-dedup identity then covers the approvals (ADR-013,
-  T-37). Without this, a relay can forward a weaker approval set than it
-  received and a receiver cannot tell an approval it cannot verify from one
-  invented on the spot.
+  pad the list.~~ Landed with T-37 (ADR-014). Note the correction: flood-dedup
+  identity stays `broadcast_digest` and must **not** cover the approvals, or
+  the originator can pad and re-sign one alert into arbitrarily many accepted
+  entries; forwarding for a better-authenticated list is tracked separately,
+  per list, under a ceiling.
 - An end-to-end test: four nodes, three approve, the flood is accepted; with
   two approvals it is refused everywhere.
 
@@ -337,6 +343,18 @@ initiator will act on: accept the altered copy, then replay the original.
 **Area:** `mycelium-node`, `mycelium-protocol` · **Spec:** §9.5 · **ADR-010**,
 **ADR-013**, **ADR-014** (design decided 2026-11-12)
 
+**Landed 2026-11-13 (ADR-014): the origin is authenticated.** A broadcast
+carries the originator's identity key and a signature over the alert *and* its
+approval list, verified against `SHA-256(identity_key) == envelope.source`
+before the trust gate. A stranger can no longer name a source its neighbours
+trust, a relay can no longer strip or pad the approvals, and the id and date
+are fixed before collection so co-signatures can be gathered over them
+(`draft_emergency` → `emergency_cosign_digest` → `raise_emergency`). Flood
+dedup stays keyed on the alert, with reach tracked per approval list under a
+ceiling of three.
+
+**What remains: the levels still do not differ.** Defect 2 below is untouched.
+
 Two related defects, found while fixing T-36:
 
 1. **Nothing authenticates the originator.** Levels 1 and 2 carry no signature
@@ -364,24 +382,19 @@ Two related defects, found while fixing T-36:
    without a flood.
 
 **Acceptance:**
-- An emergency broadcast carries the originator's `identity_key(32)` and a
-  `signature(64)` over the broadcast digest, at every level. A receiver drops
-  it unless `SHA-256(identity_key) == envelope.source` and the signature
-  verifies, checked *before* the trust gate (ADR-014). Carrying the key is
-  what lets a receiver with no prior contact verify an alert.
-- The signature is over its own digest — `broadcast_digest ‖ cosigner_count ‖
-  each (node_id ‖ signature)` under a distinct context — so the approval set
-  cannot be stripped or padded in flight (ADR-014). Flood dedup stays keyed on
-  `broadcast_digest`, *not* on that digest: keying on it would let the
-  originator pad and re-sign one alert into arbitrarily many accepted entries.
-  A copy with a different authenticated approval list is forwarded again only
-  under a bounded counter per `broadcast_digest`. This is the half T-36 could not close: a receiver
+- ~~An emergency broadcast carries the originator's `identity_key(32)` and a
+  `signature(64)`, verified against `SHA-256(identity_key) ==
+  envelope.source` before the trust gate.~~ Landed 2026-11-13.
+- ~~The signature covers its own digest over the alert and the approval list,
+  while dedup stays keyed on the alert; a copy with a different authenticated
+  list is forwarded again only under a ceiling.~~ Landed 2026-11-13, with
+  reach tracked per list rather than per alert. This is the half T-36 could not close: a receiver
   cannot distinguish an approval it cannot verify from one invented on the
   spot. No circularity, since a co-signer signs the alert digest and the
   originator signs last, over the approvals it collected — which means a
   level-3 alert cannot be signed until T-05's collection has finished.
-- An originator with no identity cannot raise an alert, and the API refuses to
-  send one rather than sending what no receiver will take.
+- ~~An originator with no identity cannot raise an alert.~~ Structural:
+  `Node::raise_emergency` signs with the node's own identity.
 - Each level's behaviour matches spec §9.5: level 1 gets relay-queue priority
   and a reach below a flood, level 2 is exempt from the per-originator rate
   limit (and only level 2), level 3 is the only level that floods mesh-wide
@@ -436,6 +449,53 @@ fill the store, or both.
   capacity.
 - Tests: eviction pressure followed by a replay of an evicted record is
   refused; a store filled by one publisher still admits records from others.
+
+---
+
+### T-39 · A co-signed emergency alert does not fit BLE
+
+**Area:** `mycelium-core`, `mycelium-protocol` · **Spec:** §8.4, §9.5 ·
+**ADR-014**
+
+The BLE transport caps a message at 512 bytes and enforces it by refusing the
+send (`TransportError::ExceedsMtu`). A critical alert carrying three approvals
+is larger than that:
+
+```
+wire size = 217 + message_bytes + 96 × approvals
+
+  217 = 106 envelope header
+      + 111 body overhead: type(1) level(1) signed_at(8)
+             identity_key(32) signature(64) msg_len(4) count(1)
+   96 = one co-signer entry: node_id(32) + signature(64)   (ADR-010)
+```
+
+Against 512 that leaves **7 bytes of message with three approvals** and **295
+with none** — where before T-37's key and signature it was 391. A
+three-approval alert carrying "evacuate sector 7" is 522 bytes, which is the
+figure this task is usually quoted with, but the constraint is the formula, not
+that example. The Rust BLE transport has no message-level fragmentation — the 1-byte
+fragment header in spec §8.4 is the platform layer's GATT-write framing, below
+this cap — so an oversized alert simply does not traverse BLE.
+
+Nothing collects co-signatures yet (T-05), so the three-approval case is
+latent and becomes live the moment collection lands; the long-message case is
+live now. Found by reviewing T-37's size against the transports.
+
+**Mitigated, not fixed (2026-11-13):** `Node::raise_emergency` refuses an
+alert larger than the narrowest transport the node has registered
+(`TransportManager::min_mtu`) and the API returns 400, so an originator learns
+instead of the mesh truncating silently. A relay that cannot pass a flood on
+logs it. Neither makes the alert fit.
+
+**Acceptance:**
+- A critical alert with three approvals and a 200-byte message traverses BLE,
+  by message-level fragmentation in the transport or a smaller co-signer
+  entry — the choice decided in an ADR, with the reassembly limits stated.
+- A send that cannot be delivered for size is reported, not discarded, on
+  every flood path (landed with T-37 for the emergency paths).
+- Tests: the worst-case alert round-trips over the BLE transport's own send
+  path; a fragment lost mid-reassembly does not strand the rest.
 
 ---
 

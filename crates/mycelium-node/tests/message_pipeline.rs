@@ -967,3 +967,84 @@ async fn test_a_replayed_session_init_draws_no_rejection() {
         "an init Alice refuses must still draw a rejection, or this test proves nothing"
     );
 }
+
+/// A `SessionInit` carrying no message still proves the initiator's identity
+/// key — `SHA-256(identity_key)` matched its source — so the key must be
+/// recorded, as the message-carrying path does. Without it, that peer's
+/// emergency co-signatures can never be counted: nothing else on the wire
+/// carries the key, so later encrypted traffic does not repair it (ADR-010).
+#[tokio::test]
+async fn test_a_message_less_session_init_records_the_identity_key() {
+    use mycelium_crypto::session::SessionManager;
+    use mycelium_protocol::codec::Envelope;
+    use mycelium_protocol::types::{MessageFlags, MessageId, ProtocolVersion};
+    use mycelium_protocol::wire::SessionInitPayload;
+
+    let alice_identity = Identity::generate();
+    let alice_node_id = alice_identity.node_id();
+    let peer_identity = Identity::generate();
+    let peer_node_id = peer_identity.node_id();
+
+    let alice = make_node(alice_identity);
+    let network = MockNetwork::new();
+    let alice_transport = Arc::new(MockTransport::new(alice_node_id, network.clone()).await);
+    alice
+        .transport_manager
+        .add_transport(alice_transport.clone())
+        .await;
+    alice.start().await.expect("alice start");
+
+    let (peer_tx, _peer_rx) = tokio::sync::broadcast::channel(64);
+    network.register_node(peer_node_id, peer_tx).await;
+    network
+        .add_link(peer_node_id, alice_node_id, MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        alice.db.get_contact_identity_key(&peer_node_id).is_none(),
+        "no key for the peer before the handshake"
+    );
+
+    let alice_bundle = alice.prekey_state.read().await.bundle();
+    let mut peer_sessions = SessionManager::new();
+    let init_result = peer_sessions
+        .initiate_session(&peer_identity, alice_node_id, &alice_bundle)
+        .expect("peer initiates");
+    let init_payload = SessionInitPayload {
+        ephemeral_public: init_result.ephemeral_public,
+        identity_key: peer_identity.public_key_bytes(),
+        signed_prekey_id: init_result.used_signed_prekey_id,
+        one_time_prekey_id: init_result.used_one_time_prekey_id,
+        // No enclosed message: the path this test is about.
+        encrypted_payload: Vec::new(),
+    }
+    .serialize();
+
+    // `SessionInitPayload::serialize` already carries the type byte.
+    let envelope = Envelope {
+        source: peer_node_id,
+        destination: alice_node_id,
+        message_id: MessageId::random(),
+        ttl: 10,
+        hop_count: 0,
+        flags: MessageFlags::SYSTEM,
+        lamport_clock: 1,
+        device_timestamp: 0,
+        protocol_version: ProtocolVersion::CURRENT,
+        payload: init_payload,
+    };
+    network
+        .deliver(peer_node_id, alice_node_id, envelope.serialize())
+        .await
+        .expect("delivered");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        alice.db.get_contact_identity_key(&peer_node_id),
+        Some(peer_identity.public_key_bytes()),
+        "the key proved by a message-less init must be recorded"
+    );
+
+    alice.stop().await;
+}
