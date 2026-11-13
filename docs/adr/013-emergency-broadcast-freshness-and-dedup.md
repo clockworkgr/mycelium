@@ -417,3 +417,31 @@ What this record still governs unchanged: verify-before-remember, the digest
 as the dedup key, `signed_at` and the freshness window, dual-clock retention
 with its grace, per-level and per-flood-type sets, the destination rule, and
 the strict body parsing.
+
+## Note (2026-11-13), second
+
+Three more claims here are superseded by ADR-014's per-level work.
+
+- **The TTL clamp is not universal.** This record clamps every flood to
+  `MAX_FLOOD_TTL` (20). Each emergency level now has its own reach, counted in
+  nodes that receive the alert: 4, 8 and 20 for levels 1, 2 and 3, which is a
+  wire TTL of 3, 7 and 19 — the first transmission is the first hop. The clamp
+  applies on receipt and on forwarding, so a level-1 copy claiming twenty hops
+  travels four nodes *from the node that forwards it*. Channel floods keep the
+  flat figure.
+- **The clamp does not enforce the originator's intended reach**, as this
+  record claims it does. It could not: the TTL carries no signature — every hop
+  decrements it — so a relay can re-send a spent alert at the full figure and
+  buy it another four hops. What the clamp bounds is how far any one node sends
+  a copy onward. The content stays authenticated, a node accepts an alert once
+  per validity window, and the per-list reach rule limits re-forwarding, so the
+  cost is extra traffic rather than a forged or endless flood (ADR-014).
+- **Emergency broadcasts are no longer exempt from per-originator rate
+  limiting across the board.** This record notes that they skip the
+  per-originator gate at every level. Levels 1 and 3 are now charged, and only
+  level 2 is exempt (spec §9.5). The charge is to a limiter reserved for
+  emergencies and made only once an alert's origin signature verifies, because
+  the general books are charged for unverified claims: sharing them let five
+  malformed packets naming an originator silence its genuine alert. For the
+  same reason the claimed-origin accounting for relayed user data now has its
+  own book too, separate from the per-peer one.

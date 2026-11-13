@@ -225,3 +225,102 @@ levels. The reach limits and the two-class send queue are the work; the queue's
 scope — floods only, all relayed traffic, or every outbound send — is the
 question to settle before building it, because it decides whether this is a
 contained change or one that touches every forward path.
+
+## Note (2026-11-13), second: the per-level half, and the queue withdrawn
+
+**The two-class send queue is withdrawn.** It was chosen over applying priority
+where contention exists, and building it turned out to be the wrong trade: a
+queue between every relay decision and the wire makes relaying asynchronous,
+which moves send failures away from the call site that can report them — and
+this record's own first note had to add that reporting because a silent send
+failure hid the BLE size regression.
+
+**And the alternative does not exist either.** "Boosted priority in relay
+queues" cannot be honoured by DTN ordering and eviction preference, as the
+reversal assumed, because **an emergency broadcast never enters the DTN
+store**: bundles come from `DtnRelay` payloads and the unicast routing
+fallback, and a broadcast (destination `NodeId::ZERO`) takes neither path. The
+DTN engine has no priority notion at all. So level 1's privilege as spec §9.5
+writes it has nothing to attach to in either form.
+
+What the levels therefore are, as implemented:
+
+- **Level 1 (Priority)** — trust > 0.3, reach 4.
+- **Level 2 (Urgent)** — trust > 0.6, reach 8, exempt from the per-originator
+  rate limit.
+- **Level 3 (Critical)** — three verified co-signatures, reach
+  `MAX_FLOOD_TTL` (20): the only level that floods the mesh.
+
+The reach figures are provisional until something measures them (T-19, T-15);
+the ordering is the rule and a test pins it.
+
+**The alert quota is its own limiter.** It must not share state with the gate
+that charges user-data payloads, because that gate is charged *before* a
+payload is authenticated: five malformed `EncryptedMessage` packets claiming an
+originator's id would exhaust that id's allowance and suppress its genuine,
+co-signed alert for an hour — silencing the one message type that must arrive,
+with no forgery at all. The emergency limiter is charged only after the origin
+signature verifies, so only the real originator can spend it, and once per
+alert rather than per copy.
+
+It is charged whether or not the originator handed us the alert itself.
+Ingress accounting is a different limiter answering a different question —
+"how much is this peer sending us" — so skipping this one for a direct
+neighbour let an originator spend its allowance twice: five alerts directly,
+five more through any relay. It is also swept on the maintenance tick, since
+it is keyed by originator and never consulted again once an alert is old.
+
+**The emergency limiter never blacklists.** §12 promises an auto-blacklist
+after ten violations, and this book does not do it: the id it would blacklist
+is the one that might be raising a real alert, and the refusal already bounds
+the work an over-quota originator can ask for. Documented as an exception
+rather than implemented.
+
+The same reasoning split the general limiter in two, and the same trade comes
+with it. Per-peer accounting and per-claimed-origin accounting are now separate
+books, so a sender that delivers directly spends a different allowance from one
+relaying through others — by spec §12's wording, twice the messages for one
+identity. Merging them would close that and reopen the suppression: five
+malformed packets naming a peer would exhaust the book that gates that peer's
+own traffic. A factor of two on a flood bound is worth less than a
+forgery-free way to silence a peer, so the books stay apart and §12 says so.
+
+**Reach counts receivers, including the first.** An alert goes on the wire with
+`reach - 1`, because the node that receives the first transmission is the first
+hop. Sending it at `reach` makes a level-1 alert travel five nodes, not four.
+
+**What reach does not mean.** The TTL is not covered by any signature — it
+cannot be, since every hop decrements it — so a relay can take a spent alert
+and re-send it at the level's full figure, buying it another four hops from
+wherever it stands. The clamp bounds how far a copy travels *from each node
+that forwards it*, not how far it gets from its originator. Authenticated hop
+accounting would need something the originator signs that bounds distance,
+which this format has no room for and no design for.
+
+What that is worth to an attacker is bounded: the content is authenticated, so
+what gets re-injected is a genuine alert; a node accepts it once per validity
+window, and the per-list reach rule lets it forward one again only while that
+list's reach keeps increasing. So the cost is extra traffic inside the window,
+not a forged or endless flood. Stated here, in ADR-013's second note and in
+spec §9.5, rather than left for someone to discover from the code.
+
+**The rate-limit exemption is nearly vacuous, and that is worth knowing.** To
+send a level-2 alert an originator must clear trust > 0.6, which takes a 1-hop
+vouch — and 1-hop peers are already unlimited, while a 2-hop path scores 0.5
+and fails the threshold. So the privilege changes nothing observable until the
+tiers change. It is implemented as specified rather than quietly dropped,
+because the tiers are the thing more likely to move.
+
+**What is still not implemented:** relay priority for level 1. And the
+reasoning above for why it could not be — "there is no queue" — was wrong.
+There is no queue *in the relay path*, and emergencies do not enter the DTN
+store, but every transport has a bounded send queue that an alert already
+passes through: BLE's 512-packet outbox, the internet transport's 128-slot
+channel, and the Wi-Fi Direct and LoRa equivalents. Ordering by level belongs
+there — an alert placed ahead of ordinary traffic in a queue that already
+exists — which is a far smaller change than the two-class relay queue this
+record withdrew, and it does not make relaying asynchronous or move send
+failures away from their call site.
+
+So the withdrawal stands and the conclusion changes: the work is per-transport
+queue ordering, not a new structure. Spec §9.5 and ROADMAP T-37 say so.

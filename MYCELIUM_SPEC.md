@@ -1112,9 +1112,30 @@ signature in ROADMAP T-14.
 
 | Level | Name | Behaviour | Requirement |
 |-------|------|-----------|-------------|
-| 1 | **Priority** | Boosted priority in relay queues | sender trust > 0.3 |
-| 2 | **Urgent** | Bypasses per-identity rate limits | sender trust > 0.6 |
-| 3 | **Critical** | Floods the whole mesh, bypasses routing rules | 3+ co-signers with trust > 0.8 |
+| 1 | **Priority** | Reach 4 hops | sender trust > 0.3 |
+| 2 | **Urgent** | Reach 8 hops; exempt from the per-originator rate limit | sender trust > 0.6 |
+| 3 | **Critical** | Reach 20 hops — the mesh-wide flood | 3+ co-signers with trust > 0.8 |
+
+Reach counts the nodes that receive the alert, the first transmission
+included, so an alert goes on the wire with `reach - 1` and is clamped to the
+same figure on receipt and on forwarding: a level-1 alert claiming twenty hops
+travels four nodes from the node that forwards it. It is **not** a bound
+relative to the originator: the TTL carries no signature — every hop
+decrements it — so a relay can re-send a spent alert at the full figure and
+buy it another four hops. The content stays authenticated, a node accepts it
+once per validity window, and the per-list reach rule limits re-forwarding, so
+the cost is extra traffic rather than a forged or endless flood (ADR-014). The figures are provisional until measured against a real
+topology (ROADMAP T-19, T-15); what is fixed is that each level reaches
+strictly less far than the one above.
+
+The per-neighbour rate limit applies to every level — it is charged before a
+payload is parsed — and the level-2 exemption is from a **separate**
+per-originator limiter reserved for emergencies, charged only once an alert's
+origin signature verifies and once per alert rather than per copy, however the
+alert reached us. Sharing the general limiter would let unauthenticated packets
+claiming an originator's id spend its alert quota and silence it; skipping the
+charge for a direct neighbour would let an originator spend that quota twice
+(ADR-014).
 
 Thresholds are enforced as specified. Emergency messages carry the sender's
 identity — they are deliberately non-anonymous, for accountability — and a
@@ -1198,8 +1219,10 @@ has no slot for yet. One figure per entry would not do, because a relay can
 deliver a new list with its TTL spent — recording the list while forwarding
 nothing — and the copy that could carry it would then look like a duplicate;
 and a copy claiming a fourth list must not get past the ceiling by carrying a
-higher TTL. Remaining TTL is clamped to 20 in both directions, which stops an
-inflated TTL flooding past the originator's intent.
+higher TTL. Remaining TTL is clamped to the level's own figure in both
+directions — 3, 7 or 19 on the wire — which bounds how far any one node sends a
+copy onward. It does not bound distance from the originator: the TTL is
+unsigned, so a relay can reset it (§9.5).
 
 An entry is dropped by **age** only when both clocks agree it is spent: the
 monotonic retention (3901 s — validity plus skew, plus a second for rounding)
@@ -1225,12 +1248,17 @@ a level-3 broadcast is refused by every receiver. Unusable is the correct
 failure direction for a mesh-wide flood, but level 3 is not available until
 collection exists. See ROADMAP T-05.
 
-**Known gap:** the levels do not yet differ in behaviour. Every accepted
-broadcast floods at the same clamped reach, nothing consults the level when
-relaying, and the per-originator rate limit is skipped for all of them — so a
-level selects only its trust threshold and, at level 3, its co-signature
-requirement. The table above describes the intent; ADR-014 decides the
-implementation and ROADMAP T-37 carries it.
+**Known gap:** level 1 has no relay priority. The relay path itself sends as
+it decides, with nothing to order, and an emergency never enters the DTN store
+— bundles come from `DtnRelay` payloads and the unicast routing fallback, and a
+broadcast takes neither. But every transport has a bounded send queue that an
+alert already passes through (BLE's 512-packet outbox, the internet
+transport's 128-slot channel, and the Wi-Fi Direct and LoRa equivalents), and
+that is where ordering by level belongs: ahead of ordinary traffic in the queue
+that is already there, rather than in a new one above it (ADR-014, ROADMAP
+T-37). The level-2 rate-limit exemption is implemented but nearly inert,
+because an originator that clears trust > 0.6 is 1 hop away and already
+unlimited.
 
 **Known gap:** an alert is `217 + message_bytes + 96 × approvals` bytes on the
 wire, against the BLE transport's 512-byte message cap — so three approvals
@@ -1370,8 +1398,24 @@ Enforcement details:
   feedback and no oracle.
 - Auto-blacklist after 10 violations in a window; blacklist lasts 1 hour.
   Violation counters reset hourly.
-- A direct neighbour is charged **once** (the previous-hop gate), not once per
-  check.
+- A direct neighbour is charged **once** for user data (the previous-hop
+  gate), not once per check. Three books are kept apart, because they answer
+  different questions and one of them is charged for claims nothing has
+  verified:
+  - **per peer** — what this link delivered, charged on every message;
+  - **per claimed origin** — relayed user data attributed to an
+    `envelope.source` that is still unchecked at that point;
+  - **per alert originator** — emergency broadcasts, charged only once the
+    origin signature verifies, at every level but 2, and however the alert
+    arrived. This book does not auto-blacklist: the id it would blacklist is
+    the one that might be raising a real alert, and refusing the alert already
+    bounds the work (ADR-014).
+
+  A sender close enough to deliver directly therefore spends a different
+  allowance from one relaying through others. Merging the first two books
+  would close that gap and reopen a worse one: five malformed packets naming a
+  peer would exhaust that peer's own allowance and silence everything it sent,
+  alerts included (ADR-014).
 - DTN relay quota is charged only when a bundle is actually stored.
 
 Supernodes sharing violation data to detect coordinated attacks is **Planned**.
@@ -1502,8 +1546,11 @@ a plain reading of the protocol allows:
 - **Receipts** — accepted only from the recipient of one of our outgoing
   messages.
 - **Sender keys** — only inside pairwise-encrypted `SYSTEM` messages (§4.2).
-- **Rate limiting** — charge a direct neighbour once; charge DTN quota only on
-  store; reset violation counters hourly.
+- **Rate limiting** — charge a direct neighbour once for user data; keep the
+  per-peer, per-claimed-origin and per-alert-originator books separate (§12);
+  charge an emergency to its originator only after the origin signature
+  verifies, at every level but 2; charge DTN quota only on store; reset
+  violation counters hourly.
 - **Emergency freshness and dedup** — refuse a broadcast dated beyond the
   300 s skew tolerance or raised more than 3600 s ago; remember it only after
   it is accepted, keyed on its digest, never on the envelope id (§9.5,
@@ -1512,9 +1559,12 @@ a plain reading of the protocol allows:
   when its destination is `NodeId::ZERO`; floods skip the originator,
   ourselves and the previous hop; RERR rebroadcasts skip the hop they came
   from. A flood is deduplicated on a digest of the message, entries expire by
-  age rather than the set being cleared, remaining TTL is clamped to 20 on
-  receipt and on forwarding, and a copy that reaches further than the one
-  already seen is forwarded again.
+  age rather than the set being cleared, and a copy that reaches further than
+  the one already seen is forwarded again. Remaining TTL is clamped on receipt
+  and on forwarding: to 20 for a channel message, and to its level's reach for
+  an emergency — 3, 7 or 19 on the wire for levels 1, 2 and 3, since reach
+  counts the receiving nodes and the first transmission is the first hop
+  (§9.5).
 - **DTN** — a `DtnRelay` for another node always reaches `handle_dtn_relay`,
   which stores it with the wire copies/TTL when no route exists. All three
   local-delivery paths funnel through `finalize_incoming_message()`
@@ -1946,7 +1996,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 9.3 | Receipts | **Partial** | Recipient-only, WS push, UI indicators. Dropped when no route exists, so DTN deliveries are never acknowledged (T-27) |
 | 9.4 | Public channels | **Implemented** | Wire types, storage, flooding, 6 REST endpoints, 2 screens. Dedup expires by age and is keyed on the message (ADR-013); the channel `NodeEvent` variant is still open (T-14) |
 | 9.4 | Regional channels | **Planned** | Needs the geographic overlay |
-| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); the levels do not yet differ in behaviour (T-37); a co-signed alert exceeds the BLE cap (T-39) |
+| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest, reach and rate limiting per level (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); level 1 has no relay priority, which needs a queue or a store-and-forward path for emergencies (T-37); a co-signed alert exceeds the BLE cap (T-39) |
 | 9.6 | Multi-device / CRDT sync | **Planned** | v0.3 |
 | 10.1 | Beacon | **Implemented** | Node type, battery, neighbour count, group hash; LoRa broadcast |
 | 10.2 | Seed phrase groups | **Partial** | Derivation + beacon match + auto-vouch; no proof of possession (T-04) |

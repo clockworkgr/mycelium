@@ -37,6 +37,7 @@ struct Harness {
     bob: Node,
     bob_id: NodeId,
     relay: Arc<MockTransport>,
+    relay_id: NodeId,
     network: Arc<MockNetwork>,
     /// The alert's originator. An identity rather than an id, because a
     /// broadcast now carries its key and a signature over the alert and its
@@ -96,6 +97,7 @@ async fn harness() -> Harness {
         bob,
         bob_id,
         relay,
+        relay_id,
         network,
         originator,
         cosigners,
@@ -1148,6 +1150,321 @@ async fn test_a_receiver_counts_its_own_co_signature() {
             .as_deref(),
         Some("evacuate sector 7"),
         "Bob's own approval is one of the three"
+    );
+
+    h.bob.stop().await;
+}
+
+/// Spec §9.5 reserves mesh-wide flooding for level 3, so the cheaper levels
+/// travel less far. The forwarded TTL is clamped to the level's reach whatever
+/// the sender claimed (ADR-014).
+#[tokio::test]
+async fn test_each_level_is_forwarded_at_its_own_reach() {
+    let h = harness().await;
+    let (downstream, _) = h.downstream().await;
+    let mut relayed = downstream.events();
+
+    {
+        let mut tg = h.bob.trust_graph.write().await;
+        tg.add_vouch(h.bob_id, h.originator_id());
+    }
+
+    let signed_at = unix_now();
+    // Each alert claims the full twenty hops; the receiver decides.
+    // Reach counts receivers, so the wire TTL is reach - 1 and forwarding
+    // counts one more hop: a level-1 copy leaves here with 2.
+    for (level, reach) in [(EmergencyLevel::Priority, 4u8), (EmergencyLevel::Urgent, 8)] {
+        let mut envelope = h.envelope(MessageId::random(), level, signed_at, b"go", &[]);
+        envelope.ttl = 20;
+        h.deliver(&envelope).await;
+
+        let onward = forwarded_alert(&mut relayed, Duration::from_secs(2))
+            .await
+            .unwrap_or_else(|| panic!("{level:?} must still be forwarded"));
+        assert_eq!(
+            onward.ttl,
+            reach - 2,
+            "{level:?} claimed twenty hops and is cut to its own reach of {reach}"
+        );
+    }
+
+    h.bob.stop().await;
+}
+
+// The level-2 rate-limit exemption has no end-to-end test here on purpose.
+// Reaching the per-originator gate needs an originator that clears level 2's
+// trust threshold (> 0.6), which takes a 1-hop vouch — and 1-hop peers are
+// already unlimited, while a 2-hop path scores 0.5 and fails the threshold.
+// An attempt measured the per-*neighbour* gate instead, which charges every
+// message from a peer whatever its level. The decision is unit-tested in
+// `node.rs` (`charges_originator`), and the observation that the privilege is
+// nearly vacuous given the tiers is recorded in ADR-014 and ROADMAP T-37.
+
+/// A level-3 alert's acceptance does not depend on its originator's trust —
+/// three verified co-signatures do — so an unknown originator can raise one,
+/// and the per-originator rate limit is what bounds how many. Nothing is
+/// remembered for an alert refused on quota, or a spent copy could be
+/// recorded and a later one with reach left forwarded as an "improvement"
+/// without ever being charged or raised (ADR-013, ADR-014).
+#[tokio::test]
+async fn test_an_alert_refused_on_quota_is_not_remembered() {
+    let h = harness().await;
+    let (downstream, _) = h.downstream().await;
+    let mut relayed = downstream.events();
+
+    // The relay is trusted, so the ingress gate does not throttle it; the
+    // originator stays unknown, so its own quota is what bites.
+    {
+        let mut tg = h.bob.trust_graph.write().await;
+        tg.add_vouch(h.bob_id, h.relay_id);
+    }
+
+    let signed_at = unix_now();
+    let message = b"evacuate sector 7";
+    let mut events = h.bob.event_tx.subscribe();
+
+    // An unknown originator is allowed five messages an hour.
+    let mut raised = 0;
+    for _ in 0..5 {
+        let id = MessageId::random();
+        let approvals = h.approvals(&id, EmergencyLevel::Critical, signed_at, message);
+        h.deliver(&h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals))
+            .await;
+        if next_alert(&mut events, Duration::from_millis(400))
+            .await
+            .is_some()
+        {
+            raised += 1;
+        }
+    }
+    assert_eq!(raised, 5, "the first five alerts are within quota");
+
+    // The same allowance covers alerts handed to us directly by their
+    // originator: ingress accounting is a different limiter answering a
+    // different question, so skipping this one for a direct neighbour would
+    // let an originator spend its allowance twice (ADR-014).
+    {
+        let direct = Arc::new(MockTransport::new(h.originator_id(), h.network.clone()).await);
+        direct.start().await.expect("direct transport starts");
+        h.network
+            .add_link(h.originator_id(), h.bob_id, MockLinkConfig::default())
+            .await;
+        // Deliberately *not* vouched: a 1-hop peer sits in an unlimited tier,
+        // so vouching it would make this assertion vacuous.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let id = MessageId::random();
+        let approvals = h.approvals(&id, EmergencyLevel::Critical, signed_at, message);
+        let envelope = h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals);
+        direct
+            .send(&h.bob_id, &envelope.serialize())
+            .await
+            .expect("originator delivers its own alert");
+        assert_eq!(
+            next_alert(&mut events, Duration::from_millis(400)).await,
+            None,
+            "the originator's allowance is already spent, however the alert arrives"
+        );
+    }
+
+    // Those five were forwarded too; drain them, or the check below would see
+    // one of them rather than the copy it is about.
+    while forwarded_alert(&mut relayed, Duration::from_millis(200))
+        .await
+        .is_some()
+    {}
+
+    // The sixth is over quota. Deliver it spent first, then with reach left:
+    // neither may be raised, and neither may be forwarded.
+    let id = MessageId::random();
+    let approvals = h.approvals(&id, EmergencyLevel::Critical, signed_at, message);
+    let mut spent = h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals);
+    spent.ttl = 0;
+    let mut alive = spent.clone();
+    alive.ttl = 20;
+
+    h.deliver(&spent).await;
+    h.deliver(&alive).await;
+    assert_eq!(
+        next_alert(&mut events, Duration::from_millis(400)).await,
+        None,
+        "an alert over quota is not raised"
+    );
+    assert!(
+        forwarded_alert(&mut relayed, Duration::from_millis(400))
+            .await
+            .is_none(),
+        "and a later copy with reach left must not be forwarded as an improvement \
+         on an entry that should never have existed"
+    );
+
+    h.bob.stop().await;
+}
+
+/// Reach counts the nodes that receive an alert, so the first transmission is
+/// the first hop: a level-1 alert with reach 4 goes on the wire with TTL 3,
+/// which four nodes see (3, 2, 1, 0). Sending it at 4 would make it five.
+#[tokio::test]
+async fn test_the_first_transmission_counts_against_the_reach() {
+    let identity = Identity::generate();
+    let node_id = identity.node_id();
+    let node = Node::new(
+        NodeConfig::default(),
+        Database::open_in_memory().expect("in-memory DB"),
+        identity,
+    );
+
+    let network = MockNetwork::new();
+    node.transport_manager
+        .add_transport(Arc::new(MockTransport::new(node_id, network.clone()).await))
+        .await;
+    node.start().await.expect("node starts");
+
+    let observer_id = Identity::generate().node_id();
+    let observer = Arc::new(MockTransport::new(observer_id, network.clone()).await);
+    observer.start().await.expect("observer starts");
+    network
+        .add_link(node_id, observer_id, MockLinkConfig::default())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut seen = observer.events();
+
+    for (level, reach) in [
+        (EmergencyLevel::Priority, 4u8),
+        (EmergencyLevel::Urgent, 8),
+        (EmergencyLevel::Critical, 20),
+    ] {
+        let draft = node.draft_emergency(level, b"go");
+        node.raise_emergency(draft, &[]).await.expect("raised");
+        let envelope = forwarded_alert(&mut seen, Duration::from_secs(2))
+            .await
+            .unwrap_or_else(|| panic!("{level:?} must be sent"));
+        assert_eq!(
+            envelope.ttl,
+            reach - 1,
+            "{level:?} has reach {reach}, so it leaves with {} on the wire",
+            reach - 1
+        );
+    }
+
+    node.stop().await;
+}
+
+/// The emergency quota must not share state with the gate that charges
+/// user-data payloads before authenticating them. Otherwise five malformed
+/// `EncryptedMessage` packets claiming an originator's id exhaust its
+/// allowance and suppress its genuine co-signed alert for an hour — no
+/// forgery required (ADR-014).
+#[tokio::test]
+async fn test_unauthenticated_traffic_cannot_spend_the_alert_quota() {
+    use mycelium_protocol::wire::WirePayloadType;
+
+    let h = harness().await;
+    {
+        let mut tg = h.bob.trust_graph.write().await;
+        tg.add_vouch(h.bob_id, h.relay_id);
+    }
+
+    // Five malformed encrypted messages claiming the originator's id. Each is
+    // charged to that id by the user-data gate before anything is checked.
+    for _ in 0..5 {
+        let envelope = Envelope {
+            source: h.originator_id(),
+            destination: h.bob_id,
+            message_id: MessageId::random(),
+            ttl: 10,
+            hop_count: 1,
+            flags: MessageFlags::NONE,
+            lamport_clock: 0,
+            device_timestamp: unix_now(),
+            protocol_version: ProtocolVersion::CURRENT,
+            payload: vec![WirePayloadType::EncryptedMessage as u8, 0, 0, 0],
+        };
+        h.deliver(&envelope).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The originator's genuine alert must still get through.
+    let id = MessageId::random();
+    let signed_at = unix_now();
+    let message = b"evacuate sector 7";
+    let approvals = h.approvals(&id, EmergencyLevel::Critical, signed_at, message);
+    let mut events = h.bob.event_tx.subscribe();
+    h.deliver(&h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals))
+        .await;
+
+    assert_eq!(
+        next_alert(&mut events, Duration::from_secs(2))
+            .await
+            .as_deref(),
+        Some("evacuate sector 7"),
+        "unauthenticated packets must not spend the alert quota"
+    );
+
+    h.bob.stop().await;
+}
+
+/// Unverified claims and proved peers need separate books. Five malformed
+/// packets claiming a peer's id used to exhaust that peer's own ingress
+/// allowance, so everything it later sent directly — including its emergency
+/// alerts — was dropped for an hour, with no forgery (ADR-014).
+#[tokio::test]
+async fn test_spoofed_claims_do_not_throttle_the_peer_they_name() {
+    use mycelium_protocol::wire::WirePayloadType;
+
+    let h = harness().await;
+
+    // The originator will deliver its own alert, so it is the peer whose
+    // ingress allowance an attacker would try to spend. Not vouched: a 1-hop
+    // peer is unlimited, which would make this vacuous.
+    let direct = Arc::new(MockTransport::new(h.originator_id(), h.network.clone()).await);
+    direct.start().await.expect("direct transport starts");
+    h.network
+        .add_link(h.originator_id(), h.bob_id, MockLinkConfig::default())
+        .await;
+    {
+        let mut tg = h.bob.trust_graph.write().await;
+        tg.add_vouch(h.bob_id, h.relay_id);
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Five malformed user-data packets from the relay, each claiming the
+    // originator as their source.
+    for _ in 0..5 {
+        let envelope = Envelope {
+            source: h.originator_id(),
+            destination: h.bob_id,
+            message_id: MessageId::random(),
+            ttl: 10,
+            hop_count: 1,
+            flags: MessageFlags::NONE,
+            lamport_clock: 0,
+            device_timestamp: unix_now(),
+            protocol_version: ProtocolVersion::CURRENT,
+            payload: vec![WirePayloadType::EncryptedMessage as u8, 0, 0, 0],
+        };
+        h.deliver(&envelope).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // The originator's own alert, delivered by the originator itself.
+    let id = MessageId::random();
+    let signed_at = unix_now();
+    let message = b"evacuate sector 7";
+    let approvals = h.approvals(&id, EmergencyLevel::Critical, signed_at, message);
+    let envelope = h.envelope(id, EmergencyLevel::Critical, signed_at, message, &approvals);
+    let mut events = h.bob.event_tx.subscribe();
+    direct
+        .send(&h.bob_id, &envelope.serialize())
+        .await
+        .expect("originator delivers its own alert");
+
+    assert_eq!(
+        next_alert(&mut events, Duration::from_secs(2))
+            .await
+            .as_deref(),
+        Some("evacuate sector 7"),
+        "claims made in someone else's name must not spend their ingress allowance"
     );
 
     h.bob.stop().await;

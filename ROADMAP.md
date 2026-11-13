@@ -14,7 +14,7 @@ authentication:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **442 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **449 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -353,7 +353,21 @@ are fixed before collection so co-signatures can be gathered over them
 dedup stays keyed on the alert, with reach tracked per approval list under a
 ceiling of three.
 
-**What remains: the levels still do not differ.** Defect 2 below is untouched.
+**Landed 2026-11-13, second half: the levels differ.** Each level has its own
+reach, clamped on receipt and on forwarding (4, 8, 20 hops — provisional until
+T-19/T-15 measure them; the ordering is the rule), and only level 2 is exempt
+from the per-originator rate limit, charged once per alert rather than per
+copy.
+
+**What remains: level 1 has no relay priority.** The two-class relay queue
+decided for this task was withdrawn — a queue between every relay decision and
+the wire makes relaying asynchronous and moves send failures away from the call
+site that reports them — and an emergency never enters the DTN store, so
+store-and-forward ordering cannot carry the privilege either. What can: every
+transport already has a bounded send queue an alert passes through, and
+ordering by level belongs in those. Also noted: the level-2 rate-limit exemption is
+implemented but nearly inert, since an originator clearing trust > 0.6 is 1 hop
+away and already unlimited — it bites only if the tiers change (ADR-014).
 
 Two related defects, found while fixing T-36:
 
@@ -395,11 +409,18 @@ Two related defects, found while fixing T-36:
   level-3 alert cannot be signed until T-05's collection has finished.
 - ~~An originator with no identity cannot raise an alert.~~ Structural:
   `Node::raise_emergency` signs with the node's own identity.
-- Each level's behaviour matches spec §9.5: level 1 gets relay-queue priority
-  and a reach below a flood, level 2 is exempt from the per-originator rate
-  limit (and only level 2), level 3 is the only level that floods mesh-wide
-  (ADR-014). That needs a per-level reach limit rather than the single
-  `MAX_FLOOD_TTL` clamp, and a priority notion in the relay path.
+- ~~Level 1 reaches less far than level 2, which reaches less far than level 3;
+  level 2 alone is exempt from the per-originator rate limit.~~ Landed
+  2026-11-13.
+- Level 1 gets relay priority by **ordering within the send queue each
+  transport already has** — BLE's 512-packet outbox, the internet transport's
+  128-slot channel, and the Wi-Fi Direct and LoRa equivalents — so an alert
+  goes ahead of ordinary traffic in a queue that exists rather than a new one
+  above it. The two-class relay queue first decided for this task was
+  withdrawn: it made relaying asynchronous and moved send failures away from
+  the call site that reports them (ADR-014's second note, corrected).
+- Tests: an alert queued behind ordinary traffic leaves first, per transport;
+  a full queue drops ordinary traffic before an alert.
 - Tests: a level-2 alert forged under a trusted id is dropped; a genuine one
   is accepted; the flood scope per level is asserted.
 

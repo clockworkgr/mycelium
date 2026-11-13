@@ -311,6 +311,15 @@ impl FloodDedup {
         aged_out && past_window
     }
 
+    /// Drop spent entries now, whether or not anything has arrived.
+    ///
+    /// Sweeping otherwise only happens inside `accept_at`, so a quiet node
+    /// would hold every entry it ever made until traffic resumed. Called from
+    /// the maintenance tick.
+    pub fn sweep_now(&mut self) {
+        self.sweep(Instant::now(), unix_now());
+    }
+
     fn sweep(&mut self, now: Instant, now_secs: u64) {
         let ttl = self.ttl;
         self.entries
@@ -390,6 +399,13 @@ impl EmergencyDedup {
         now_secs: u64,
     ) -> FloodCopy {
         self.set(level).accept_at(mark, now, now_secs)
+    }
+
+    /// Sweep every level. See `FloodDedup::sweep_now`.
+    pub fn sweep_now(&mut self) {
+        self.priority.sweep_now();
+        self.urgent.sweep_now();
+        self.critical.sweep_now();
     }
 
     fn level(&self, level: EmergencyLevel) -> &FloodDedup {

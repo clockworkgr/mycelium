@@ -66,6 +66,8 @@ pub enum NodeError {
     SendToSelf,
     #[error("alert is {size} bytes, over the {limit}-byte limit a flooded message must fit")]
     AlertTooLarge { size: usize, limit: usize },
+    #[error("alert was drafted {age}s ago, past the {validity}s every receiver allows")]
+    AlertExpired { age: u64, validity: u64 },
     #[error("group not found")]
     GroupNotFound,
 }
@@ -142,6 +144,47 @@ const CHANNEL_DEDUP_TTL: Duration = Duration::from_secs(900);
 const EMERGENCY_DEDUP_TTL: Duration =
     Duration::from_secs(EMERGENCY_VALIDITY_SECS + EMERGENCY_MAX_CLOCK_SKEW_SECS + 1);
 
+/// How far each emergency level travels, counted in **nodes that receive it**,
+/// the first transmission included.
+///
+/// Spec §9.5 reserves mesh-wide flooding for level 3; the cheaper levels are
+/// cheaper for the network, which is the point of having tiers at all. Level 3
+/// gets `MAX_FLOOD_TTL`, and 1 and 2 strictly less.
+///
+/// The ordering is the rule; the figures are provisional until something
+/// measures them against a real topology (ROADMAP T-19, T-15). What a useful
+/// reach is depends on mesh diameter and density, which no test here knows.
+/// The TTL to put on the wire for `level`: one less than its reach, because
+/// the node receiving the first transmission is the first hop.
+fn flood_ttl(level: wire::EmergencyLevel) -> u8 {
+    reach_for(level).saturating_sub(1)
+}
+
+fn reach_for(level: wire::EmergencyLevel) -> u8 {
+    match level {
+        wire::EmergencyLevel::Priority => 4,
+        wire::EmergencyLevel::Urgent => 8,
+        wire::EmergencyLevel::Critical => MAX_FLOOD_TTL,
+    }
+}
+
+/// Whether an emergency at this level is charged the per-originator rate
+/// limit.
+///
+/// Spec §9.5 gives the exemption to "Urgent" alone, and only the
+/// per-*originator* gate is at issue: the per-neighbour gate charges every
+/// message from a peer before its payload is even parsed, so no level escapes
+/// that one.
+///
+/// How much the exemption is worth, given the tiers: an originator must pass
+/// level 2's trust threshold (> 0.6) to send one at all, which means a 1-hop
+/// vouch (trust 1.0) — and 1-hop peers are already unlimited. A 2-hop path
+/// scores 0.5, below the threshold. So the exemption only bites if the tiers
+/// change, and that is worth knowing rather than discovering later.
+fn charges_originator(level: wire::EmergencyLevel) -> bool {
+    level != wire::EmergencyLevel::Urgent
+}
+
 /// Remaining TTL a flooded message is allowed to claim.
 ///
 /// The envelope's TTL is cleartext and nothing authenticates it, so a relay
@@ -192,6 +235,29 @@ pub struct Node {
     pub session_manager: Arc<RwLock<SessionManager>>,
     pub prekey_state: Arc<RwLock<PrekeyState>>,
     pub rate_limiter: Arc<RwLock<RateLimiter>>,
+    /// Per-claimed-origin limit for relayed user data, kept apart from
+    /// `rate_limiter`.
+    ///
+    /// `envelope.source` on an `EncryptedMessage`, `GroupMessage` or
+    /// `ChannelMessage` is a claim nothing has checked when the limit is
+    /// charged. Sharing a bucket with the per-*peer* accounting above let five
+    /// malformed packets claiming a peer's id exhaust that peer's own
+    /// allowance, so everything it later sent us directly — its messages, and
+    /// its emergency alerts — was dropped at ingress for an hour. Unverified
+    /// claims and proved peers get separate books.
+    origin_limits: Arc<RwLock<RateLimiter>>,
+    /// Per-originator limit for emergency broadcasts, kept apart from both of
+    /// the above.
+    ///
+    /// They must not share a bucket. The general limiter is charged for
+    /// user-data payloads *before* anything about them is authenticated, so
+    /// five malformed `EncryptedMessage` packets claiming someone's id would
+    /// exhaust that id's allowance and suppress its genuine, co-signed alert
+    /// for an hour — a forgery-free way to silence the one message type that
+    /// must arrive (ADR-013, ADR-014). This one is charged only after an
+    /// alert's origin signature verifies, so only its real originator can
+    /// spend it.
+    emergency_limits: Arc<RwLock<RateLimiter>>,
     pub battery: Arc<RwLock<BatteryManager>>,
     pub db: Arc<Database>,
     pub trust_graph: Arc<RwLock<TrustGraph>>,
@@ -317,6 +383,8 @@ impl Node {
             session_manager: Arc::new(RwLock::new(SessionManager::new())),
             prekey_state: Arc::new(RwLock::new(prekey_state)),
             rate_limiter: Arc::new(RwLock::new(RateLimiter::new())),
+            origin_limits: Arc::new(RwLock::new(RateLimiter::new())),
+            emergency_limits: Arc::new(RwLock::new(RateLimiter::new())),
             battery: Arc::new(RwLock::new(battery)),
             db: Arc::new(db),
             trust_graph: Arc::new(RwLock::new(trust_graph)),
@@ -506,6 +574,8 @@ impl Node {
         let session_manager = self.session_manager.clone();
         let prekey_state = self.prekey_state.clone();
         let rate_limiter = self.rate_limiter.clone();
+        let origin_limits = self.origin_limits.clone();
+        let emergency_limits = self.emergency_limits.clone();
         let trust_graph = self.trust_graph.clone();
         let groups = self.groups.clone();
         let db = self.db.clone();
@@ -542,6 +612,8 @@ impl Node {
                                     &session_manager,
                                     &prekey_state,
                                     &rate_limiter,
+                                    &origin_limits,
+                                    &emergency_limits,
                                     &trust_graph,
                                     &groups,
                                     &transport_manager,
@@ -578,6 +650,10 @@ impl Node {
         let prekey_state_m = self.prekey_state.clone();
         let prekey_cache_m = self.prekey_cache.clone();
         let rate_limiter_m = self.rate_limiter.clone();
+        let seen_channel_m = self.seen_channel_messages.clone();
+        let seen_emergency_m = self.seen_emergency_broadcasts.clone();
+        let origin_limits_m = self.origin_limits.clone();
+        let emergency_limits_m = self.emergency_limits.clone();
         let cancel_m = self.cancel.clone();
         let db_m = self.db.clone();
         let mut spk_rotation_counter: u32 = 0;
@@ -632,6 +708,26 @@ impl Node {
                         // Clean up expired rate limiter state and blacklist entries
                         {
                             let mut rl = rate_limiter_m.write().await;
+                            rl.cleanup();
+                        }
+                        {
+                            let mut rl = origin_limits_m.write().await;
+                            rl.cleanup();
+                        }
+                        // The flood-dedup sets sweep themselves when
+                        // something arrives, which leaves a quiet node holding
+                        // every entry it ever made; the tick covers that.
+                        {
+                            seen_channel_m.write().await.sweep_now();
+                            seen_emergency_m.write().await.sweep_now();
+                        }
+                        // The emergency limiter is swept on the same tick. It
+                        // is keyed by originator and never consulted again
+                        // once an alert is old, so without this its entries —
+                        // and their timestamp vectors — would outlive every
+                        // bounded structure around them.
+                        {
+                            let mut rl = emergency_limits_m.write().await;
                             rl.cleanup();
                         }
 
@@ -1428,6 +1524,22 @@ impl Node {
             clock.0
         };
 
+        // Collecting approvals takes time, and the date was fixed when the
+        // draft was — re-dating it here would invalidate every co-signature
+        // collected over it, so a draft that has aged out is refused instead.
+        // Receivers would refuse it anyway; the point is that the originator
+        // finds out rather than believing the alert went out.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if mycelium_crypto::emergency::check_freshness(signed_at, now).is_err() {
+            return Err(NodeError::AlertExpired {
+                age: now.saturating_sub(signed_at),
+                validity: EMERGENCY_VALIDITY_SECS,
+            });
+        }
+
         let ctx = self.broadcast_context(&draft);
         let signature = mycelium_crypto::emergency::sign_broadcast(&self.identity, &ctx, cosigners);
 
@@ -1435,7 +1547,7 @@ impl Node {
             source: self.node_id,
             destination: NodeId::ZERO,
             message_id,
-            ttl: MAX_FLOOD_TTL,
+            ttl: flood_ttl(level),
             hop_count: 0,
             flags: MessageFlags::NONE,
             lamport_clock: clock_val,
@@ -1865,6 +1977,8 @@ impl Node {
         session_manager: &RwLock<SessionManager>,
         prekey_state: &RwLock<PrekeyState>,
         rate_limiter: &RwLock<RateLimiter>,
+        origin_limits: &RwLock<RateLimiter>,
+        emergency_limits: &RwLock<RateLimiter>,
         trust_graph: &RwLock<TrustGraph>,
         groups: &RwLock<HashMap<[u8; 32], SenderKeyGroup>>,
         transport_manager: &TransportManager,
@@ -2276,7 +2390,9 @@ impl Node {
                         tg.trust_score(&local_id, &envelope.source).hops
                     };
                     let allowed = {
-                        let mut rl = rate_limiter.write().await;
+                        // The claimed-origin book, not the peer one: this
+                        // source is unverified at this point.
+                        let mut rl = origin_limits.write().await;
                         rl.check_message(&envelope.source, trust_hops)
                     };
                     if !allowed {
@@ -2284,7 +2400,7 @@ impl Node {
                             "Rate-limited {:?} from {} (trust_hops={})",
                             payload_type, envelope.source, trust_hops
                         );
-                        let mut rl = rate_limiter.write().await;
+                        let mut rl = origin_limits.write().await;
                         let blacklisted = rl.record_violation(&envelope.source);
                         if blacklisted {
                             warn!(
@@ -2468,6 +2584,7 @@ impl Node {
                             *peer,
                             body,
                             trust_graph,
+                            emergency_limits,
                             transport_manager,
                             local_id,
                             identity.public_key_bytes(),
@@ -4313,12 +4430,13 @@ impl Node {
         peer: NodeId,
         local_id: NodeId,
         transport_manager: &TransportManager,
+        reach: u8,
     ) {
         if envelope.ttl == 0 {
             return;
         }
         let mut fwd = envelope.clone();
-        fwd.ttl = fwd.ttl.min(MAX_FLOOD_TTL);
+        fwd.ttl = fwd.ttl.min(reach);
         fwd.forward();
         let fwd_data = fwd.serialize();
         for p in transport_manager.known_peers().await {
@@ -4408,7 +4526,8 @@ impl Node {
             FloodCopy::Further => {
                 // Same message, more reach: carry it on without storing or
                 // reporting it a second time.
-                Self::flood_onward(envelope, peer, local_id, transport_manager).await;
+                Self::flood_onward(envelope, peer, local_id, transport_manager, MAX_FLOOD_TTL)
+                    .await;
                 return;
             }
             FloodCopy::Duplicate => {
@@ -4452,7 +4571,7 @@ impl Node {
 
         // Flood to all connected peers except the originator and the hop
         // that just delivered it to us.
-        Self::flood_onward(envelope, peer, local_id, transport_manager).await;
+        Self::flood_onward(envelope, peer, local_id, transport_manager, MAX_FLOOD_TTL).await;
     }
 
     // --- Emergency broadcast handler ---
@@ -4487,6 +4606,7 @@ impl Node {
         peer: NodeId,
         body: &[u8],
         trust_graph: &RwLock<TrustGraph>,
+        emergency_limits: &RwLock<RateLimiter>,
         transport_manager: &TransportManager,
         local_id: NodeId,
         local_identity_key: [u8; 32],
@@ -4543,7 +4663,9 @@ impl Node {
         let digest = mycelium_crypto::emergency::broadcast_digest(&ctx);
         let mark = FloodMark {
             key: digest,
-            reach: envelope.ttl.min(MAX_FLOOD_TTL),
+            // Clamped to this level's reach, not the maximum: a level-1
+            // alert claiming twenty hops travels four (spec §9.5).
+            reach: envelope.ttl.min(flood_ttl(broadcast.level)),
             // Hold the entry until this broadcast could no longer be accepted
             // on its date, whatever the monotonic clock does: a backward clock
             // correction must not retire the entry while the alert it covers
@@ -4561,7 +4683,8 @@ impl Node {
         // dropped here, before any verification: re-checking it is work an
         // attacker can ask for by replaying one captured alert, and a 1-hop
         // neighbour is not rate-limited at all.
-        if seen.read().await.probe(broadcast.level, &mark) == FloodCopy::Duplicate {
+        let known = seen.read().await.probe(broadcast.level, &mark);
+        if known == FloodCopy::Duplicate {
             debug!(
                 "Duplicate emergency broadcast {}, skipping",
                 envelope.message_id
@@ -4591,7 +4714,13 @@ impl Node {
 
         // Trust threshold checks
         let tg = trust_graph.read().await;
-        let sender_trust = tg.trust_score(&local_id, &envelope.source).value;
+        let sender_score = tg.trust_score(&local_id, &envelope.source);
+        let sender_trust = sender_score.value;
+        let sender_hops = if sender_trust > 0.0 {
+            sender_score.hops
+        } else {
+            u8::MAX
+        };
 
         // Thresholds per spec §9.5: Priority > 0.3, Urgent > 0.6, Critical
         // needs 3+ co-signers above 0.8 whose signatures verify (ADR-010).
@@ -4687,6 +4816,40 @@ impl Node {
             return;
         }
 
+        // Level 2 is the level that bypasses the per-identity rate limit, and
+        // the only one: spec §9.5 gives that privilege to "Urgent" alone.
+        // Charged per *alert* rather than per copy — a flood delivers the same
+        // alert from every neighbour, and charging each would make a
+        // legitimate flood exhaust its own originator's quota — so only a
+        // broadcast we have not seen is charged.
+        //
+        // Charged whether or not the originator is the neighbour that handed
+        // it to us. Ingress accounting is a different limiter answering a
+        // different question ("how much is this peer sending us"), so skipping
+        // this one for a direct neighbour let an originator spend its alert
+        // allowance twice: five directly, five more through any relay.
+        let charge_originator = charges_originator(broadcast.level) && known == FloodCopy::New;
+
+        // Before the dedup entry, not after: an entry is a record of
+        // something accepted, and an alert refused for quota was not. Writing
+        // it first let an attacker over its quota send a spent copy — refused,
+        // but remembered — and then a copy with reach left, which the set
+        // reported as `Further` and the handler forwarded without ever
+        // charging or raising it (ADR-013).
+        if charge_originator {
+            let allowed = {
+                let mut rl = emergency_limits.write().await;
+                rl.check_message(&envelope.source, sender_hops)
+            };
+            if !allowed {
+                debug!(
+                    "Rate-limited {:?} emergency from {} (trust_hops={})",
+                    broadcast.level, envelope.source, sender_hops
+                );
+                return;
+            }
+        }
+
         // Accepted — and only now remembered, so that a copy we refused can
         // never stand in for one we would have taken.
         let copy = seen.write().await.accept(broadcast.level, mark);
@@ -4715,7 +4878,14 @@ impl Node {
         // never back to the hop it came from. `FloodCopy::Further` lands here
         // too: same alert, more reach, so it travels on without being
         // reported a second time.
-        Self::flood_onward(envelope, peer, local_id, transport_manager).await;
+        Self::flood_onward(
+            envelope,
+            peer,
+            local_id,
+            transport_manager,
+            flood_ttl(broadcast.level),
+        )
+        .await;
     }
 
     // --- Receipt handler ---
@@ -5107,6 +5277,35 @@ mod tests {
         assert_ne!(
             text,
             build_ad(b, a, content_type_to_byte(ContentType::Text))
+        );
+    }
+
+    /// Spec §9.5 gives the rate-limit exemption to "Urgent" alone, so the
+    /// other two levels are charged. The end-to-end behaviour is not testable
+    /// through the node: an originator must clear level 2's trust threshold
+    /// (> 0.6) to send one, which takes a 1-hop vouch, and 1-hop peers are
+    /// already unlimited — so the exemption changes nothing observable until
+    /// the tiers do (see `charges_originator`).
+    #[test]
+    fn test_only_urgent_is_exempt_from_the_originator_rate_limit() {
+        assert!(charges_originator(wire::EmergencyLevel::Priority));
+        assert!(!charges_originator(wire::EmergencyLevel::Urgent));
+        assert!(charges_originator(wire::EmergencyLevel::Critical));
+    }
+
+    /// Mesh-wide flooding is level 3's alone, so the cheaper levels travel
+    /// strictly less far. The figures are provisional (T-19, T-15); the
+    /// ordering is the rule.
+    #[test]
+    fn test_each_level_reaches_less_far_than_the_one_above() {
+        let priority = reach_for(wire::EmergencyLevel::Priority);
+        let urgent = reach_for(wire::EmergencyLevel::Urgent);
+        let critical = reach_for(wire::EmergencyLevel::Critical);
+        assert!(priority < urgent, "level 1 travels less far than level 2");
+        assert!(urgent < critical, "level 2 travels less far than level 3");
+        assert_eq!(
+            critical, MAX_FLOOD_TTL,
+            "level 3 is the one that floods the mesh"
         );
     }
 
