@@ -3,7 +3,6 @@
 //! BT Classic provides higher throughput than BLE (~2 Mbps) via RFCOMM
 //! sockets. No fragmentation needed due to large MTU.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -13,7 +12,9 @@ const MAX_OUTBOX: usize = 512;
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
-use super::{Transport, TransportError, TransportEvent, TransportType};
+use super::{
+    PriorityOutbox, SendPriority, Transport, TransportError, TransportEvent, TransportType,
+};
 
 /// Bluetooth Classic SPP transport.
 ///
@@ -27,7 +28,7 @@ pub struct BtClassicTransport {
     connected_peers: Arc<RwLock<Vec<NodeId>>>,
     started: Arc<RwLock<bool>>,
     #[allow(clippy::type_complexity)]
-    outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
+    outbox: Arc<Mutex<PriorityOutbox>>,
 }
 
 impl Default for BtClassicTransport {
@@ -43,7 +44,7 @@ impl BtClassicTransport {
             tx,
             connected_peers: Arc::new(RwLock::new(Vec::new())),
             started: Arc::new(RwLock::new(false)),
-            outbox: Arc::new(Mutex::new(VecDeque::new())),
+            outbox: Arc::new(Mutex::new(PriorityOutbox::new(MAX_OUTBOX))),
         }
     }
 
@@ -54,7 +55,7 @@ impl BtClassicTransport {
 
     /// Dequeue a pending send from the outbox.
     pub fn dequeue_send(&self) -> Option<(NodeId, Vec<u8>)> {
-        self.outbox.lock().ok()?.pop_front()
+        self.outbox.lock().ok()?.pop()
     }
 
     /// Called when a BT Classic peer connects via SPP.
@@ -123,6 +124,18 @@ impl Transport for BtClassicTransport {
     }
 
     async fn send(&self, peer: &NodeId, data: &[u8]) -> Result<(), TransportError> {
+        self.send_with_priority(peer, data, SendPriority::Normal)
+            .await
+    }
+
+    /// An `Alert` frame is queued ahead of ordinary traffic, and kept in
+    /// preference to it when the outbox is full (spec §9.5, ADR-014).
+    async fn send_with_priority(
+        &self,
+        peer: &NodeId,
+        data: &[u8],
+        priority: SendPriority,
+    ) -> Result<(), TransportError> {
         let started = self.started.read().await;
         if !*started {
             return Err(TransportError::NotStarted);
@@ -143,14 +156,15 @@ impl Transport for BtClassicTransport {
         debug!("BT Classic send: {} bytes to {}", data.len(), peer);
 
         if let Ok(mut outbox) = self.outbox.lock() {
-            if outbox.len() >= MAX_OUTBOX {
+            if outbox.push(*peer, data.to_vec(), priority).is_err() {
                 warn!(
-                    "BT Classic outbox full ({}), dropping oldest packet",
+                    "BT Classic outbox full ({}) of alerts, dropping ordinary traffic",
                     MAX_OUTBOX
                 );
-                outbox.pop_front();
+                return Err(TransportError::SendFailed(
+                    "outbox is full of emergency traffic".to_string(),
+                ));
             }
-            outbox.push_back((*peer, data.to_vec()));
         }
 
         Ok(())

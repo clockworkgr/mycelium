@@ -14,7 +14,7 @@ authentication:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **449 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **460 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -359,13 +359,23 @@ T-19/T-15 measure them; the ordering is the rule), and only level 2 is exempt
 from the per-originator rate limit, charged once per alert rather than per
 copy.
 
-**What remains: level 1 has no relay priority.** The two-class relay queue
-decided for this task was withdrawn — a queue between every relay decision and
-the wire makes relaying asynchronous and moves send failures away from the call
-site that reports them — and an emergency never enters the DTN store, so
-store-and-forward ordering cannot carry the privilege either. What can: every
-transport already has a bounded send queue an alert passes through, and
-ordering by level belongs in those. Also noted: the level-2 rate-limit exemption is
+**Landed 2026-11-13, third: priority.** The two-class relay queue first
+decided for this task was withdrawn — it would have made relaying asynchronous
+and moved send failures away from the call site that reports them — and
+ordering went where the queues already are:
+`Transport::send_with_priority` carries an `Alert`, defaulting to `send` so
+transports without a queue and older plugins are unchanged. The four platform
+transports share one bounded outbox: alerts keep their own order ahead of
+ordinary traffic, a full outbox drops the oldest *ordinary* frame for an alert
+and refuses ordinary traffic rather than evicting one, and a fragmented
+message is admitted whole or not at all. The internet transport drains a
+second channel first. None of it reaches frames already handed to the platform
+layer.
+
+**T-37 is complete.** What remains of §9.5 is recorded on T-05 (nothing
+collects co-signatures) and T-39 (a co-signed alert exceeds the BLE cap), plus
+the standing note that the level-2 rate-limit exemption is nearly inert while
+an originator clearing trust > 0.6 is 1 hop away and already unlimited. Also noted: the level-2 rate-limit exemption is
 implemented but nearly inert, since an originator clearing trust > 0.6 is 1 hop
 away and already unlimited — it bites only if the tiers change (ADR-014).
 
@@ -412,15 +422,10 @@ Two related defects, found while fixing T-36:
 - ~~Level 1 reaches less far than level 2, which reaches less far than level 3;
   level 2 alone is exempt from the per-originator rate limit.~~ Landed
   2026-11-13.
-- Level 1 gets relay priority by **ordering within the send queue each
-  transport already has** — BLE's 512-packet outbox, the internet transport's
-  128-slot channel, and the Wi-Fi Direct and LoRa equivalents — so an alert
-  goes ahead of ordinary traffic in a queue that exists rather than a new one
-  above it. The two-class relay queue first decided for this task was
-  withdrawn: it made relaying asynchronous and moved send failures away from
-  the call site that reports them (ADR-014's second note, corrected).
-- Tests: an alert queued behind ordinary traffic leaves first, per transport;
-  a full queue drops ordinary traffic before an alert.
+- ~~Level 1 gets relay priority by ordering within the send queue each
+  transport already has.~~ Landed 2026-11-13, with tests that an alert queued
+  behind ordinary traffic leaves first and that a full outbox drops ordinary
+  traffic rather than the alert.
 - Tests: a level-2 alert forged under a trusted id is dropped; a genuine one
   is accepted; the flood scope per level is asserted.
 
@@ -517,6 +522,41 @@ logs it. Neither makes the alert fit.
   every flood path (landed with T-37 for the emergency paths).
 - Tests: the worst-case alert round-trips over the BLE transport's own send
   path; a fragment lost mid-reassembly does not strand the rest.
+
+---
+
+### T-40 · LoRa transport does not keep ADR-008's guarantees
+
+**Area:** `mycelium-core`, platform bridges · **Spec:** §8.3 · **ADR-008**
+
+Four defects found by reviewing ADR-008 against the code during T-37, none of
+them caused by that work:
+
+1. **The spreading factor never reaches the radio.** Per-peer SF affects
+   fragmentation and airtime accounting only; nothing carries it through the
+   outbox and FFI bridge, so ADR-008's discovery-SF behaviour is unimplemented
+   and a receiver's settings are never coordinated.
+2. **Peer expiry runs only on incoming traffic.** A silent radio keeps dead
+   peers indefinitely instead of the 300 s ADR-008 states, so routing keeps
+   offering them.
+3. **Reassembly does not enforce the 2048-byte limit.** 47 valid 45-byte
+   fragments produce a 2115-byte message; the cap is documented but never
+   checked against accumulated bytes.
+4. **A fragment-id collision can produce a complete corrupted message.**
+   ADR-008 says colliding sender tags and ids cause a drop; two messages
+   sharing tag, id and fragment count can instead combine into something whole
+   and wrong, which nothing at this layer detects.
+
+**Acceptance:**
+- SF travels with each frame to the platform layer, and a receiver is told
+  which to listen on; test the discovery-SF path end to end.
+- Peer and partial-message expiry run from periodic maintenance, not only on
+  receipt; test that a silent peer ages out.
+- Reassembly refuses a message whose accumulated fragments exceed the limit,
+  before storing more payload.
+- Either fragment reassembly is integrity-checked, or ADR-008 states which
+  layer is responsible for detecting a corrupted reassembly and why that is
+  sufficient.
 
 ---
 

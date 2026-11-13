@@ -3,7 +3,6 @@
 //! On Android/iOS, the real implementation will use platform BLE APIs
 //! via FFI callbacks. This stub provides the trait implementation structure.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -13,7 +12,9 @@ const MAX_OUTBOX: usize = 512;
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
-use super::{Transport, TransportError, TransportEvent, TransportType};
+use super::{
+    PriorityOutbox, SendPriority, Transport, TransportError, TransportEvent, TransportType,
+};
 
 /// FFI send callback type for BLE transport.
 /// Parameters: peer_id (32 bytes), data pointer, data length.
@@ -37,7 +38,7 @@ pub struct BleTransport {
     /// Outbox queue for outgoing data. Dart polls this via FFI since it cannot
     /// provide a synchronous C callback across threads.
     #[allow(clippy::type_complexity)]
-    outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
+    outbox: Arc<Mutex<PriorityOutbox>>,
 }
 
 impl BleTransport {
@@ -49,7 +50,7 @@ impl BleTransport {
             connected_peers: Arc::new(RwLock::new(Vec::new())),
             started: Arc::new(RwLock::new(false)),
             send_callback: Arc::new(RwLock::new(None)),
-            outbox: Arc::new(Mutex::new(VecDeque::new())),
+            outbox: Arc::new(Mutex::new(PriorityOutbox::new(MAX_OUTBOX))),
         }
     }
 
@@ -61,7 +62,7 @@ impl BleTransport {
     /// Dequeue a pending send from the outbox.
     /// Returns `Some((peer, data))` if there was a packet waiting, `None` otherwise.
     pub fn dequeue_send(&self) -> Option<(NodeId, Vec<u8>)> {
-        let result = self.outbox.lock().ok()?.pop_front();
+        let result = self.outbox.lock().ok()?.pop();
         if let Some((ref peer, ref data)) = result {
             debug!("BLE outbox dequeue: {} bytes for {}", data.len(), peer);
         }
@@ -136,6 +137,19 @@ impl Transport for BleTransport {
     }
 
     async fn send(&self, peer: &NodeId, data: &[u8]) -> Result<(), TransportError> {
+        self.send_with_priority(peer, data, SendPriority::Normal)
+            .await
+    }
+
+    /// An `Alert` frame is queued ahead of ordinary traffic, and kept in
+    /// preference to it when the outbox is full: this outbox is where spec
+    /// §9.5's "boosted priority in relay queues" actually happens (ADR-014).
+    async fn send_with_priority(
+        &self,
+        peer: &NodeId,
+        data: &[u8],
+        priority: SendPriority,
+    ) -> Result<(), TransportError> {
         let started = self.started.read().await;
         if !*started {
             return Err(TransportError::NotStarted);
@@ -173,11 +187,15 @@ impl Transport for BleTransport {
         } else {
             // Push to outbox for Dart to poll via mycelium_ble_dequeue_send
             if let Ok(mut outbox) = self.outbox.lock() {
-                if outbox.len() >= MAX_OUTBOX {
-                    warn!("BLE outbox full ({}), dropping oldest packet", MAX_OUTBOX);
-                    outbox.pop_front();
+                if let Err(_full) = outbox.push(*peer, data.to_vec(), priority) {
+                    warn!(
+                        "BLE outbox full ({}) of alerts, dropping ordinary traffic",
+                        MAX_OUTBOX
+                    );
+                    return Err(TransportError::SendFailed(
+                        "outbox is full of emergency traffic".to_string(),
+                    ));
                 }
-                outbox.push_back((*peer, data.to_vec()));
                 debug!("BLE outbox: queued, depth now {}", outbox.len());
             }
         }
@@ -212,5 +230,64 @@ impl Transport for BleTransport {
 
     fn mtu(&self) -> usize {
         512
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn connected() -> (BleTransport, NodeId) {
+        let transport = BleTransport::new(NodeId([1u8; 32]));
+        transport.start().await.expect("start");
+        let peer = NodeId([2u8; 32]);
+        transport.on_peer_discovered(peer).await;
+        (transport, peer)
+    }
+
+    /// The outbox is where spec §9.5's "boosted priority in relay queues"
+    /// happens: an alert leaves before ordinary traffic already waiting
+    /// (ADR-014).
+    #[tokio::test]
+    async fn test_an_alert_leaves_the_outbox_before_ordinary_traffic() {
+        let (transport, peer) = connected().await;
+
+        transport
+            .send(&peer, b"ordinary one")
+            .await
+            .expect("queued");
+        transport
+            .send(&peer, b"ordinary two")
+            .await
+            .expect("queued");
+        transport
+            .send_with_priority(&peer, b"alert", SendPriority::Alert)
+            .await
+            .expect("queued");
+
+        let (_, first) = transport.dequeue_send().expect("something queued");
+        assert_eq!(first, b"alert", "the alert goes first");
+        let (_, second) = transport.dequeue_send().expect("something queued");
+        assert_eq!(second, b"ordinary one", "then the traffic in its own order");
+    }
+
+    /// A full outbox drops ordinary traffic to make room for an alert, rather
+    /// than refusing the alert.
+    #[tokio::test]
+    async fn test_a_full_outbox_makes_room_for_an_alert() {
+        let (transport, peer) = connected().await;
+
+        for _ in 0..MAX_OUTBOX {
+            transport.send(&peer, b"ordinary").await.expect("queued");
+        }
+        assert_eq!(transport.outbox_len(), MAX_OUTBOX);
+
+        transport
+            .send_with_priority(&peer, b"alert", SendPriority::Alert)
+            .await
+            .expect("an alert is never refused for a full queue");
+        assert_eq!(transport.outbox_len(), MAX_OUTBOX, "still bounded");
+        let (_, first) = transport.dequeue_send().expect("something queued");
+        assert_eq!(first, b"alert");
     }
 }

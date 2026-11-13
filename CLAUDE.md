@@ -66,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 449 tests).
+- `cargo test` runs the whole workspace (currently 460 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -258,7 +258,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-13: 449 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-14: 460 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -276,7 +276,7 @@ co-signer signatures (`T-05`, wire format and verification landed; collecting
 co-signatures is not built), identity key at rest (`T-08`), BLE/Wi-Fi Direct
 peer identity, which is asserted rather than proved (`T-34`), what remains of
 the forged-`SessionReject` work (`T-35`, bookkeeping landed in ADR-012),
-the per-level behaviour of emergency broadcasts (`T-37`, origin authentication
-landed in ADR-014), DHT record eviction, which undoes ADR-011's rollback
-protection (`T-38`), and a co-signed emergency alert exceeding the BLE message
-cap (`T-39`). T-36 landed on 2026-11-12 (ADR-013).
+DHT record eviction, which undoes ADR-011's rollback protection (`T-38`), and
+a co-signed emergency alert exceeding the BLE message cap (`T-39`). T-36 landed
+on 2026-11-12 (ADR-013) and T-37 on 2026-11-14 (ADR-014). `T-40` collects four
+LoRa defects found reviewing ADR-008 against the code.

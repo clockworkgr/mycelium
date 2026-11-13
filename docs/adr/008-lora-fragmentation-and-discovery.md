@@ -56,3 +56,34 @@ never discover each other.
 2. **Broadcast from the node without a trait method** — Would require the
    node to know which transports are radios; the trait default keeps the
    knowledge in the transport.
+
+## Note (2026-11-14)
+
+**The outbox now orders by priority (ADR-014).** LoRa shares the
+`PriorityOutbox` the other platform transports use: an emergency alert queues
+ahead of ordinary traffic and keeps its own order, a full outbox drops the
+oldest *ordinary* frame to make room for an alert and refuses ordinary traffic
+rather than evicting one, and — because this transport fragments — a message is
+admitted **whole or not at all**, so it cannot evict its own earlier fragments
+and report success for something that can never be reassembled.
+
+Duty-cycle airtime is charged only once frames are admitted, and the check, the
+admission and the charge happen under one lock. Charging before admission meant
+a refused send spent airtime it never used; separate locks let two concurrent
+sends pass against the same remaining allowance.
+
+**Four defects in this record's own guarantees, found reviewing it against the
+code.** None is caused by the above; all are recorded as ROADMAP T-40.
+
+1. The spreading factor chosen for a peer affects fragmentation and airtime
+   accounting only. Nothing carries it to the radio through the outbox and FFI
+   bridge, so this record's discovery-SF behaviour is not implemented.
+2. Peer expiry runs only when a packet arrives, so a silent radio keeps dead
+   peers indefinitely rather than the 300 s this record states.
+3. Reassembly does not enforce the 2048-byte limit: 47 valid 45-byte fragments
+   produce a 2115-byte message.
+4. Colliding sender tags and fragment ids are described here as causing a
+   dropped message. Two messages with the same tag, id and fragment count can
+   instead combine into a *complete* corrupted one, which nothing at this layer
+   detects. Whether that is acceptable depends on upper-layer validation, and
+   this record should say which layer is responsible.

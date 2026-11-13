@@ -13,7 +13,7 @@ use mycelium_core::routing::aodv::{
 };
 use mycelium_core::routing::coordinator::{RoutingCoordinator, RoutingDecision};
 use mycelium_core::transport::manager::TransportManager;
-use mycelium_core::transport::{TransportError, TransportEvent};
+use mycelium_core::transport::{SendPriority, TransportError, TransportEvent};
 use mycelium_crypto::double_ratchet::RatchetHeader;
 use mycelium_crypto::emergency::{
     BroadcastContext, EMERGENCY_MAX_CLOCK_SKEW_SECS, EMERGENCY_VALIDITY_SECS,
@@ -1590,7 +1590,11 @@ impl Node {
                 // An emergency flood is best-effort, but a failure here is
                 // worth saying out loud: a `ExceedsMtu` on a co-signed alert
                 // means it cannot traverse BLE at all (ROADMAP T-39).
-                if let Err(e) = self.transport_manager.send(&peer, &data).await {
+                if let Err(e) = self
+                    .transport_manager
+                    .send_with_priority(&peer, &data, SendPriority::Alert)
+                    .await
+                {
                     warn!(
                         "Emergency broadcast {} not sent to {} ({} bytes): {}",
                         message_id,
@@ -4431,6 +4435,7 @@ impl Node {
         local_id: NodeId,
         transport_manager: &TransportManager,
         reach: u8,
+        priority: SendPriority,
     ) {
         if envelope.ttl == 0 {
             return;
@@ -4444,7 +4449,10 @@ impl Node {
                 // Best-effort, but not silent: a co-signed emergency alert is
                 // over BLE's message cap, and a flood that stops there should
                 // say so rather than look like a delivered one (T-39).
-                if let Err(e) = transport_manager.send(&p, &fwd_data).await {
+                if let Err(e) = transport_manager
+                    .send_with_priority(&p, &fwd_data, priority)
+                    .await
+                {
                     debug!(
                         "Flood of {} not relayed to {} ({} bytes): {}",
                         envelope.message_id,
@@ -4526,8 +4534,15 @@ impl Node {
             FloodCopy::Further => {
                 // Same message, more reach: carry it on without storing or
                 // reporting it a second time.
-                Self::flood_onward(envelope, peer, local_id, transport_manager, MAX_FLOOD_TTL)
-                    .await;
+                Self::flood_onward(
+                    envelope,
+                    peer,
+                    local_id,
+                    transport_manager,
+                    MAX_FLOOD_TTL,
+                    SendPriority::Normal,
+                )
+                .await;
                 return;
             }
             FloodCopy::Duplicate => {
@@ -4571,7 +4586,15 @@ impl Node {
 
         // Flood to all connected peers except the originator and the hop
         // that just delivered it to us.
-        Self::flood_onward(envelope, peer, local_id, transport_manager, MAX_FLOOD_TTL).await;
+        Self::flood_onward(
+            envelope,
+            peer,
+            local_id,
+            transport_manager,
+            MAX_FLOOD_TTL,
+            SendPriority::Normal,
+        )
+        .await;
     }
 
     // --- Emergency broadcast handler ---
@@ -4884,6 +4907,7 @@ impl Node {
             local_id,
             transport_manager,
             flood_ttl(broadcast.level),
+            SendPriority::Alert,
         )
         .await;
     }

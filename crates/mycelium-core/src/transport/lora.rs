@@ -8,7 +8,7 @@
 //! configured SF and the transport progressively tests lower SFs on
 //! consecutive successes, falling back to higher SFs on failures.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, RwLock};
@@ -16,7 +16,9 @@ use tracing::{debug, info, warn};
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
-use super::{Transport, TransportError, TransportEvent, TransportType};
+use super::{
+    PriorityOutbox, SendPriority, Transport, TransportError, TransportEvent, TransportType,
+};
 
 // --- LoRa BLE GATT Bridge UUIDs ---
 //
@@ -430,7 +432,7 @@ pub struct LoraTransport {
     started: Arc<RwLock<bool>>,
     /// Outbox queue for outgoing data. Platform polls via FFI.
     #[allow(clippy::type_complexity)]
-    outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
+    outbox: Arc<Mutex<PriorityOutbox>>,
     /// Duty cycle tracking for the current one-hour window.
     duty_cycle: Arc<Mutex<DutyCycleWindow>>,
     /// Adaptive data rate state per peer.
@@ -454,7 +456,7 @@ impl LoraTransport {
             tx,
             connected_peers: Arc::new(RwLock::new(Vec::new())),
             started: Arc::new(RwLock::new(false)),
-            outbox: Arc::new(Mutex::new(VecDeque::new())),
+            outbox: Arc::new(Mutex::new(PriorityOutbox::new(MAX_OUTBOX))),
             duty_cycle: Arc::new(Mutex::new(DutyCycleWindow::new())),
             adr: Arc::new(Mutex::new(AdaptiveDataRate::new(initial_sf))),
             next_frag_id: Arc::new(Mutex::new(0)),
@@ -562,7 +564,7 @@ impl LoraTransport {
 
     /// Dequeue a pending send from the outbox.
     pub fn dequeue_send(&self) -> Option<(NodeId, Vec<u8>)> {
-        self.outbox.lock().ok()?.pop_front()
+        self.outbox.lock().ok()?.pop()
     }
 
     /// Called by platform when a LoRa peer is discovered.
@@ -672,14 +674,19 @@ impl LoraTransport {
     /// Check if `airtime_ms` more airtime would exceed the duty cycle limit
     /// for the current one-hour window (regulatory limits such as EU 1% are
     /// per hour).
-    fn check_duty_cycle_airtime(&self, airtime_ms: u64) -> bool {
+    /// Whether `airtime_ms` fits the remaining allowance, given a window the
+    /// caller already holds.
+    ///
+    /// Takes the guard rather than locking, so a caller can check, admit and
+    /// charge without releasing it: two sends that each check against the same
+    /// remaining allowance and then both charge exceed the duty cycle.
+    fn airtime_fits(&self, window: &mut DutyCycleWindow, airtime_ms: u64) -> bool {
         if self.config.duty_cycle_limit >= 1.0 {
             return true; // No limit
         }
-        let used = self.duty_cycle.lock().map(|mut w| w.used_ms()).unwrap_or(0);
         let max_airtime =
             (DUTY_CYCLE_WINDOW.as_millis() as f64 * self.config.duty_cycle_limit as f64) as u64;
-        used + airtime_ms <= max_airtime
+        window.used_ms() + airtime_ms <= max_airtime
     }
 
     /// Airtime charged so far in the current duty-cycle window (ms).
@@ -732,6 +739,19 @@ impl Transport for LoraTransport {
     }
 
     async fn send(&self, peer: &NodeId, data: &[u8]) -> Result<(), TransportError> {
+        self.send_with_priority(peer, data, SendPriority::Normal)
+            .await
+    }
+
+    /// An `Alert` frame is queued ahead of ordinary traffic, and kept in
+    /// preference to it when the outbox is full: this outbox is where spec
+    /// §9.5's "boosted priority in relay queues" actually happens (ADR-014).
+    async fn send_with_priority(
+        &self,
+        peer: &NodeId,
+        data: &[u8],
+        priority: SendPriority,
+    ) -> Result<(), TransportError> {
         let started = self.started.read().await;
         if !*started {
             return Err(TransportError::NotStarted);
@@ -771,21 +791,13 @@ impl Transport for LoraTransport {
         };
         let frames = fragment(data, frame_mtu, self.sender_tag, frag_id)?;
 
+        let fragment_count = frames.len();
+
         // Duty cycle: charge the airtime of every frame, not the payload.
         let airtime: u64 = frames
             .iter()
             .map(|f| self.config.airtime_ms_for_sf(f.len(), peer_sf))
             .sum();
-        if !self.check_duty_cycle_airtime(airtime) {
-            warn!("LoRa duty cycle limit reached, dropping send");
-            return Err(TransportError::SendFailed(
-                "duty cycle limit exceeded".to_string(),
-            ));
-        }
-        if let Ok(mut window) = self.duty_cycle.lock() {
-            window.charge(airtime);
-        }
-
         debug!(
             "LoRa send: {} bytes to {} as {} frame(s) (SF{}, ~{}ms airtime)",
             data.len(),
@@ -795,17 +807,44 @@ impl Transport for LoraTransport {
             airtime
         );
 
-        // Queue frames for platform polling
+        // Queue frames for platform polling. Airtime is charged only once
+        // they are admitted: an ordinary send refused by an outbox full of
+        // alerts transmits nothing, and charging it anyway would let retries
+        // spend the hourly allowance and block the very alerts that filled
+        // the queue.
+        // The duty-cycle lock is held across the check, the admission and the
+        // charge. Separate acquisitions let two concurrent sends both pass
+        // against the same remaining allowance and exceed it, and the charge
+        // has to come after admission — a send the outbox refuses transmits
+        // nothing, so charging it would let retries spend the hourly budget
+        // and block the alerts that filled the queue.
+        let mut window = self
+            .duty_cycle
+            .lock()
+            .map_err(|_| TransportError::Other("duty cycle lock".into()))?;
+        if !self.airtime_fits(&mut window, airtime) {
+            warn!("LoRa duty cycle limit reached, dropping send");
+            return Err(TransportError::SendFailed(
+                "duty cycle limit exceeded".to_string(),
+            ));
+        }
+
         if let Ok(mut outbox) = self.outbox.lock() {
-            for frame in frames {
-                if outbox.len() >= MAX_OUTBOX {
-                    warn!("LoRa outbox full ({}), dropping oldest packet", MAX_OUTBOX);
-                    outbox.pop_front();
-                }
-                outbox.push_back((*peer, frame));
+            // All the fragments or none: a message missing one cannot be
+            // reassembled, and reporting success for a half-queued batch stops
+            // the manager trying another transport.
+            if outbox.push_batch(*peer, frames, priority).is_err() {
+                warn!(
+                    "LoRa outbox has no room for {} fragment(s) without displacing alerts",
+                    fragment_count
+                );
+                return Err(TransportError::SendFailed(
+                    "outbox is full of emergency traffic".to_string(),
+                ));
             }
             debug!("LoRa outbox depth now {}", outbox.len());
         }
+        window.charge(airtime);
 
         Ok(())
     }
@@ -858,6 +897,84 @@ impl Transport for LoraTransport {
 
 #[cfg(test)]
 mod tests {
+    /// A fragmented send must not evict its own earlier fragments to fit:
+    /// with the outbox nearly full, admitting some and dropping others left a
+    /// message that could never be reassembled, reported as a success — so the
+    /// manager never tried another transport (ADR-014).
+    #[tokio::test]
+    async fn test_a_fragmented_send_is_refused_rather_than_part_queued() {
+        use crate::transport::SendPriority;
+
+        let transport = LoraTransport::new(LoraConfig::default());
+        transport.start().await.expect("start");
+        let peer = NodeId([2u8; 32]);
+        transport.on_peer_discovered(peer).await;
+
+        // A message that fragments into three frames, as the fragmentation
+        // test above establishes.
+        let mut multi = NodeId([0xBB; 32]).as_bytes().to_vec();
+        multi.extend((0..78u8).collect::<Vec<u8>>());
+
+        // Fill the outbox with alerts but for two slots, so a three-fragment
+        // ordinary send cannot fit and has only alerts to displace.
+        let mut alert = NodeId([0xCC; 32]).as_bytes().to_vec();
+        alert.extend_from_slice(b"alert");
+        while transport.outbox_len() < MAX_OUTBOX - 2 {
+            transport
+                .send_with_priority(&peer, &alert, SendPriority::Alert)
+                .await
+                .expect("alerts are admitted");
+        }
+        let depth = transport.outbox_len();
+
+        let refused = transport.send(&peer, &multi).await;
+        assert!(
+            refused.is_err(),
+            "three fragments cannot be admitted without displacing alerts"
+        );
+        assert_eq!(
+            transport.outbox_len(),
+            depth,
+            "and a refusal must leave the outbox untouched"
+        );
+    }
+
+    /// Airtime is a scarce hourly budget, and a send the outbox refuses
+    /// transmits nothing. Charging it anyway would let ordinary retries spend
+    /// the allowance and block the very alerts that filled the queue
+    /// (ADR-014).
+    #[tokio::test]
+    async fn test_a_refused_send_does_not_spend_airtime() {
+        use crate::transport::SendPriority;
+
+        let transport = LoraTransport::new(LoraConfig::default());
+        transport.start().await.expect("start");
+        let peer = NodeId([2u8; 32]);
+        transport.on_peer_discovered(peer).await;
+
+        // Fill the outbox with alerts, so ordinary traffic has nowhere to go.
+        // A message looks like an envelope: it starts with the 32-byte source.
+        let mut alert = NodeId([0xBB; 32]).as_bytes().to_vec();
+        alert.extend_from_slice(b"alert");
+        while transport.outbox_len() < MAX_OUTBOX {
+            transport
+                .send_with_priority(&peer, &alert, SendPriority::Alert)
+                .await
+                .expect("an alert is always admitted");
+        }
+        let spent = transport.duty_cycle_used_ms();
+
+        let mut ordinary = NodeId([0xCC; 32]).as_bytes().to_vec();
+        ordinary.extend_from_slice(b"ordinary");
+        let refused = transport.send(&peer, &ordinary).await;
+        assert!(refused.is_err(), "an outbox full of alerts refuses it");
+        assert_eq!(
+            transport.duty_cycle_used_ms(),
+            spent,
+            "a send that transmitted nothing must not have spent airtime"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1079,27 +1196,27 @@ mod tests {
 
         let airtime = |bytes: usize| transport.config.airtime_ms(bytes);
         // Initially should be allowed
-        assert!(transport.check_duty_cycle_airtime(airtime(50)));
+        assert!(transport.airtime_fits(&mut transport.duty_cycle.lock().unwrap(), airtime(50)));
 
         // Simulate heavy usage by setting high airtime
         if let Ok(mut w) = transport.duty_cycle.lock() {
             w.airtime_ms = 35_000; // 35 seconds out of 36 allowed (1% of 3600s)
         }
         // Should still pass for small packet
-        assert!(transport.check_duty_cycle_airtime(airtime(10)));
+        assert!(transport.airtime_fits(&mut transport.duty_cycle.lock().unwrap(), airtime(10)));
 
         // Set to near limit
         if let Ok(mut w) = transport.duty_cycle.lock() {
             w.airtime_ms = 36_000; // At the limit
         }
         // Large packet should fail
-        assert!(!transport.check_duty_cycle_airtime(airtime(50)));
+        assert!(!transport.airtime_fits(&mut transport.duty_cycle.lock().unwrap(), airtime(50)));
 
         // Once the hour window has elapsed the budget is available again.
         if let Ok(mut w) = transport.duty_cycle.lock() {
             w.window_start = Instant::now() - DUTY_CYCLE_WINDOW - Duration::from_secs(1);
         }
-        assert!(transport.check_duty_cycle_airtime(airtime(50)));
+        assert!(transport.airtime_fits(&mut transport.duty_cycle.lock().unwrap(), airtime(50)));
         assert_eq!(transport.duty_cycle_used_ms(), 0);
     }
 

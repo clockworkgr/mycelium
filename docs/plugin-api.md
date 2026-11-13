@@ -46,6 +46,19 @@ pub trait Transport: Send + Sync {
     /// Send data to a specific peer.
     async fn send(&self, peer: &NodeId, data: &[u8]) -> Result<(), TransportError>;
 
+    /// Optional. Defaults to `send`, so a plugin need not implement it.
+    ///
+    /// A plugin that queues outbound frames should send an `Alert` ahead of
+    /// `Normal` traffic, and when its queue is full drop ordinary traffic
+    /// rather than an alert: this is where an emergency broadcast's priority
+    /// is honoured (spec §9.5, ADR-014).
+    async fn send_with_priority(
+        &self,
+        peer: &NodeId,
+        data: &[u8],
+        priority: SendPriority,
+    ) -> Result<(), TransportError>;
+
     /// Subscribe to transport events (neighbor discovered/lost, data received).
     fn events(&self) -> broadcast::Receiver<TransportEvent>;
 

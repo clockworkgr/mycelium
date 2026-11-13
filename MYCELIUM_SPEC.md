@@ -1112,7 +1112,7 @@ signature in ROADMAP T-14.
 
 | Level | Name | Behaviour | Requirement |
 |-------|------|-----------|-------------|
-| 1 | **Priority** | Reach 4 hops | sender trust > 0.3 |
+| 1 | **Priority** | Reach 4 hops; queued ahead of ordinary traffic | sender trust > 0.3 |
 | 2 | **Urgent** | Reach 8 hops; exempt from the per-originator rate limit | sender trust > 0.6 |
 | 3 | **Critical** | Reach 20 hops — the mesh-wide flood | 3+ co-signers with trust > 0.8 |
 
@@ -1248,17 +1248,26 @@ a level-3 broadcast is refused by every receiver. Unusable is the correct
 failure direction for a mesh-wide flood, but level 3 is not available until
 collection exists. See ROADMAP T-05.
 
-**Known gap:** level 1 has no relay priority. The relay path itself sends as
-it decides, with nothing to order, and an emergency never enters the DTN store
-— bundles come from `DtnRelay` payloads and the unicast routing fallback, and a
-broadcast takes neither. But every transport has a bounded send queue that an
-alert already passes through (BLE's 512-packet outbox, the internet
-transport's 128-slot channel, and the Wi-Fi Direct and LoRa equivalents), and
-that is where ordering by level belongs: ahead of ordinary traffic in the queue
-that is already there, rather than in a new one above it (ADR-014, ROADMAP
-T-37). The level-2 rate-limit exemption is implemented but nearly inert,
-because an originator that clears trust > 0.6 is 1 hop away and already
-unlimited.
+**Priority is queue ordering.** An emergency is sent and relayed at `Alert`
+priority, which every transport applies to the queue it already has. BLE,
+Wi-Fi Direct, LoRa and Bluetooth Classic share one bounded outbox with three
+rules: an alert queues after the alerts already waiting and ahead of all
+ordinary traffic, so alerts keep their own order; a full outbox makes room for
+an alert by dropping the **oldest ordinary** frame, and sacrifices the oldest
+alert only when nothing ordinary is left; and a full outbox **refuses**
+ordinary traffic rather than evicting an alert to fit it. A fragmented message
+is admitted whole or not at all, so it cannot evict its own fragments, and
+LoRa charges duty-cycle airtime only once frames are admitted. The internet
+transport has a second channel its writer drains first.
+
+The relay path itself has nothing to order — it sends as it decides — and an
+emergency never enters the DTN store, so these queues are the only place
+ordering can happen (ADR-014). It does not reach frames already handed to the
+platform layer or the operating system.
+
+**Known gap:** the level-2 rate-limit exemption is implemented but nearly
+inert, because an originator that clears trust > 0.6 is 1 hop away and already
+unlimited. See ROADMAP T-37.
 
 **Known gap:** an alert is `217 + message_bytes + 96 × approvals` bytes on the
 wire, against the BLE transport's 512-byte message cap — so three approvals
@@ -1996,7 +2005,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 9.3 | Receipts | **Partial** | Recipient-only, WS push, UI indicators. Dropped when no route exists, so DTN deliveries are never acknowledged (T-27) |
 | 9.4 | Public channels | **Implemented** | Wire types, storage, flooding, 6 REST endpoints, 2 screens. Dedup expires by age and is keyed on the message (ADR-013); the channel `NodeEvent` variant is still open (T-14) |
 | 9.4 | Regional channels | **Planned** | Needs the geographic overlay |
-| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest, reach and rate limiting per level (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); level 1 has no relay priority, which needs a queue or a store-and-forward path for emergencies (T-37); a co-signed alert exceeds the BLE cap (T-39) |
+| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest, reach and rate limiting per level, and alerts ordered ahead of ordinary traffic in every transport's send queue (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); a co-signed alert exceeds the BLE cap (T-39) |
 | 9.6 | Multi-device / CRDT sync | **Planned** | v0.3 |
 | 10.1 | Beacon | **Implemented** | Node type, battery, neighbour count, group hash; LoRa broadcast |
 | 10.2 | Seed phrase groups | **Partial** | Derivation + beacon match + auto-vouch; no proof of possession (T-04) |

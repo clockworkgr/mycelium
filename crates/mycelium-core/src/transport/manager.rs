@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
-use super::{Transport, TransportError, TransportEvent, TransportType};
+use super::{SendPriority, Transport, TransportError, TransportEvent, TransportType};
 
 /// Per-peer transport scoring info.
 #[derive(Debug, Clone)]
@@ -228,13 +228,28 @@ impl TransportManager {
 
     /// Send data to a peer, selecting the best available transport.
     pub async fn send(&self, peer: &NodeId, data: &[u8]) -> Result<(), TransportError> {
+        self.send_with_priority(peer, data, SendPriority::Normal)
+            .await
+    }
+
+    /// `send`, carrying a priority the transport applies to its own queue.
+    ///
+    /// Each transport queues outbound frames, and that queue is where
+    /// ordering by urgency happens — the relay path above has nothing to
+    /// order (ADR-014).
+    pub async fn send_with_priority(
+        &self,
+        peer: &NodeId,
+        data: &[u8],
+        priority: SendPriority,
+    ) -> Result<(), TransportError> {
         let best = self.select_transport(peer).await;
 
         if let Some(transport_type) = best {
             let transports = self.transports.read().await;
             for t in transports.iter() {
                 if t.transport_type() == transport_type {
-                    match t.send(peer, data).await {
+                    match t.send_with_priority(peer, data, priority).await {
                         Ok(()) => return Ok(()),
                         Err(e) => {
                             warn!("Transport {} failed for {}: {}", transport_type, peer, e);
@@ -247,7 +262,7 @@ impl TransportManager {
         // Fallback: try all transports
         let transports = self.transports.read().await;
         for t in transports.iter() {
-            match t.send(peer, data).await {
+            match t.send_with_priority(peer, data, priority).await {
                 Ok(()) => {
                     debug!("Fallback send via {} to {}", t.transport_type(), peer);
                     return Ok(());

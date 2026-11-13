@@ -311,8 +311,8 @@ and fails the threshold. So the privilege changes nothing observable until the
 tiers change. It is implemented as specified rather than quietly dropped,
 because the tiers are the thing more likely to move.
 
-**What is still not implemented:** relay priority for level 1. And the
-reasoning above for why it could not be — "there is no queue" — was wrong.
+**Relay priority, implemented where the queues are.** The reasoning above for
+why it could not be — "there is no queue" — was wrong.
 There is no queue *in the relay path*, and emergencies do not enter the DTN
 store, but every transport has a bounded send queue that an alert already
 passes through: BLE's 512-packet outbox, the internet transport's 128-slot
@@ -322,5 +322,49 @@ exists — which is a far smaller change than the two-class relay queue this
 record withdrew, and it does not make relaying asynchronous or move send
 failures away from their call site.
 
-So the withdrawal stands and the conclusion changes: the work is per-transport
-queue ordering, not a new structure. Spec §9.5 and ROADMAP T-37 say so.
+So the withdrawal stands and the conclusion changed: the work was
+per-transport queue ordering, not a new structure, and that is what is built.
+
+`Transport::send_with_priority(peer, data, SendPriority)` carries the urgency,
+defaulting to `send` so a transport without a queue — and any plugin written
+before this existed — is unchanged. Emergency broadcasts send and relay at
+`Alert`; everything else is `Normal`.
+
+The four platform transports (BLE, Wi-Fi Direct, LoRa, Bluetooth Classic)
+share one `PriorityOutbox`, because the rules are easy to get backwards and
+four copies would get them backwards differently:
+
+- an alert queues after the alerts already waiting and before all ordinary
+  traffic, so alerts keep their own order;
+- a full outbox makes room for an alert by dropping the **oldest ordinary**
+  frame, and sacrifices the oldest alert only when there is no ordinary
+  traffic left to give;
+- a full outbox **refuses** ordinary traffic rather than evicting an alert to
+  fit it.
+
+The first version of this was a single deque with alerts pushed to the front.
+It dropped the newest ordinary frame when making room, and — worse — an
+ordinary frame arriving at a full outbox evicted the alert at the front, which
+is the opposite of the rule. Two deques make the classes explicit.
+
+The internet transport instead gets a second channel of its own, drained first
+by a biased select, because an `mpsc` is first-in-first-out and an alert queued
+behind a hundred frames would leave last however it was labelled.
+
+What this does not do is make an alert overtake traffic already handed to the
+operating system, or to a platform layer that has polled it out of the outbox.
+Priority applies to what is still queued in this process.
+
+Two consequences worth recording, both because refusing a send was new.
+
+LoRa charges duty-cycle airtime, and it now does so **after** the frames are
+admitted to the outbox. Charging before meant an ordinary send the outbox
+refused still spent airtime it never used, so retries could exhaust the hourly
+allowance and block the very alerts that filled the queue.
+
+And a fragmented message is admitted **all or none**. Pushing frame by frame
+meant a three-fragment send into a nearly full outbox evicted its own earlier
+fragments to fit the later ones — leaving a message that could never be
+reassembled, reported as a success, so the manager never tried another
+transport. `push_batch` decides feasibility before evicting anything, so a
+refusal leaves the outbox exactly as it was.

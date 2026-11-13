@@ -33,7 +33,7 @@ use mycelium_crypto::channel::{channel_hello_payload, ChannelHandshake, FrameCip
 use mycelium_crypto::identity::{node_id_from_public_key, verify_signature_bytes, Identity};
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
-use super::{Transport, TransportError, TransportEvent, TransportType};
+use super::{SendPriority, Transport, TransportError, TransportEvent, TransportType};
 use crate::dht::record::{DhtRecord, RECORD_TTL_SECS};
 use crate::dht::rpc::{
     deserialize_wire_message, encode_body, DhtReply, DhtRequest, DhtRequestBody,
@@ -60,6 +60,12 @@ const STOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// shape as the other transports' outboxes: a bounded queue, and a failed send
 /// the node's DTN layer can fall back on.
 const OUTBOX_CAPACITY: usize = 128;
+
+/// Frames queued for the alert channel of one connection.
+///
+/// Smaller than the ordinary outbox: an emergency is rare, and a queue deep
+/// enough to hold many of them would only delay the newest behind the oldest.
+const ALERT_OUTBOX_CAPACITY: usize = 16;
 
 /// How long one frame may take to reach the socket before the channel is
 /// considered dead. Bounds a peer that stops reading.
@@ -135,12 +141,24 @@ impl SealedWriter {
 async fn writer_task(
     mut writer: SealedWriter,
     mut outbox: mpsc::Receiver<InternetWireMessage>,
+    mut alerts: mpsc::Receiver<InternetWireMessage>,
     cancel: CancellationToken,
     _permit: Arc<OwnedSemaphorePermit>,
 ) {
     loop {
+        // Alerts first, and the select is biased so a steady stream of
+        // ordinary traffic cannot starve them: this channel is where spec
+        // §9.5's "boosted priority in relay queues" happens for the internet
+        // transport (ADR-014).
         let msg = tokio::select! {
+            biased;
             _ = cancel.cancelled() => break,
+            msg = alerts.recv() => match msg {
+                Some(msg) => msg,
+                // The alert channel closing means the connection is going
+                // away; the ordinary one is handled the same way below.
+                None => break,
+            },
             msg = outbox.recv() => match msg {
                 Some(msg) => msg,
                 None => break,
@@ -208,6 +226,12 @@ struct PeerConnection {
     cancel: CancellationToken,
     /// Queue into the connection's writer task.
     outbox: mpsc::Sender<InternetWireMessage>,
+    /// Queue for emergency alerts, which the writer drains first.
+    ///
+    /// A separate channel rather than a priority flag, because an `mpsc` is
+    /// first-in-first-out: an alert queued behind a hundred ordinary frames
+    /// would leave last however it was labelled.
+    alerts: mpsc::Sender<InternetWireMessage>,
     /// In-flight DHT requests on *this* connection, awaiting their replies.
     ///
     /// Per connection, not global: with one shared map any authenticated peer
@@ -223,7 +247,20 @@ impl PeerConnection {
     /// means the peer is not draining, which the caller should treat as a
     /// failed send.
     fn enqueue(&self, msg: InternetWireMessage) -> Result<(), TransportError> {
-        self.outbox.try_send(msg).map_err(|e| match e {
+        self.enqueue_with_priority(msg, SendPriority::Normal)
+    }
+
+    /// `enqueue`, choosing the queue the writer drains first for an alert.
+    fn enqueue_with_priority(
+        &self,
+        msg: InternetWireMessage,
+        priority: SendPriority,
+    ) -> Result<(), TransportError> {
+        let queue = match priority {
+            SendPriority::Alert => &self.alerts,
+            SendPriority::Normal => &self.outbox,
+        };
+        queue.try_send(msg).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => {
                 TransportError::SendFailed("peer is not draining its outbox".to_string())
             }
@@ -617,6 +654,9 @@ impl Shared {
             dialled.unwrap_or_else(|| SocketAddr::new(socket_addr.ip(), channel.peer.listen_port));
         let conn_cancel = cancel.child_token();
         let (outbox, outbox_rx) = mpsc::channel(OUTBOX_CAPACITY);
+        // Its own capacity, so ordinary traffic filling the outbox cannot
+        // leave an alert with nowhere to go.
+        let (alerts, alerts_rx) = mpsc::channel(ALERT_OUTBOX_CAPACITY);
         let conn = Arc::new(PeerConnection {
             socket_addr,
             dialable_addr,
@@ -625,6 +665,7 @@ impl Shared {
             transcript: channel.transcript,
             cancel: conn_cancel.clone(),
             outbox,
+            alerts,
             pending: std::sync::Mutex::new(HashMap::new()),
         });
         let sealed_reader = SealedReader {
@@ -637,6 +678,7 @@ impl Shared {
                 cipher: channel.send,
             },
             outbox_rx,
+            alerts_rx,
             conn_cancel.clone(),
             permit,
         ));
@@ -1309,6 +1351,17 @@ impl Transport for InternetTransport {
     }
 
     async fn send(&self, peer: &NodeId, data: &[u8]) -> Result<(), TransportError> {
+        self.send_with_priority(peer, data, SendPriority::Normal)
+            .await
+    }
+
+    /// An `Alert` frame goes to the channel the writer drains first.
+    async fn send_with_priority(
+        &self,
+        peer: &NodeId,
+        data: &[u8],
+        priority: SendPriority,
+    ) -> Result<(), TransportError> {
         if data.len() > MAX_MESH_PAYLOAD {
             return Err(TransportError::ExceedsMtu {
                 size: data.len(),
@@ -1324,10 +1377,13 @@ impl Transport for InternetTransport {
                 .clone()
         };
 
-        conn.enqueue(InternetWireMessage::MeshData {
-            sender_id: self.shared.local_id,
-            data: data.to_vec(),
-        })
+        conn.enqueue_with_priority(
+            InternetWireMessage::MeshData {
+                sender_id: self.shared.local_id,
+                data: data.to_vec(),
+            },
+            priority,
+        )
     }
 
     fn events(&self) -> broadcast::Receiver<TransportEvent> {
@@ -1760,6 +1816,7 @@ mod tests {
             transcript: [0u8; 32],
             cancel: CancellationToken::new(),
             outbox,
+            alerts: mpsc::channel(1).0,
             pending: std::sync::Mutex::new(HashMap::new()),
         };
         let frame = || InternetWireMessage::Confirm {

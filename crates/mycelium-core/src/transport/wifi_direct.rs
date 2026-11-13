@@ -3,7 +3,6 @@
 //! On Android, the real implementation uses the WifiP2pManager API
 //! via FFI callbacks. Dart polls the outbox for outgoing data at 50ms.
 
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, warn};
@@ -13,7 +12,9 @@ const MAX_OUTBOX: usize = 512;
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
-use super::{Transport, TransportError, TransportEvent, TransportType};
+use super::{
+    PriorityOutbox, SendPriority, Transport, TransportError, TransportEvent, TransportType,
+};
 
 /// FFI send callback type for Wi-Fi Direct transport.
 /// Parameters: peer_id (32 bytes), data pointer, data length.
@@ -37,7 +38,7 @@ pub struct WifiDirectTransport {
     /// Outbox queue for outgoing data. Dart polls this via FFI since it cannot
     /// provide a synchronous C callback across threads.
     #[allow(clippy::type_complexity)]
-    outbox: Arc<Mutex<VecDeque<(NodeId, Vec<u8>)>>>,
+    outbox: Arc<Mutex<PriorityOutbox>>,
 }
 
 impl WifiDirectTransport {
@@ -49,7 +50,7 @@ impl WifiDirectTransport {
             connected_peers: Arc::new(RwLock::new(Vec::new())),
             started: Arc::new(RwLock::new(false)),
             send_callback: Arc::new(RwLock::new(None)),
-            outbox: Arc::new(Mutex::new(VecDeque::new())),
+            outbox: Arc::new(Mutex::new(PriorityOutbox::new(MAX_OUTBOX))),
         }
     }
 
@@ -61,7 +62,7 @@ impl WifiDirectTransport {
     /// Dequeue a pending send from the outbox.
     /// Returns `Some((peer, data))` if there was a packet waiting, `None` otherwise.
     pub fn dequeue_send(&self) -> Option<(NodeId, Vec<u8>)> {
-        let result = self.outbox.lock().ok()?.pop_front();
+        let result = self.outbox.lock().ok()?.pop();
         if let Some((ref peer, ref data)) = result {
             debug!(
                 "WiFi Direct outbox dequeue: {} bytes for {}",
@@ -139,6 +140,19 @@ impl Transport for WifiDirectTransport {
     }
 
     async fn send(&self, peer: &NodeId, data: &[u8]) -> Result<(), TransportError> {
+        self.send_with_priority(peer, data, SendPriority::Normal)
+            .await
+    }
+
+    /// An `Alert` frame is queued ahead of ordinary traffic, and kept in
+    /// preference to it when the outbox is full: this outbox is where spec
+    /// §9.5's "boosted priority in relay queues" actually happens (ADR-014).
+    async fn send_with_priority(
+        &self,
+        peer: &NodeId,
+        data: &[u8],
+        priority: SendPriority,
+    ) -> Result<(), TransportError> {
         let started = self.started.read().await;
         if !*started {
             return Err(TransportError::NotStarted);
@@ -176,14 +190,15 @@ impl Transport for WifiDirectTransport {
         } else {
             // Push to outbox for Dart to poll via mycelium_wifi_dequeue_send
             if let Ok(mut outbox) = self.outbox.lock() {
-                if outbox.len() >= MAX_OUTBOX {
+                if let Err(_full) = outbox.push(*peer, data.to_vec(), priority) {
                     warn!(
-                        "WiFi Direct outbox full ({}), dropping oldest packet",
+                        "WiFi Direct outbox full ({}) of alerts, dropping ordinary traffic",
                         MAX_OUTBOX
                     );
-                    outbox.pop_front();
+                    return Err(TransportError::SendFailed(
+                        "outbox is full of emergency traffic".to_string(),
+                    ));
                 }
-                outbox.push_back((*peer, data.to_vec()));
                 debug!("WiFi Direct outbox: queued, depth now {}", outbox.len());
             }
         }
