@@ -16,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
+use super::fragment::{fragment, Reassembler};
 use super::{
     PriorityOutbox, SendPriority, Transport, TransportError, TransportEvent, TransportType,
 };
@@ -287,13 +288,6 @@ const DUTY_CYCLE_WINDOW: Duration = Duration::from_secs(3600);
 /// Maximum packets queued in the outbox while the platform is not polling.
 const MAX_OUTBOX: usize = 256;
 
-/// Fragment header on every LoRa frame: sender tag (u16 LE, random per
-/// transport instance so two radios' fragment ids do not collide), fragment
-/// id (u16 LE), index (u8), count (u8). A 106-byte Mycelium envelope never
-/// fits the 51-byte MTU of SF10-12, so every message is split into frames the
-/// radio can carry.
-const FRAG_HEADER: usize = 6;
-
 /// A LoRa peer that has been silent this long is reported lost. The radio is
 /// a broadcast medium with no link-layer sessions, so presence is inferred
 /// from traffic (beacons every 30 s by default).
@@ -301,77 +295,6 @@ pub const LORA_PEER_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Largest reassembled message the transport accepts.
 pub const LORA_MAX_MESSAGE: usize = 2048;
-
-/// Concurrent reassemblies kept per transport, and how long an incomplete one
-/// waits for its missing fragments before being discarded.
-const MAX_REASSEMBLIES: usize = 64;
-const REASSEMBLY_TTL: Duration = Duration::from_secs(120);
-
-/// Fragments of one message received so far.
-struct Reassembly {
-    parts: Vec<Option<Vec<u8>>>,
-    received: usize,
-    started: Instant,
-}
-
-/// Split `data` into frames of at most `frame_mtu` bytes, each prefixed with
-/// the fragment header.
-pub fn fragment(
-    data: &[u8],
-    frame_mtu: usize,
-    sender_tag: u16,
-    id: u16,
-) -> Result<Vec<Vec<u8>>, TransportError> {
-    if frame_mtu <= FRAG_HEADER {
-        return Err(TransportError::ExceedsMtu {
-            size: data.len(),
-            mtu: 0,
-        });
-    }
-    let chunk = frame_mtu - FRAG_HEADER;
-    let count = data.len().div_ceil(chunk).max(1);
-    if count > u8::MAX as usize {
-        return Err(TransportError::ExceedsMtu {
-            size: data.len(),
-            mtu: chunk * u8::MAX as usize,
-        });
-    }
-    let mut frames = Vec::with_capacity(count);
-    for (index, piece) in data.chunks(chunk).enumerate() {
-        let mut frame = Vec::with_capacity(FRAG_HEADER + piece.len());
-        frame.extend_from_slice(&sender_tag.to_le_bytes());
-        frame.extend_from_slice(&id.to_le_bytes());
-        frame.push(index as u8);
-        frame.push(count as u8);
-        frame.extend_from_slice(piece);
-        frames.push(frame);
-    }
-    if frames.is_empty() {
-        // Empty message still needs one frame so the peer sees it.
-        let mut frame = Vec::with_capacity(FRAG_HEADER);
-        frame.extend_from_slice(&sender_tag.to_le_bytes());
-        frame.extend_from_slice(&id.to_le_bytes());
-        frame.push(0);
-        frame.push(1);
-        frames.push(frame);
-    }
-    Ok(frames)
-}
-
-/// Parse a fragment header. Returns (sender_tag, id, index, count, payload).
-fn parse_fragment(frame: &[u8]) -> Option<(u16, u16, u8, u8, &[u8])> {
-    if frame.len() < FRAG_HEADER {
-        return None;
-    }
-    let tag = u16::from_le_bytes([frame[0], frame[1]]);
-    let id = u16::from_le_bytes([frame[2], frame[3]]);
-    let index = frame[4];
-    let count = frame[5];
-    if count == 0 || index >= count {
-        return None;
-    }
-    Some((tag, id, index, count, &frame[FRAG_HEADER..]))
-}
 
 /// The source NodeId of a reassembled message: every Mycelium envelope
 /// starts with the 32-byte source id. Returns `None` for shorter data.
@@ -442,7 +365,7 @@ pub struct LoraTransport {
     /// Random tag identifying this radio's fragments to receivers.
     sender_tag: u16,
     /// In-progress reassemblies keyed by (sender tag, fragment id).
-    reassembly: Arc<Mutex<HashMap<(u16, u16), Reassembly>>>,
+    reassembly: Arc<Mutex<Reassembler>>,
     /// When each peer was last heard from (for silent-peer expiry).
     last_seen: Arc<Mutex<HashMap<NodeId, Instant>>>,
 }
@@ -461,7 +384,7 @@ impl LoraTransport {
             adr: Arc::new(Mutex::new(AdaptiveDataRate::new(initial_sf))),
             next_frag_id: Arc::new(Mutex::new(0)),
             sender_tag: rand::random(),
-            reassembly: Arc::new(Mutex::new(HashMap::new())),
+            reassembly: Arc::new(Mutex::new(Reassembler::new(LORA_MAX_MESSAGE, "LoRa"))),
             last_seen: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -503,58 +426,16 @@ impl LoraTransport {
 
     /// Number of incomplete reassemblies currently held.
     pub fn pending_reassemblies(&self) -> usize {
-        self.reassembly.lock().map(|r| r.len()).unwrap_or(0)
+        self.reassembly.lock().map(|r| r.pending()).unwrap_or(0)
     }
 
     /// Feed one received frame into reassembly. Returns the complete message
     /// once every fragment has arrived.
     fn reassemble(&self, frame: &[u8]) -> Option<Vec<u8>> {
-        let (tag, id, index, count, payload) = match parse_fragment(frame) {
-            Some(f) => f,
-            None => {
-                debug!("LoRa: dropping malformed frame");
-                return None;
-            }
-        };
-        if count == 1 {
-            return Some(payload.to_vec());
-        }
-
-        let mut map = self.reassembly.lock().ok()?;
-        let now = Instant::now();
-        map.retain(|_, r| now.duration_since(r.started) < REASSEMBLY_TTL);
-        let key = (tag, id);
-        if !map.contains_key(&key) && map.len() >= MAX_REASSEMBLIES {
-            // Evict the oldest incomplete message rather than grow unbounded.
-            if let Some(oldest) = map.iter().min_by_key(|(_, r)| r.started).map(|(k, _)| *k) {
-                map.remove(&oldest);
-            }
-        }
-        let entry = map.entry(key).or_insert_with(|| Reassembly {
-            parts: vec![None; count as usize],
-            received: 0,
-            started: now,
-        });
-        if entry.parts.len() != count as usize {
-            // Fragment id reused with a different count: start over.
-            entry.parts = vec![None; count as usize];
-            entry.received = 0;
-            entry.started = now;
-        }
-        let slot = &mut entry.parts[index as usize];
-        if slot.is_none() {
-            *slot = Some(payload.to_vec());
-            entry.received += 1;
-        }
-        if entry.received < count as usize {
-            return None;
-        }
-        let done = map.remove(&key)?;
-        let mut out = Vec::new();
-        for part in done.parts.into_iter().flatten() {
-            out.extend_from_slice(&part);
-        }
-        Some(out)
+        // The radio exposes no link-layer address, so every sender shares one
+        // scope and the random sender tag in the header is what separates
+        // them (§8.4, ADR-022).
+        self.reassembly.lock().ok()?.push(NodeId::ZERO, frame)
     }
 
     /// Number of packets waiting in the outbox.
@@ -1172,20 +1053,6 @@ mod tests {
             Ok(TransportEvent::DataReceived { data, .. }) => assert_eq!(data, vec![42, 43]),
             other => panic!("expected DataReceived, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_fragment_bounds() {
-        let frames = fragment(&[0u8; 45], 51, 3, 1).unwrap();
-        assert_eq!(frames.len(), 1);
-        let frames = fragment(&[0u8; 46], 51, 3, 1).unwrap();
-        assert_eq!(frames.len(), 2);
-        assert!(fragment(&[0u8; 45 * 256], 51, 3, 1).is_err());
-        assert!(fragment(&[0u8; 10], 6, 3, 1).is_err());
-        let empty = fragment(&[], 51, 3, 9).unwrap();
-        assert_eq!(empty.len(), 1);
-        let (tag, id, index, count, payload) = parse_fragment(&empty[0]).unwrap();
-        assert_eq!((tag, id, index, count, payload.len()), (3, 9, 0, 1, 0));
     }
 
     #[test]

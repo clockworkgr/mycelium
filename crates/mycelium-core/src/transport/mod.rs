@@ -1,5 +1,6 @@
 pub mod ble;
 pub mod bt_classic;
+pub mod fragment;
 pub mod internet;
 pub mod lora;
 pub mod manager;

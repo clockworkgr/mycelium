@@ -14,7 +14,7 @@ authentication:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **460 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **472 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -165,10 +165,6 @@ no approval UI, and `POST /v1/emergency/broadcast` sends an empty list — so a
 level-3 broadcast is now refused by every receiver. Unusable is the correct
 failure direction for a mesh-wide flood (it was previously forgeable), but
 level 3 is unavailable until this is built.
-
-**Blocked on T-39 for BLE:** a three-approval alert is 522 bytes against
-BLE's 512-byte cap, so collection delivers alerts that cannot traverse the
-project's primary transport until that is fixed.
 
 **Acceptance:**
 - A wire exchange by which an originator requests approval from trusted peers
@@ -508,11 +504,23 @@ Nothing collects co-signatures yet (T-05), so the three-approval case is
 latent and becomes live the moment collection lands; the long-message case is
 live now. Found by reviewing T-37's size against the transports.
 
-**Mitigated, not fixed (2026-11-13):** `Node::raise_emergency` refuses an
-alert larger than the narrowest transport the node has registered
-(`TransportManager::min_mtu`) and the API returns 400, so an originator learns
-instead of the mesh truncating silently. A relay that cannot pass a flood on
-logs it. Neither makes the alert fit.
+**Landed 2026-11-14 (ADR-022): the BLE transport fragments.** A message is
+split into 512-byte frames with the 6-byte header LoRa already used, queued as
+a batch so it cannot lose a fragment to a full outbox, and reassembled before
+anything above the transport sees it. BLE's MTU is now the reassembly bound
+(4096) rather than one frame, so a co-signed alert crosses it and an alert's
+text is no longer capped at 295 bytes. The fragmenter is shared with LoRa, and
+its accumulation check closes the unenforced 2048-byte limit in T-40's third
+bullet.
+
+`Node::raise_emergency` still refuses an alert larger than the narrowest
+registered transport's *message* bound, and the API returns 400, so an
+originator learns rather than the mesh truncating silently.
+
+**What remains:** the co-signer entry is still 96 bytes, so a three-approval
+alert is 522 and leaves little room on a 2048-byte LoRa link. Shrinking it —
+a truncated NodeId — stays an independent option (ADR-022's alternatives), to
+be taken only if alerts prove tight in practice.
 
 **Acceptance:**
 - A critical alert with three approvals and a 200-byte message traverses BLE,
@@ -539,9 +547,10 @@ them caused by that work:
 2. **Peer expiry runs only on incoming traffic.** A silent radio keeps dead
    peers indefinitely instead of the 300 s ADR-008 states, so routing keeps
    offering them.
-3. **Reassembly does not enforce the 2048-byte limit.** 47 valid 45-byte
-   fragments produce a 2115-byte message; the cap is documented but never
-   checked against accumulated bytes.
+3. ~~**Reassembly does not enforce the 2048-byte limit.**~~ Fixed
+   2026-11-14 with T-39: the shared reassembler checks accumulated bytes, and
+   keeps a refused message marked so its later fragments cannot restart it
+   (ADR-022).
 4. **A fragment-id collision can produce a complete corrupted message.**
    ADR-008 says colliding sender tags and ids cause a drop; two messages
    sharing tag, id and fragment count can instead combine into something whole
@@ -552,8 +561,8 @@ them caused by that work:
   which to listen on; test the discovery-SF path end to end.
 - Peer and partial-message expiry run from periodic maintenance, not only on
   receipt; test that a silent peer ages out.
-- Reassembly refuses a message whose accumulated fragments exceed the limit,
-  before storing more payload.
+- ~~Reassembly refuses a message whose accumulated fragments exceed the
+  limit.~~ Landed 2026-11-14 with T-39.
 - Either fragment reassembly is integrity-checked, or ADR-008 states which
   layer is responsible for detecting a corrupted reassembly and why that is
   sufficient.

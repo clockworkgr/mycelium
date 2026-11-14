@@ -1504,15 +1504,16 @@ mod tests {
         );
     }
 
-    /// Pins the figure ROADMAP T-39 exists for: with three approvals — the
-    /// minimum a critical alert needs — the envelope is over BLE's 512-byte
-    /// message cap, so it cannot traverse the transport an emergency most
-    /// needs. If this starts passing, T-39 has been fixed or the format
-    /// shrank, and both deserve to be noticed here.
+    /// Pins the arithmetic that made ROADMAP T-39 necessary: with three
+    /// approvals — the minimum a critical alert needs — the envelope exceeds
+    /// what one 512-byte BLE frame carries. The transport fragments now, so
+    /// this is no longer a limit on the message; it is the reason
+    /// fragmentation exists, and if the format ever shrinks below a frame
+    /// that is worth noticing here.
     #[test]
-    fn test_a_three_approval_alert_does_not_fit_ble() {
+    fn test_a_three_approval_alert_does_not_fit_one_ble_frame() {
         const ENVELOPE_HEADER: usize = 106;
-        const BLE_MTU: usize = 512;
+        const BLE_FRAME: usize = 512;
         let cosigners: Vec<EmergencyCosigner> = (0..3)
             .map(|i| EmergencyCosigner {
                 node_id: NodeId([i; 32]),
@@ -1528,8 +1529,8 @@ mod tests {
             &cosigners,
         );
         assert!(
-            ENVELOPE_HEADER + body.len() > BLE_MTU,
-            "expected the alert to exceed BLE's cap, got {} bytes",
+            ENVELOPE_HEADER + body.len() > BLE_FRAME,
+            "expected the alert to exceed one BLE frame, got {} bytes",
             ENVELOPE_HEADER + body.len()
         );
     }

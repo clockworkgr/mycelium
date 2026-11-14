@@ -796,8 +796,22 @@ route poisoning rather than impersonation. Wi-Fi Direct's `Hello` is the same
 bare id exchange. The internet transport proves identity instead (§8.4,
 ADR-011), and the fix here has the same shape.
 
-Fragmentation uses a 1-byte header: `0x01` first, `0x02` last, `0x03` single,
-`0x00` middle. Fragment size is `max(negotiated_MTU - 4, 20)`. Android permits
+**Two framing layers, independent of each other.** A *message* is split by the
+transport into frames of 512 bytes with the same 6-byte header LoRa uses
+(sender tag u16, fragment id u16, index u8, count u8), and the transport MTU is
+therefore the largest reassembled message (`BLE_MAX_MESSAGE = 4096`), not one
+frame: without this a co-signed critical alert (522 bytes) could not cross BLE
+at all, and an alert's text was capped at 295 bytes (ADR-022, ROADMAP T-39).
+Reassembly is keyed by (peer, sender tag, fragment id) — BLE knows who wrote a
+frame, so two peers cannot mix fragments by sharing a tag — and is shared with
+LoRa: bounded to 64 partials, expired after 120 s, refused past the message
+limit by accumulated bytes, with a duplicate fragment ignored rather than
+counted and a refused message kept marked so its later fragments cannot start
+it over.
+
+Below that, each frame is written to GATT by the platform layer with a 1-byte
+header of its own: `0x01` first, `0x02` last, `0x03` single, `0x00` middle.
+Fragment size is `max(negotiated_MTU - 4, 20)`. Android permits
 one outstanding GATT operation, so writes go through a sequential queue driven
 by `onCharacteristicWrite`/`onNotificationSent`. Connections stagger
 500–1500 ms with jitter and retry with exponential backoff (1 s, 2.5 s, 4 s,
@@ -811,8 +825,10 @@ handles segmentation, so no fragmentation layer.
 **LoRa (ADR-008).** Messages are fragmented into frames with a 6-byte header
 (sender tag u16, fragment id u16, index u8, count u8), sized for the peer's
 current spreading factor; the transport MTU is the largest reassembled message
-(`LORA_MAX_MESSAGE = 2048`). Reassembly is keyed by (sender tag, fragment id),
-bounded to 64 partials, expired after 120 s. Duty cycle is charged per frame
+(`LORA_MAX_MESSAGE = 2048`). Reassembly is shared with BLE (ADR-022): keyed by
+(sender tag, fragment id), bounded to 64 partials, expired after 120 s, and
+refused past the message limit by accumulated bytes rather than per fragment —
+which ADR-008 documented and the code did not do. Duty cycle is charged per frame
 against an hourly window (1 % for EU 868 MHz; unlimited for US 915 MHz).
 
 The radio exposes no link-layer address, so the bridge passes `NodeId::ZERO`
@@ -1269,12 +1285,13 @@ platform layer or the operating system.
 inert, because an originator that clears trust > 0.6 is 1 hop away and already
 unlimited. See ROADMAP T-37.
 
-**Known gap:** an alert is `217 + message_bytes + 96 × approvals` bytes on the
-wire, against the BLE transport's 512-byte message cap — so three approvals
-leave 7 bytes of message, and none leave 295. A node refuses to raise an alert
-larger than its narrowest registered transport rather than flooding only the
-links that can carry it, but the alert still does not fit. See ROADMAP T-39,
-which blocks co-signature collection (T-05) for BLE.
+**Size.** An alert is `217 + message_bytes + 96 × approvals` bytes on the
+wire, so a critical alert with three approvals is 522 — more than one 512-byte
+BLE frame. The BLE transport fragments at the message level (ADR-022), so what
+bounds an alert is the reassembly limit (4096 bytes) rather than a frame, and a
+node still refuses to raise one larger than its narrowest registered
+transport's message bound rather than flooding only the links that can carry
+it.
 
 ### 9.6 Multi-device support
 
@@ -2005,7 +2022,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 9.3 | Receipts | **Partial** | Recipient-only, WS push, UI indicators. Dropped when no route exists, so DTN deliveries are never acknowledged (T-27) |
 | 9.4 | Public channels | **Implemented** | Wire types, storage, flooding, 6 REST endpoints, 2 screens. Dedup expires by age and is keyed on the message (ADR-013); the channel `NodeEvent` variant is still open (T-14) |
 | 9.4 | Regional channels | **Planned** | Needs the geographic overlay |
-| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest, reach and rate limiting per level, and alerts ordered ahead of ordinary traffic in every transport's send queue (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05); a co-signed alert exceeds the BLE cap (T-39) |
+| 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest, reach and rate limiting per level, and alerts ordered ahead of ordinary traffic in every transport's send queue (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05) |
 | 9.6 | Multi-device / CRDT sync | **Planned** | v0.3 |
 | 10.1 | Beacon | **Implemented** | Node type, battery, neighbour count, group hash; LoRa broadcast |
 | 10.2 | Seed phrase groups | **Partial** | Derivation + beacon match + auto-vouch; no proof of possession (T-04) |

@@ -10,8 +10,24 @@ use tracing::{debug, info, warn};
 /// Maximum packets queued while the platform is not polling the outbox.
 const MAX_OUTBOX: usize = 512;
 
+/// Bytes one BLE frame carries, fragment header included.
+///
+/// The negotiated GATT MTU. The platform layer splits a frame further into
+/// writes with its own 1-byte header (spec §8.4), which sits below this.
+const BLE_FRAME_MTU: usize = 512;
+
+/// Largest message reassembled from BLE frames.
+///
+/// The frame cap is not the message cap. A critical alert carrying three
+/// co-signatures is 522 bytes — `217 + message + 96 × approvals` — so without
+/// fragmentation it could not cross BLE at all, and neither could an alert
+/// with a message over 295 bytes (ROADMAP T-39). Reassembly stops the frame
+/// size being a cliff; this bound stops it being a memory hole.
+pub const BLE_MAX_MESSAGE: usize = 4096;
+
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
+use super::fragment::{fragment, Reassembler};
 use super::{
     PriorityOutbox, SendPriority, Transport, TransportError, TransportEvent, TransportType,
 };
@@ -39,6 +55,13 @@ pub struct BleTransport {
     /// provide a synchronous C callback across threads.
     #[allow(clippy::type_complexity)]
     outbox: Arc<Mutex<PriorityOutbox>>,
+    /// In-progress reassemblies, shared with every other transport that has a
+    /// frame cap (`transport::fragment`).
+    reassembly: Arc<Mutex<Reassembler>>,
+    /// Random per instance, so two senders' fragment ids cannot collide into
+    /// one reassembly.
+    sender_tag: u16,
+    next_frag_id: Arc<Mutex<u16>>,
 }
 
 impl BleTransport {
@@ -51,6 +74,9 @@ impl BleTransport {
             started: Arc::new(RwLock::new(false)),
             send_callback: Arc::new(RwLock::new(None)),
             outbox: Arc::new(Mutex::new(PriorityOutbox::new(MAX_OUTBOX))),
+            reassembly: Arc::new(Mutex::new(Reassembler::new(BLE_MAX_MESSAGE, "BLE"))),
+            sender_tag: rand::random(),
+            next_frag_id: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -99,13 +125,25 @@ impl BleTransport {
     }
 
     /// Called by platform-specific code when data arrives from a BLE peer.
+    ///
+    /// One frame in; a whole message out, once its fragments have all
+    /// arrived. Incomplete and oversized reassemblies are bounded by the
+    /// shared reassembler.
     pub async fn on_data_received(&self, peer: NodeId, data: Vec<u8>) {
-        debug!("BLE data received: {} bytes from {}", data.len(), peer);
-        let _ = self.tx.send(TransportEvent::DataReceived {
-            peer,
-            data,
-            transport: TransportType::Ble,
-        });
+        debug!("BLE frame received: {} bytes from {}", data.len(), peer);
+        let message = match self.reassembly.lock() {
+            // Keyed by peer as well as sender tag: BLE knows who wrote the
+            // frame, so two peers cannot mix fragments by sharing a tag.
+            Ok(mut r) => r.push(peer, &data),
+            Err(_) => None,
+        };
+        if let Some(message) = message {
+            let _ = self.tx.send(TransportEvent::DataReceived {
+                peer,
+                data: message,
+                transport: TransportType::Ble,
+            });
+        }
     }
 }
 
@@ -167,31 +205,52 @@ impl Transport for BleTransport {
             });
         }
 
-        debug!("BLE send: {} bytes to {}", data.len(), peer);
+        // One frame per GATT MTU, each carrying the fragment header, so a
+        // message larger than a frame crosses BLE instead of being refused
+        // (ROADMAP T-39).
+        let frag_id = {
+            let mut next = self
+                .next_frag_id
+                .lock()
+                .map_err(|_| TransportError::Other("fragment id lock".into()))?;
+            let id = *next;
+            *next = next.wrapping_add(1);
+            id
+        };
+        let frames = fragment(data, BLE_FRAME_MTU, self.sender_tag, frag_id)?;
+
+        debug!(
+            "BLE send: {} bytes to {} as {} frame(s)",
+            data.len(),
+            peer,
+            frames.len()
+        );
 
         // Use platform send callback if registered, otherwise queue for Dart polling
         let cb = self.send_callback.read().await;
         if let Some(callback) = *cb {
             let peer_bytes = peer.as_bytes();
-            let result = callback(
-                peer_bytes as *const [u8; 32],
-                data.as_ptr(),
-                data.len() as u32,
-            );
-            if result != 0 {
-                return Err(TransportError::SendFailed(format!(
-                    "BLE send callback returned {}",
-                    result
-                )));
+            for frame in &frames {
+                let result = callback(
+                    peer_bytes as *const [u8; 32],
+                    frame.as_ptr(),
+                    frame.len() as u32,
+                );
+                if result != 0 {
+                    return Err(TransportError::SendFailed(format!(
+                        "BLE send callback returned {}",
+                        result
+                    )));
+                }
             }
         } else {
-            // Push to outbox for Dart to poll via mycelium_ble_dequeue_send
+            // Push to outbox for Dart to poll via mycelium_ble_dequeue_send.
+            // All the fragments or none: a message missing one cannot be
+            // reassembled, and reporting success for a half-queued batch stops
+            // the manager trying another transport.
             if let Ok(mut outbox) = self.outbox.lock() {
-                if let Err(_full) = outbox.push(*peer, data.to_vec(), priority) {
-                    warn!(
-                        "BLE outbox full ({}) of alerts, dropping ordinary traffic",
-                        MAX_OUTBOX
-                    );
+                if outbox.push_batch(*peer, frames, priority).is_err() {
+                    warn!("BLE outbox has no room for the fragments without displacing alerts");
                     return Err(TransportError::SendFailed(
                         "outbox is full of emergency traffic".to_string(),
                     ));
@@ -229,13 +288,22 @@ impl Transport for BleTransport {
     }
 
     fn mtu(&self) -> usize {
-        512
+        // What a *message* may be, not what one frame carries: the transport
+        // fragments (ROADMAP T-39).
+        BLE_MAX_MESSAGE
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::fragment::FRAG_HEADER;
     use super::*;
+
+    /// The outbox now holds frames, so a test comparing payloads has to skip
+    /// the fragment header.
+    fn payload(frame: &[u8]) -> &[u8] {
+        &frame[FRAG_HEADER..]
+    }
 
     async fn connected() -> (BleTransport, NodeId) {
         let transport = BleTransport::new(NodeId([1u8; 32]));
@@ -266,9 +334,13 @@ mod tests {
             .expect("queued");
 
         let (_, first) = transport.dequeue_send().expect("something queued");
-        assert_eq!(first, b"alert", "the alert goes first");
+        assert_eq!(payload(&first), b"alert", "the alert goes first");
         let (_, second) = transport.dequeue_send().expect("something queued");
-        assert_eq!(second, b"ordinary one", "then the traffic in its own order");
+        assert_eq!(
+            payload(&second),
+            b"ordinary one",
+            "then the traffic in its own order"
+        );
     }
 
     /// A full outbox drops ordinary traffic to make room for an alert, rather
@@ -288,6 +360,54 @@ mod tests {
             .expect("an alert is never refused for a full queue");
         assert_eq!(transport.outbox_len(), MAX_OUTBOX, "still bounded");
         let (_, first) = transport.dequeue_send().expect("something queued");
-        assert_eq!(first, b"alert");
+        assert_eq!(payload(&first), b"alert");
+    }
+
+    /// A co-signed critical alert is 522 bytes and BLE frames carry 512, so
+    /// before fragmentation it could not cross BLE at all. The message now
+    /// goes as several frames and arrives whole (ROADMAP T-39).
+    #[tokio::test]
+    async fn test_a_message_larger_than_a_frame_crosses_ble() {
+        let (sender, peer) = connected().await;
+        let big: Vec<u8> = (0..700u32).map(|n| n as u8).collect();
+
+        sender.send(&peer, &big).await.expect("queued");
+        assert!(
+            sender.outbox_len() > 1,
+            "700 bytes does not fit one 512-byte frame"
+        );
+
+        // The receiving side hands each frame to the transport and sees one
+        // message come out.
+        let (receiver, _) = connected().await;
+        let mut events = receiver.events();
+        while let Some((_, frame)) = sender.dequeue_send() {
+            receiver.on_data_received(peer, frame).await;
+        }
+
+        match events.try_recv() {
+            Ok(TransportEvent::DataReceived { data, .. }) => {
+                assert_eq!(data, big, "reassembled whole")
+            }
+            other => panic!("expected one reassembled message, got {other:?}"),
+        }
+        assert!(
+            events.try_recv().is_err(),
+            "and exactly one: fragments are not reported individually"
+        );
+    }
+
+    /// A message over the reassembly bound is refused at the sender, so it is
+    /// never fragmented into frames nobody will put back together.
+    #[tokio::test]
+    async fn test_a_message_over_the_reassembly_bound_is_refused() {
+        let (transport, peer) = connected().await;
+        let huge = vec![0u8; BLE_MAX_MESSAGE + 1];
+        let err = transport
+            .send(&peer, &huge)
+            .await
+            .expect_err("over the message bound");
+        assert!(matches!(err, TransportError::ExceedsMtu { .. }), "{err:?}");
+        assert_eq!(transport.outbox_len(), 0, "and nothing was queued");
     }
 }

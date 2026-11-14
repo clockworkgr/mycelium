@@ -1056,14 +1056,13 @@ async fn test_an_oversized_approval_list_still_produces_a_verifiable_alert() {
     alice.stop().await;
 }
 
-/// An alert is `217 + message_bytes + 96 × approvals` on the wire, so with a
-/// BLE transport registered and no approvals it has 295 bytes of message to
-/// spend — not characters, since a multi-byte character costs more than one.
-/// A node refuses the alert that does not fit rather than flooding the links
-/// that can carry it and stopping silently at every phone (T-39).
+/// Before T-39 a BLE frame's 512 bytes *was* the message limit, so an alert
+/// with a message over 295 bytes — or three co-signatures — could not cross
+/// BLE at all. The transport fragments now, so what the node refuses is a
+/// message past the reassembly bound, not past one frame.
 #[tokio::test]
 async fn test_an_alert_too_large_for_the_narrowest_transport_is_refused() {
-    use mycelium_core::transport::ble::BleTransport;
+    use mycelium_core::transport::ble::{BleTransport, BLE_MAX_MESSAGE};
 
     let identity = Identity::generate();
     let node_id = identity.node_id();
@@ -1076,35 +1075,26 @@ async fn test_an_alert_too_large_for_the_narrowest_transport_is_refused() {
         .add_transport(Arc::new(BleTransport::new(node_id)))
         .await;
 
-    // ASCII, so 295 characters is 295 bytes.
-    let fits = "x".repeat(295);
-    let draft = node.draft_emergency(EmergencyLevel::Urgent, fits.as_bytes());
+    // The alert T-39 is about: three approvals and a sentence of text, 522
+    // bytes on the wire, which one BLE frame cannot carry.
+    let roomy = "x".repeat(600);
+    let draft = node.draft_emergency(EmergencyLevel::Urgent, roomy.as_bytes());
     assert!(
         node.raise_emergency(draft, &[]).await.is_ok(),
-        "295 bytes is the most that fits BLE's 512-byte message"
+        "a message larger than one frame is fragmented, not refused"
     );
 
-    let one_too_many = "x".repeat(296);
-    let draft = node.draft_emergency(EmergencyLevel::Urgent, one_too_many.as_bytes());
+    // Past what reassembly will hold, it is refused at the source rather than
+    // flooded to the transports that happen to be wider.
+    let huge = "x".repeat(BLE_MAX_MESSAGE);
+    let draft = node.draft_emergency(EmergencyLevel::Urgent, huge.as_bytes());
     match node.raise_emergency(draft, &[]).await {
         Err(mycelium_node::node::NodeError::AlertTooLarge { size, limit }) => {
-            assert_eq!(size, 513);
-            assert_eq!(limit, 512);
+            assert_eq!(limit, BLE_MAX_MESSAGE);
+            assert!(size > limit);
         }
-        other => panic!("expected a refusal at 513 bytes, got {other:?}"),
+        other => panic!("expected a refusal past the reassembly bound, got {other:?}"),
     }
-
-    // 148 three-byte characters are 444 bytes and fit; 149 are 447 and do not
-    // reach the limit either, so take the first count that does: the point is
-    // that the limit counts bytes, so far fewer characters fit.
-    let multibyte = "€".repeat(99); // 297 bytes
-    assert_eq!(multibyte.len(), 297);
-    let draft = node.draft_emergency(EmergencyLevel::Urgent, multibyte.as_bytes());
-    assert!(
-        node.raise_emergency(draft, &[]).await.is_err(),
-        "99 three-byte characters are 297 bytes, over the same limit that 295 \
-         ASCII characters just met"
-    );
 }
 
 /// A receiver that co-signed the alert must count its own approval. The

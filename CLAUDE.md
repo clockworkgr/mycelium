@@ -25,7 +25,7 @@ Then, as needed:
 3. [`CONTRIBUTING.md`](CONTRIBUTING.md) — build setup, test commands, project
    structure, commit conventions.
 4. [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-001 …
-   ADR-021). Append-only; never rewrite one. ADR-014 … ADR-021 are decided but
+   ADR-022). Append-only; never rewrite one. ADR-014 … ADR-021 are decided but
    not yet implemented — one per open P0 — and each names its ROADMAP task and
    flips its own status in the commit that implements it.
 5. [`docs/plugin-api.md`](docs/plugin-api.md) — transport plugin development
@@ -66,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 460 tests).
+- `cargo test` runs the whole workspace (currently 472 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -258,7 +258,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-14: 460 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-14: 472 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
