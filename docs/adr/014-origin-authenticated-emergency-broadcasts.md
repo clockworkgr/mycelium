@@ -2,9 +2,11 @@
 
 ## Status
 
-Accepted (2026-11-12). **Partially implemented (2026-11-13) — ROADMAP T-37.**
-The origin authentication below is built; the per-level behaviour is not. See
-the note at the end.
+Accepted (2026-11-12). **Implemented (2026-11-14) — ROADMAP T-37.** The
+status said "partially" while the second note of 2026-11-13 below already
+described the per-level half as built; the per-level reach, quota and send
+priority landed with it. See both notes at the end — the relay queue this
+record proposed was withdrawn in favour of the transports' own outboxes.
 
 ## Context
 
@@ -368,3 +370,20 @@ fragments to fit the later ones — leaving a message that could never be
 reassembled, reported as a success, so the manager never tried another
 transport. `push_batch` decides feasibility before evicting anything, so a
 refusal leaves the outbox exactly as it was.
+
+## Note (2026-11-14): BLE's 512 bytes is a frame, not a message
+
+The consequence above — "against the BLE transport's 512-byte message cap,
+which it enforces by refusing the send", so "three approvals leave 7 bytes of
+message" — described the transport as it was. T-39 made the frame size and the
+message size two different things (ADR-022): the BLE transport fragments a
+message across 512-byte frames and reassembles it, so its *message* bound is
+`BLE_MAX_MESSAGE` = 4096 and a three-approval alert with real text crosses it
+comfortably. The arithmetic above still holds; only the limit it is measured
+against has moved.
+
+What has not changed is that `raise_emergency` refuses an alert larger than the
+narrowest registered transport's message bound, and the API returns 400 — the
+originator learns rather than the mesh truncating silently. The co-signer entry
+is still 96 bytes, and shrinking it stays an independent option (ADR-022's
+alternatives) rather than something this record needs.

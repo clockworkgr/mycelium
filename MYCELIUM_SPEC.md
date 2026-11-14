@@ -363,13 +363,69 @@ DH4 = X25519(ephemeral_secret,    their_one_time_prekey)   [if present]
 shared_secret = HKDF-SHA256(
     salt = zeros(32),
     ikm  = DH1 ‖ DH2 ‖ DH3 [‖ DH4],
-    info = b"MyceliumX3DH",
+    info = b"MyceliumX3DH-v2:" ‖ init_binding,
     len  = 32)
+
+init_binding = ephemeral_public(32) ‖ identity_key(32)
+             ‖ signed_prekey_id(4 LE) ‖ has_otp(1) [‖ one_time_prekey_id(4 LE)]
+             ‖ carries_message(1)
 ```
+
+**The init's own bytes are in the derivation** (ADR-015). `init_binding` is the
+`SessionInit` header exactly as it appears on the wire, plus one byte for
+whether the init encloses a message — the initiator binds what it is about to
+serialize, the responder what it received — and
+`mycelium_protocol::wire::session_init_binding` is the single definition both
+sides use.
+
+`carries_message` is in there although it is not a header field, because the two
+forms are different handshakes: they take different X3DH variants and they are
+answered on different paths, one authenticated and one not. Without it,
+stripping the payload from an init left the binding untouched, so the stripped
+copy was answered on the unauthenticated path and the genuine init — same
+binding, already answered — was met with silence, losing its message. With it, a
+stripped copy derives a different secret and cannot stand in for the real
+handshake.
+
+This is the mitigation RFC 7748 §7 names, and it is not optional. For any
+X25519 public key `u` there are other, publicly computable keys that produce
+the same shared secret, and `u⁻¹ mod p` is **canonical**, so the
+canonical-encoding check at ingress cannot tell it from the original. Without
+the binding, a relay could swap an init's ephemeral for the inverse and the
+responder would derive the same secret from different wire bytes — a second
+identity for one handshake, which is what lets a replay of the original collect
+an actionable signed rejection (§5.2 Rejection, ADR-012). A handshake is
+therefore identified by what the AEAD authenticates, not by a hash of bytes it
+does not cover.
+
+**A one-time prekey is retired only after the init authenticates.** The
+derivation peeks at the prekey; the caller spends it once the enclosed first
+message decrypts, including on ADR-007's tie-break path where the responder
+keeps its own session and decrypts only that message. Spending it earlier let a
+corrupted copy of an init burn the prekey and leave the genuine init to fail
+and draw a rejection; leaving it unspent after a success let a replay of the
+same init, under a fresh envelope id, derive the handshake again.
+
+**A `SessionInit` carrying no message uses the signed-prekey-only X3DH
+variant** — `DH1 ‖ DH2 ‖ DH3`, no `DH4`. Such an init **must not** name a
+one-time prekey and is refused if it does: nothing in it authenticates the
+initiator, so there is no event on which a prekey could be spent. The initiator
+therefore ignores any one-time prekey the bundle offers when it builds this
+form, in the derivation, the binding and the id it names — using the offered one
+produced an init the responder could only reject, against any bundle with
+prekeys left in it. That
+handshake gets no one-time-prekey forward secrecy, which is the honest price
+for an init with nothing to authenticate. A non-empty nested payload whose type
+is not `EncryptedMessage` is refused outright, never treated as message-less.
 
 A one-time prekey **must** be issued at most once: `PrekeyState::issue_bundle()`
 reserves the OTP it hands out, while `bundle()` only peeks. Two concurrent
-initiators therefore never share an OTP.
+initiators therefore never share an OTP — but a *cached* bundle, served from a
+supernode (§16.2), reaches many initiators, and a bundle is public in any case.
+Whoever holds one can initiate with it and consume the prekey it names, so an
+initiator whose prekey is taken that way draws an honest refusal and recovers
+through it. The prekey is not bound to the initiator it was issued to
+(ROADMAP T-43).
 
 Bundles are fetched from a nearby supernode's cache (§16.2, `GET
 /v1/prekeys/{node_id}`) or over the mesh by `PrekeyRequest`/`PrekeyResponse`.
@@ -412,12 +468,71 @@ because it travels in the clear: unauthenticated, a relay could retype a
 message, and a retyped copy that still decrypted could also be used to mint a
 second identity for one `SessionInit` (ADR-012).
 
-A replayed `SessionInit` draws no rejection. A session records the transcript
-of the init it was accepted from, and an init matching it is answered with
-silence: its prekey is spent and its message already decrypted, so refusing it
-would mean signing a valid rejection of an init the peer really sent. For the
-same reason a node keeping its own session under ADR-007's tie-break never
-rejects — the initiator is the loser and will accept ours.
+**A rejection is sent only when no session with that peer exists.** If we hold
+any session with it, a failing `SessionInit` draws silence. That covers the
+replay of an init we accepted — its prekey is spent and its message already
+decrypted, so refusing it would mean signing a valid rejection of an init the
+peer really sent — and ADR-007's tie-break, where the initiator is the loser and
+will accept ours. The rule is a question about state rather than a timer, so it
+survives a restart by construction: sessions are persisted (ADR-015).
+
+The case this gives up is a stale session of ours plus a genuinely dead bundle,
+where the initiator learns nothing from us. That recovers by handshake timeout
+instead, below.
+
+**A handshake is answered once.** Answering one twice means either signing a
+valid rejection of an init the peer really sent, or — worse — installing that
+handshake's session a second time over one that has moved on, which rewinds a
+ratchet and so reuses message keys. Both records below are keyed on
+`SHA-256(init_binding)`, never on a hash of the payload: the nested message is
+free to vary, and a captured later ciphertext from the same chain decrypts on a
+fresh ratchet, so an init carrying the original header and a substituted message
+derives the same session. The derivation refuses a second answer with
+`HandshakeAlreadyAnswered`, before any DH, and a node holding the record answers
+such an init with **silence** rather than a signed rejection.
+
+| Record | Holds | Lives | Covers |
+|--------|-------|-------|--------|
+| `Session::accepted_binding` | one entry | with the session | the init a session was accepted from, including the message-less form |
+| `PrekeyState::answered_handshakes` | up to `MAX_ANSWERED_HANDSHAKES` (1024) | until the signed prekey retires | every handshake that has authenticated, including ADR-007's tie-break losers |
+
+The shapes differ for a reason. The prekey-scoped record is written only where
+the AEAD has verified, because an unauthenticated path would let an attacker
+generating identities fill a bound shared with every real handshake; it must
+outlive the session, because an init stays derivable while its signed prekey is
+retained, so a record that died with a session left the init replayable after an
+expiry or a re-handshake. The session-scoped record is the opposite: a single
+slot cannot be grown by a forgery, which is what lets it cover the message-less
+init — the one form that authenticates nothing.
+
+**The first decrypt promotes the one into the other**, and the blob is written
+on that decrypt. A successful decrypt authenticates the peer, so the session's
+entry is copied into the durable record and gains its lifetime; a promotion
+never persisted is gone on the next start and the init it covers is answerable
+again. The session's entry is **kept**, not moved: a handover across two stores
+has an order to get wrong, and a promotion followed by a lost write would leave
+neither marker, while two independent records mean losing either leaves the
+other. Promotion is also the earliest moment that matters, because a responder
+has no sending chain until something of the initiator's arrives — before it the
+session has carried no traffic in either direction and reinstalling an identical
+one costs nothing.
+
+`rotate_signed_prekey` drops the prekey-scoped entries whose prekey has gone,
+which is when the replay stops being possible, and a promotion naming a retired
+prekey is refused rather than recorded — a long-lived session re-offers its entry
+on every decrypt, and obsolete entries would evict live ones at capacity. The
+bound evicts oldest, and an evicted entry's init becomes replayable again until
+its prekey retires (ADR-015).
+
+**An init encloses message 0 of its chain, or it is not that init.** The
+initiator encrypts it on a ratchet it has just built, so a copy carrying a later
+message of the same chain is a relay's work, and `NotTheFirstMessage` refuses it
+before any DH. Without that rule a relay could reorder: wrap a captured later
+message into a copy of the init, get *that* answered first, and leave the
+genuine init — now a handshake already answered — to be met with silence, losing
+the first message of the conversation. Silently, because the session works and
+nothing retries. The captured message is not lost either; it arrives as what it
+always was, an ordinary message on the ordinary path.
 
 A reject still acts **only** on a handshake the peer has not confirmed. A
 handshake is **confirmed** the moment the initiator successfully decrypts
@@ -427,6 +542,65 @@ memory and in storage) and reports every message sent under the handshake as
 failed. A confirmed session **must not** be torn down by a reject.
 Confirmation is a state, not a deadline: an elapsed-time cutoff was tried
 first and was wrong both ways (ADR-009).
+
+**A handshake the peer never confirms is given up on.** An initiator installs
+its session as soon as the `SessionInit` goes out, so a responder that stays
+silent — the rule above has it reject only when it holds no session — would
+otherwise leave that session in place for ever, with every later message going
+out as a bare `EncryptedMessage` the peer cannot read. The 30-second maintenance
+tick lists the handshakes past their deadline and, for each one it abandons,
+does what a rejection does: discards the session, the
+cached bundle in memory and in storage, and reports the messages sent under the
+handshake as failed, so the next send starts a fresh handshake against a fresh
+bundle. The deadline is two DTN delivery windows — the init's and the reply's,
+which together are the slowest a legitimate handshake can confirm. Only one of
+them is ours: the init travels under the configured `dtn.ttl_hours`, the reply
+under the peer's, and nothing on the wire says what that is. So the
+deadline scales with `dtn.ttl_hours` and never falls below two of the documented
+72-hour default. The asymmetry is deliberate — waiting too long keeps a stale
+optimistic session, while waking too early discards one whose init was still
+queued and loses the reply it earns.
+
+That floor is an **assumption about the peer**, and a node raising its own
+`dtn.ttl_hours` above 72 should expect peers to expire its handshakes on the
+default: a reply still queued under a longer window arrives for a session they
+have dropped. Carrying the window on the wire is capability negotiation
+(ROADMAP T-20).
+
+The teardown commits in storage before anything is forgotten in memory. A
+failed write would otherwise leave durable state — a session row that reloads
+unreachable, a cached bundle the next send initiates from, a message still
+claiming "sent" — with no handshake left to retry the cleanup; a failure instead
+leaves the handshake in place, still stale, and the next tick retries.
+
+**A handshake the peer has acknowledged is kept.** "Unconfirmed" means nothing
+of the peer's has arrived for us to decrypt, which is not the same as the peer
+not having the session: a peer that reads and acknowledges but never replies
+produces no confirmation ever. A delivery or read receipt is only sent for a
+message that decrypted, so it is evidence the peer accepted the init, and
+abandoning that session costs real traffic — the peer keeps sending under it and
+we drop everything until our own next send. The acknowledgement is recorded on
+the handshake, which knows the messages it sent: a receipt counts only if it
+names one sent **after** the init, since receipts arrive late and one from a
+session long gone must not vouch for a newer handshake. The init's own message
+is excluded because an ADR-007 tie-break winner decrypts it with a session it
+then discards, and receipts it honestly — such a receipt proves the peer read
+the message, not that it holds the session the message arrived under. A
+follow-up travels under the installed session, so decrypting one is possible
+only for a peer that kept it. A conversation of exactly one message therefore
+cannot be acknowledged, and is re-handshaked after the timeout. It is noted without consulting the message
+rows at all, because those can be deleted — reading the evidence back from
+history meant clearing a conversation, or clearing it before a late receipt
+arrived, left a healthy session to be abandoned.
+
+Receipts are unauthenticated (§14.3), so a forged one suppresses the sweep for
+that pairing; that returns it to the behaviour from before the sweep existed
+rather than to something worse, which is why a receipt gates *keeping* a
+handshake and does **not** confirm one. Confirmation by an acknowledgement the
+peer cannot forge is ROADMAP T-42.
+
+The handshake record is in memory only, so a restart loses it and neither the
+sweep nor a late rejection can fire — ROADMAP T-41.
 
 Accepting an authenticated `SessionInit` clears any unconfirmed handshake of
 our own that it supersedes, and reports the messages sent *after* that init as
@@ -528,7 +702,7 @@ let a key derived for one purpose be substituted for another.
 
 | Info string | Purpose |
 |-------------|---------|
-| `b"MyceliumX3DH"` | X3DH shared-secret derivation |
+| `b"MyceliumX3DH-v2:" ‖ init_binding` | X3DH shared-secret derivation. The suffix is the `SessionInit` header as it appeared on the wire plus its carries-a-message byte, which is what makes an equivalent ephemeral — or a stripped payload — derive a different key (§5.2, ADR-015) |
 | `b"MyceliumRatchet"` | Double Ratchet root KDF |
 | `b"MyceliumAEAD"` | Per-message AEAD key + nonce |
 | `b"MyceliumSafetyNumber"` | Safety number generation |
@@ -1560,11 +1734,26 @@ a plain reading of the protocol allows:
   recorded for the `SessionInit` awaiting confirmation (§5.2, ADR-012).
 - **Non-destructive session accept** — the first message enclosed in a
   `SessionInit` must decrypt before the new session replaces an existing one; a
-  `SessionInit` without a message is refused when a session exists; replays of
-  a known message id are ignored.
+  `SessionInit` without a message is refused when a session exists, and refused
+  outright if it names a one-time prekey; a non-empty nested payload that is not
+  an `EncryptedMessage` is refused rather than treated as message-less; replays
+  of a known message id are ignored (§5.2, ADR-015).
+- **Rejection only without a session** — a `SessionInit` we cannot accept draws
+  a `SessionReject` only when we hold no session with that peer; otherwise
+  silence, and the initiator recovers by handshake timeout (§5.2, ADR-015).
+- **One answer per handshake** — an init whose binding is already on either
+  record installs nothing and draws no rejection, before any DH. Keyed on the
+  binding, which covers whether the init carries a message, so neither
+  substituting the nested message nor stripping it makes an answered handshake
+  answerable again (§5.2, ADR-015).
+- **The enclosed message is the first of its chain** — an init carrying any
+  other message of that chain is refused before the derivation, so a relay
+  cannot reorder one into it and have the handshake answered on the wrong
+  message (§5.2, ADR-007, ADR-015).
 - **Simultaneous initiation** — if a `SessionInit` arrives from a peer we
   initiated with in the last 60 s, the node with the **lower NodeId** keeps its
-  session; the other side's first message is still decrypted (ADR-007).
+  session; the other side's first message is still decrypted (ADR-007). It no
+  longer decides whether to reject: that is the rule above.
 - **Duplicates** — an `EncryptedMessage` or DTN delivery for an already-stored
   message id must not touch the ratchet; re-send the delivery receipt instead.
 - **Beacons** — body `node_id` must equal the transport peer *and* the envelope
@@ -1613,6 +1802,9 @@ pub struct NodeConfig {
     pub node_type: NodeTypeConfig,         // Phone | Supernode
     pub transports: TransportConfig,       // per-transport enable flags
     pub dtn: DtnStorageConfig,             // 256 MB / 10 MB / 72 h / 8 copies
+                                           // ttl_hours also sets the handshake
+                                           // deadline: 2 × it, never under
+                                           // 2 × 72 h (§5.2)
     pub beacon_interval_secs: u64,         // 30 phones, 10 supernodes
     pub api: ApiConfig,                    // bind, port, enabled, auth_token
     pub group_seed: Option<String>,        // group discovery key (hex)
@@ -1999,7 +2191,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 4 | Envelope + 17 payload types | **Implemented** | Custom binary codec |
 | 4.3 | Compact LoRa frame | **Implemented** | Defined and tested; not yet used by the transport (T-12) |
 | 5.1 | Ed25519/X25519 identity | **Implemented** | Device-bound, NodeId ↔ key binding enforced |
-| 5.2 | X3DH | **Implemented** | SPK + OTP issued once, signature verified, rotated SPKs retained, stale bundles rejected and recovered (ADR-009) |
+| 5.2 | X3DH | **Implemented** | SPK + OTP issued once, signature verified, rotated SPKs retained, stale bundles rejected and recovered (ADR-009). The init's own bytes are in the derivation, a handshake is answered once, and a prekey is retired only on authentication (ADR-015) |
 | 5.3 | Double Ratchet | **Implemented** | Transactional decrypt, bounded skips, ratchet state durable before transmit, key material zeroized |
 | 5.4 | Group encryption | **Implemented** | Sender keys over pairwise sessions (ADR-007), not an MLS tree. No admin model, and any member can forge messages attributed to another (T-24) |
 | 5.5 | Safety numbers | **Implemented** | 60-digit, symmetric, verify flow in the app |

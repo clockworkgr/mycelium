@@ -66,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 472 tests).
+- `cargo test` runs the whole workspace (currently 493 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -194,7 +194,8 @@ detail matters.
   `curve25519-dalek::CompressedEdwardsY`.
 - `NodeId = SHA-256(Ed25519 public key)`. This binding is enforced at ingress
   and is load-bearing against MITM — see spec §14.3.
-- 9 HKDF info strings for domain separation (spec §5.6): `MyceliumX3DH`,
+- 9 HKDF info strings for domain separation (spec §5.6):
+  `MyceliumX3DH-v2:` ‖ the raw `SessionInit` header (ADR-015),
   `MyceliumRatchet`, `MyceliumAEAD`, `MyceliumSafetyNumber`,
   `MyceliumGroupMK`, `MyceliumGroupCK`, `MyceliumGroupAEAD`,
   `MyceliumGroupDiscovery`, and `b"frame:" ‖ ephemeral_public` for internet
@@ -258,7 +259,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-14: 472 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-14: 493 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -274,9 +275,12 @@ The highest-priority open items (all P0, all defects in shipped features): FFI
 panic guards (`T-01`), group-discovery proof of possession (`T-04`), emergency
 co-signer signatures (`T-05`, wire format and verification landed; collecting
 co-signatures is not built), identity key at rest (`T-08`), BLE/Wi-Fi Direct
-peer identity, which is asserted rather than proved (`T-34`), what remains of
-the forged-`SessionReject` work (`T-35`, bookkeeping landed in ADR-012),
-DHT record eviction, which undoes ADR-011's rollback protection (`T-38`), and
-a co-signed emergency alert exceeding the BLE message cap (`T-39`). T-36 landed
-on 2026-11-12 (ADR-013) and T-37 on 2026-11-14 (ADR-014). `T-40` collects four
-LoRa defects found reviewing ADR-008 against the code.
+peer identity, which is asserted rather than proved (`T-34`), and DHT record
+eviction, which undoes ADR-011's rollback protection (`T-38`).
+
+Landed: T-36 on 2026-11-12 (ADR-013); T-37, T-39 and T-35 on 2026-11-14
+(ADR-014, ADR-022, ADR-015). `T-40` collects four LoRa defects found reviewing
+ADR-008 against the code. `T-41` and `T-42` are what T-35 left behind — the
+unconfirmed-handshake record is in memory, so a restart loses both the sweep
+and a late rejection, and receipts are unauthenticated, so confirming a
+handshake needs an acknowledgement the peer cannot forge.

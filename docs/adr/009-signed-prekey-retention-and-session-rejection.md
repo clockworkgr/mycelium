@@ -165,3 +165,22 @@ key to bind — and it is not a claim about transport peer identity. BLE and Wi-
 of possession (ROADMAP T-34), and the internet transport only began proving it
 in ADR-011. Appended rather than edited in place, because these records are
 append-only.
+
+## Note (2026-11-14): the in-memory map, and what now depends on it
+
+The consequence above — "the unconfirmed-handshake map is in memory only […]
+left as follow-up work rather than guessed at" — is **ROADMAP T-41**, and it has
+gained a second dependent since. ADR-015 stopped a responder rejecting while it
+holds any session with the peer, so "recovery waits for the next send to fail
+and re-handshake" is no longer enough on its own: a responder sitting on a stale
+session says nothing at all, and the initiator needs a way to give up. That is
+the handshake sweep, and it reads the same map. A restart therefore loses both
+the late rejection this record describes and the sweep, which is why the gap is
+now a task rather than a caveat.
+
+The prekey retention decided here also sets the lifetime of ADR-015's
+answered-handshake record: an init stays derivable exactly as long as the signed
+prekey it names is retained, so `rotate_signed_prekey` drops the entries whose
+prekey has gone and refuses to record one that names a retired id.
+`MAX_RETAINED_SIGNED_PREKEYS` is thus coupled to a third thing, not just to the
+rotation interval and the bundle-cache lifetime.

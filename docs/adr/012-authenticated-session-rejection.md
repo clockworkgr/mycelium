@@ -264,3 +264,34 @@ exists.
    entirely.** Simpler, and strictly worse for the user: a retry against a
    stale bundle fails exactly as the first attempt did, and the timeout has to
    be long enough for DTN.
+
+## Note (2026-11-14): superseded in two places by ADR-015
+
+Two rules above were right about the problem and wrong about the mechanism, and
+ADR-015 replaced both. They are left as written, because the reasoning that got
+here is the record.
+
+**"For the transcript to identify a handshake at all"** — it does not, and
+cannot. The canonicalisation above closes the slack it could see (trailing
+bytes, non-canonical prekey flags, non-canonical X25519 encodings), but RFC 7748
+§7 leaves a kind it cannot: for any X25519 public key there are other, publicly
+computable keys that produce the same shared secret, and `u⁻¹ mod p` is itself
+canonical. Two inits the responder treats identically can therefore hash
+differently however strict the encoding rules are. A handshake is identified by
+what the key derivation covers, so ADR-015 put the init's own bytes *into* the
+derivation and keys the replay records on that binding rather than on a hash of
+the payload — which also stops the substitution this record's transcript could
+not see, where the header is kept and the nested message swapped for a captured
+one from the same chain.
+
+`Session::accepted_init` is accordingly `Session::accepted_binding`, holding a
+hash of the binding and the signed-prekey id it used, and a second record in
+`PrekeyState` outlives the session for the handshakes answered without building
+one — see ADR-015 §5.2 and the spec.
+
+**"A node keeping its own session under ADR-007's tie-break never rejects"** is
+now the broader rule that a rejection is sent only when no session with that
+peer exists. The tie-break version keyed off a 60-second initiation timer that a
+restart forgot; the state-based rule survives a restart by construction, and the
+case it gives up — a stale session of ours plus a genuinely dead bundle —
+recovers by the handshake timeout ADR-015 builds.

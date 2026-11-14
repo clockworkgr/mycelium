@@ -1,6 +1,6 @@
 use ed25519_dalek::{SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519Public, StaticSecret as X25519Secret};
 
 use crate::identity::Identity;
@@ -18,6 +18,18 @@ pub struct PrekeyBundle {
     /// Optional one-time X25519 prekey.
     pub one_time_prekey: Option<[u8; 32]>,
     pub one_time_prekey_id: Option<u32>,
+}
+
+/// The key an answered handshake is remembered by.
+///
+/// A hash of the binding rather than the binding itself: 32 bytes a record
+/// can hold a thousand of, and the binding is public anyway, so there is
+/// nothing here to protect — only to compare.
+pub(crate) fn handshake_binding_hash(binding: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"mycelium-answered-handshake-v1:");
+    hasher.update(binding);
+    hasher.finalize().into()
 }
 
 /// State needed to respond to X3DH initiation (our prekey secrets).
@@ -41,6 +53,34 @@ pub struct PrekeyState {
     previous_signed_prekeys: Vec<(u32, X25519Secret)>,
     next_otp_id: u32,
     next_spk_id: u32,
+    /// Handshakes already answered, as `(signed_prekey_id, binding hash)`,
+    /// oldest first.
+    ///
+    /// A `SessionInit` stays derivable for as long as the signed prekey it
+    /// names is retained, so an init we have already answered can be replayed
+    /// until then — and accepted again, replacing a working session with one
+    /// that was abandoned. Nothing else stops it: a one-time prekey is only
+    /// retired if the init named one, and a session's own record of the init
+    /// it was built from dies with that session, while the prekey lives on.
+    ///
+    /// Keyed on the **binding** — the header the derivation covers — not on
+    /// the payload: the nested message is free to vary, and a captured
+    /// follow-up from the same chain decrypts on a fresh ratchet, so a
+    /// payload-keyed record is bypassed by substituting it.
+    ///
+    /// Entries are written only where the AEAD has verified, which is what
+    /// keeps the bound out of an attacker's reach, and are dropped when their
+    /// signed prekey retires, because the replay dies with it (ADR-015).
+    answered_handshakes: Vec<(u32, [u8; 32])>,
+    /// Whether `answered_handshakes` has gained an entry since the blob was
+    /// last written.
+    ///
+    /// The record is only as good as its persistence: an entry promoted on a
+    /// decrypt and never written is gone on the next start, and the handshake
+    /// it covers is answerable again. The flag lets the caller write the blob
+    /// on the decrypt that promoted something and not on every message —
+    /// it holds the one-time prekeys too, so it is not a cheap write.
+    needs_persist: bool,
 }
 
 /// How many rotated signed prekeys to keep.
@@ -48,6 +88,15 @@ pub struct PrekeyState {
 /// Rotation is roughly weekly and cached bundles expire after 7 days, so two
 /// covers the window with a margin.
 pub const MAX_RETAINED_SIGNED_PREKEYS: usize = 2;
+
+/// How many answered handshakes to remember, across all retained prekeys.
+///
+/// One entry per handshake that authenticated — a peer that cannot complete
+/// X3DH cannot add one — so this bounds a real conversation count, not an
+/// attacker's. Three weeks of handshakes at weekly rotation would have to
+/// exceed it before the oldest entry is evicted, and an evicted entry's init
+/// becomes replayable again until its prekey retires.
+pub const MAX_ANSWERED_HANDSHAKES: usize = 1024;
 
 impl PrekeyState {
     pub fn new(identity: Identity) -> Self {
@@ -61,6 +110,8 @@ impl PrekeyState {
             previous_signed_prekeys: Vec::new(),
             next_otp_id: 1,
             next_spk_id: 2,
+            answered_handshakes: Vec::new(),
+            needs_persist: false,
         }
     }
 
@@ -89,6 +140,88 @@ impl PrekeyState {
 
         self.signed_prekey_id = self.next_spk_id;
         self.next_spk_id += 1;
+
+        // An answered handshake whose signed prekey has retired cannot be
+        // derived again, so its record has no more work to do.
+        let live: Vec<u32> = std::iter::once(self.signed_prekey_id)
+            .chain(self.previous_signed_prekeys.iter().map(|(id, _)| *id))
+            .collect();
+        self.answered_handshakes
+            .retain(|(spk_id, _)| live.contains(spk_id));
+    }
+
+    /// Whether a signed-prekey id still resolves to a secret we hold, and so
+    /// whether an init naming it can still be derived.
+    fn signed_prekey_is_live(&self, id: u32) -> bool {
+        id == self.signed_prekey_id
+            || self
+                .previous_signed_prekeys
+                .iter()
+                .any(|(spk_id, _)| *spk_id == id)
+    }
+
+    /// Record a handshake as answered, so the init that produced it cannot be
+    /// answered a second time. See `answered_handshakes`.
+    ///
+    /// Call it only once the init has authenticated — where the one-time
+    /// prekey is retired — never on an unauthenticated path, or a forgery
+    /// could fill the bound with bindings of its own choosing.
+    pub fn mark_handshake_answered(&mut self, signed_prekey_id: u32, binding: &[u8]) {
+        self.mark_handshake_answered_hash(signed_prekey_id, handshake_binding_hash(binding));
+    }
+
+    /// As `mark_handshake_answered`, for a caller that already holds the hash
+    /// — the promotion in `SessionManager::decrypt_from`, which has the
+    /// session's record and not the init's bytes.
+    pub fn mark_handshake_answered_hash(&mut self, signed_prekey_id: u32, hash: [u8; 32]) {
+        // An entry whose signed prekey has retired protects nothing: the init
+        // it remembers can no longer be derived. Recording one would be worse
+        // than useless — a long-lived session re-offers its marker on every
+        // decrypt, so obsolete entries would accumulate and, at capacity,
+        // evict the ones still doing work.
+        if !self.signed_prekey_is_live(signed_prekey_id) {
+            return;
+        }
+        if self
+            .answered_handshakes
+            .iter()
+            .any(|(_, known)| *known == hash)
+        {
+            return;
+        }
+        if self.answered_handshakes.len() >= MAX_ANSWERED_HANDSHAKES {
+            self.answered_handshakes.remove(0);
+        }
+        self.answered_handshakes.push((signed_prekey_id, hash));
+        self.needs_persist = true;
+    }
+
+    /// Whether the record has changed since the blob was last written. See
+    /// `needs_persist`.
+    pub fn needs_persist(&self) -> bool {
+        self.needs_persist
+    }
+
+    /// Clear the flag, once the blob really is written.
+    ///
+    /// Separate from reading it because the write can fail: clearing first and
+    /// ignoring the error left the promotion unpersisted for good, since the
+    /// record deduplicates and a later decrypt would never ask again.
+    pub fn mark_persisted(&mut self) {
+        self.needs_persist = false;
+    }
+
+    /// How many answered handshakes are on record. For tests and diagnostics.
+    pub fn answered_handshake_count(&self) -> usize {
+        self.answered_handshakes.len()
+    }
+
+    /// Whether this exact handshake has already been answered.
+    pub fn has_answered_handshake(&self, binding: &[u8]) -> bool {
+        let hash = handshake_binding_hash(binding);
+        self.answered_handshakes
+            .iter()
+            .any(|(_, known)| *known == hash)
     }
 
     /// The secret for a given signed-prekey id: the current one, or a retained
@@ -155,6 +288,19 @@ impl PrekeyState {
     }
 
     /// Consume a one-time prekey by ID (marks it as used).
+    /// The secret for `id` without spending it.
+    ///
+    /// X3DH derives with this; `consume_one_time_prekey` is called only once
+    /// the first message has authenticated, so a corrupted copy of an init
+    /// cannot burn a prekey and make the genuine init fail (ADR-015).
+    pub fn one_time_prekey_secret(&self, id: u32) -> Option<&X25519Secret> {
+        self.issued_one_time_prekeys
+            .iter()
+            .chain(self.one_time_prekeys.iter())
+            .find(|(pid, _)| *pid == id)
+            .map(|(_, secret)| secret)
+    }
+
     pub fn consume_one_time_prekey(&mut self, id: u32) -> Option<X25519Secret> {
         if let Some(pos) = self
             .issued_one_time_prekeys
@@ -183,11 +329,17 @@ impl PrekeyState {
         // Issued-but-unconsumed OTPs are persisted alongside the unissued pool;
         // after a restart they become issuable again, which is harmless.
         let num_otps = self.one_time_prekeys.len() + self.issued_one_time_prekeys.len();
-        // Capacity must cover the retained signed prekeys too. A realloc here
-        // would copy the secrets already written and free the old allocation
-        // without wiping it.
-        let mut buf =
-            Vec::with_capacity(48 + num_otps * 36 + 4 + self.previous_signed_prekeys.len() * 36);
+        // Capacity must cover every appended field — the retained signed
+        // prekeys and the answered-handshake record. A realloc here would copy
+        // the secrets already written and free the old allocation without
+        // wiping it, which the caller's `Zeroizing` wrapper cannot undo.
+        let mut buf = Vec::with_capacity(
+            48 + num_otps * 36
+                + 4
+                + self.previous_signed_prekeys.len() * 36
+                + 4
+                + self.answered_handshakes.len() * 36,
+        );
 
         buf.extend_from_slice(&self.signed_prekey_secret.to_bytes());
         buf.extend_from_slice(&self.signed_prekey_id.to_le_bytes());
@@ -211,6 +363,16 @@ impl PrekeyState {
         for (id, secret) in &self.previous_signed_prekeys {
             buf.extend_from_slice(&id.to_le_bytes());
             buf.extend_from_slice(&secret.to_bytes());
+        }
+
+        // Answered handshakes, appended after those, and optional on the way
+        // back in for the same reason. They have to be durable: a restart that
+        // lost them would let every init still inside the retention window be
+        // answered a second time.
+        buf.extend_from_slice(&(self.answered_handshakes.len() as u32).to_le_bytes());
+        for (id, hash) in &self.answered_handshakes {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(hash);
         }
 
         buf
@@ -280,6 +442,27 @@ impl PrekeyState {
             }
         }
 
+        // Answered handshakes: also optional, for blobs written before the
+        // field existed.
+        let mut answered_handshakes = Vec::new();
+        if data.len() - offset >= 4 {
+            let num_answered =
+                u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?) as usize;
+            offset += 4;
+            // Overflow-safe on 32-bit targets.
+            if (data.len() - offset) / 36 < num_answered {
+                return None;
+            }
+            for _ in 0..num_answered {
+                let id = u32::from_le_bytes(data[offset..offset + 4].try_into().ok()?);
+                offset += 4;
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&data[offset..offset + 32]);
+                offset += 32;
+                answered_handshakes.push((id, hash));
+            }
+        }
+
         Some(Self {
             identity,
             signed_prekey_secret,
@@ -289,6 +472,9 @@ impl PrekeyState {
             previous_signed_prekeys,
             next_otp_id,
             next_spk_id,
+            answered_handshakes,
+            // Just loaded, so it matches the blob on disk.
+            needs_persist: false,
         })
     }
 }
@@ -301,6 +487,11 @@ pub struct X3dhInitResult {
     pub ephemeral_public: [u8; 32],
     /// Associated data for the first message.
     pub ad: Vec<u8>,
+    /// The one-time prekey this derivation actually used, which is *not*
+    /// simply the one the bundle offered: a message-less init takes the
+    /// signed-prekey-only variant and uses none (ADR-015). The `SessionInit`
+    /// must name this, or the responder derives something else.
+    pub one_time_prekey_id: Option<u32>,
 }
 
 /// Result of X3DH response.
@@ -321,6 +512,7 @@ pub struct X3dhResponseResult {
 pub fn x3dh_initiate(
     our_identity: &Identity,
     their_bundle: &PrekeyBundle,
+    carries_message: bool,
 ) -> Result<X3dhInitResult, X3dhError> {
     // Verify the signed prekey signature
     let their_identity = VerifyingKey::from_bytes(&their_bundle.identity_key)
@@ -360,13 +552,33 @@ pub fn x3dh_initiate(
     dh_concat.extend_from_slice(dh2.as_bytes());
     dh_concat.extend_from_slice(dh3.as_bytes());
 
-    if let Some(otp) = &their_bundle.one_time_prekey {
+    // A message-less init takes the signed-prekey-only variant, whatever the
+    // bundle offers: with nothing in the init to authenticate the initiator
+    // there is no event on which a one-time prekey could be spent, so naming
+    // one is refused outright (ADR-015). Using it here produced an init the
+    // responder could only reject.
+    let one_time_prekey_id = if carries_message {
+        their_bundle.one_time_prekey_id
+    } else {
+        None
+    };
+
+    if let (true, Some(otp)) = (carries_message, &their_bundle.one_time_prekey) {
         let their_otp = X25519Public::from(*otp);
         let dh4 = ephemeral_secret.diffie_hellman(&their_otp);
         dh_concat.extend_from_slice(dh4.as_bytes());
     }
 
-    let shared_secret = kdf_x3dh(&dh_concat);
+    // Exactly the header bytes this init will carry, so the responder derives
+    // the same value from what it parsed (ADR-015).
+    let binding = mycelium_protocol::wire::session_init_binding(
+        ephemeral_public.as_bytes(),
+        &our_identity.public_key_bytes(),
+        their_bundle.signed_prekey_id,
+        one_time_prekey_id,
+        carries_message,
+    );
+    let shared_secret = kdf_x3dh(&dh_concat, &binding);
 
     // Associated data: both identity keys concatenated
     let mut ad = Vec::with_capacity(64);
@@ -377,6 +589,7 @@ pub fn x3dh_initiate(
         shared_secret,
         ephemeral_public: *ephemeral_public.as_bytes(),
         ad,
+        one_time_prekey_id,
     })
 }
 
@@ -387,6 +600,7 @@ pub fn x3dh_respond(
     their_ephemeral_key: &[u8; 32],
     used_signed_prekey_id: u32,
     used_otp_id: Option<u32>,
+    carries_message: bool,
 ) -> Result<X3dhResponseResult, X3dhError> {
     let their_identity_x25519 = ed25519_public_to_x25519(their_identity_key)?;
     let their_ephemeral = X25519Public::from(*their_ephemeral_key);
@@ -417,14 +631,25 @@ pub fn x3dh_respond(
     dh_concat.extend_from_slice(dh3.as_bytes());
 
     if let Some(otp_id) = used_otp_id {
+        // Peeked, not spent. The prekey is retired by the caller once the
+        // enclosed first message authenticates: spending it here let a
+        // corrupted copy of an init burn it, after which the genuine init
+        // failed and drew a rejection the initiator acted on (ADR-015).
         let otp_secret = our_state
-            .consume_one_time_prekey(otp_id)
+            .one_time_prekey_secret(otp_id)
             .ok_or(X3dhError::OneTimePrekeyNotFound)?;
         let dh4 = otp_secret.diffie_hellman(&their_ephemeral);
         dh_concat.extend_from_slice(dh4.as_bytes());
     }
 
-    let shared_secret = kdf_x3dh(&dh_concat);
+    let binding = mycelium_protocol::wire::session_init_binding(
+        their_ephemeral_key,
+        their_identity_key,
+        used_signed_prekey_id,
+        used_otp_id,
+        carries_message,
+    );
+    let shared_secret = kdf_x3dh(&dh_concat, &binding);
 
     // Associated data
     let mut ad = Vec::with_capacity(64);
@@ -463,15 +688,33 @@ fn ed25519_public_to_x25519(ed25519_pubkey: &[u8; 32]) -> Result<X25519Public, X
     Ok(X25519Public::from(montgomery.to_bytes()))
 }
 
-/// KDF for X3DH: HKDF-SHA256 with protocol-specific info.
-fn kdf_x3dh(input: &[u8]) -> [u8; 32] {
+/// KDF for X3DH: HKDF-SHA256 over the DH outputs, with the init's binding in
+/// the info string.
+///
+/// The binding is what makes an equivalent ephemeral useless. RFC 7748 §7:
+/// for any X25519 public key there are other, publicly computable keys that
+/// produce the same shared secret, so two inits can be equivalent to the
+/// responder while differing on the wire — which is a second identity for one
+/// handshake, and ADR-012 showed what that buys an attacker. With the wire
+/// bytes in the derivation, the altered copy derives a different secret and
+/// its first message simply does not decrypt (ADR-015).
+///
+/// `v2` because the derivation changed: a session from the old one cannot be
+/// continued, and the protocol is `0.1-draft` with no deployed nodes.
+fn kdf_x3dh(input: &[u8], binding: &[u8]) -> [u8; 32] {
     let salt = [0u8; 32]; // All zeros per Signal spec
     let hk = Hkdf::<Sha256>::new(Some(&salt), input);
+    let mut info = Vec::with_capacity(X3DH_INFO.len() + binding.len());
+    info.extend_from_slice(X3DH_INFO);
+    info.extend_from_slice(binding);
     let mut output = [0u8; 32];
-    hk.expand(b"MyceliumX3DH", &mut output)
+    hk.expand(&info, &mut output)
         .expect("HKDF expansion failed");
     output
 }
+
+/// Domain separation for the X3DH derivation, followed by the init binding.
+const X3DH_INFO: &[u8] = b"MyceliumX3DH-v2:";
 
 #[derive(Debug, thiserror::Error)]
 pub enum X3dhError {
@@ -489,6 +732,170 @@ pub enum X3dhError {
 
 #[cfg(test)]
 mod tests {
+
+    /// RFC 7748 §7: for any X25519 public key `u` there are other, publicly
+    /// computable keys that produce the same shared secret. `u⁻¹ mod p` is
+    /// one, and the dangerous one: unlike a flipped high bit or a value at or
+    /// above p, it is a **canonical** encoding, so `is_canonical_x25519`
+    /// cannot tell it from the original. An attacker could take an init, swap
+    /// its ephemeral for the inverse, and have the responder derive the same
+    /// X3DH secret from different wire bytes — a second identity for one
+    /// handshake, which ADR-012 showed is what makes a replay of the original
+    /// collectable as an actionable rejection.
+    ///
+    /// The init's own bytes are in the derivation now, so the equivalent key
+    /// derives a different secret and its first message cannot decrypt
+    /// (ADR-015). This runs the real responder derivation on both encodings.
+    #[test]
+    fn test_an_equivalent_ephemeral_derives_a_different_secret() {
+        // An X25519 public key and its inverse mod 2^255-19, which is the
+        // same point to X25519 and a different 32 bytes on the wire. The
+        // equality assertion below re-derives the equivalence from these
+        // constants, so a wrong constant fails the test rather than making it
+        // pass vacuously.
+        const EPHEMERAL: [u8; 32] = [
+            0x2e, 0x8b, 0x28, 0x83, 0xc2, 0x7b, 0x39, 0x13, 0x59, 0xd7, 0xd0, 0xc1, 0x5d, 0x00,
+            0x81, 0x5a, 0x66, 0x93, 0x29, 0x0a, 0x38, 0xdd, 0x8e, 0xba, 0x34, 0x1c, 0xc0, 0x7d,
+            0xda, 0xa8, 0xed, 0x4d,
+        ];
+        const EQUIVALENT: [u8; 32] = [
+            0xa3, 0xf9, 0xf6, 0x95, 0x9c, 0x87, 0xd5, 0x1c, 0x16, 0xdb, 0x0d, 0xc3, 0x6a, 0xe0,
+            0x20, 0x1f, 0x6e, 0x23, 0x42, 0x31, 0x56, 0x00, 0xa6, 0xfd, 0xe4, 0x74, 0xeb, 0xb3,
+            0xb9, 0xa5, 0xa9, 0x38,
+        ];
+        assert_ne!(EPHEMERAL, EQUIVALENT);
+
+        // Both pass ingress: the canonical-encoding check is no defence here.
+        assert!(crate::identity::is_canonical_x25519(&EPHEMERAL));
+        assert!(crate::identity::is_canonical_x25519(&EQUIVALENT));
+
+        let initiator = Identity::generate();
+        let mut state = PrekeyState::new(Identity::generate());
+        state.generate_one_time_prekeys(1);
+        let bundle = state.issue_bundle();
+        let spk_id = bundle.signed_prekey_id;
+        let otp_id = bundle.one_time_prekey_id;
+
+        // The pair really is equivalent: the responder's own prekeys derive
+        // one shared secret from both encodings, which is why the DH outputs
+        // alone cannot distinguish the two inits.
+        for secret in [
+            state.signed_prekey_secret_for(spk_id).unwrap().to_bytes(),
+            state
+                .one_time_prekey_secret(otp_id.unwrap())
+                .unwrap()
+                .to_bytes(),
+        ] {
+            let secret = X25519Secret::from(secret);
+            assert_eq!(
+                secret
+                    .diffie_hellman(&X25519Public::from(EPHEMERAL))
+                    .to_bytes(),
+                secret
+                    .diffie_hellman(&X25519Public::from(EQUIVALENT))
+                    .to_bytes(),
+                "the constants are not an equivalent pair"
+            );
+        }
+
+        // Same DH material, different init bytes: the binding separates them.
+        let honest = x3dh_respond(
+            &mut state,
+            &initiator.public_key_bytes(),
+            &EPHEMERAL,
+            spk_id,
+            otp_id,
+            true,
+        )
+        .unwrap();
+        let altered = x3dh_respond(
+            &mut state,
+            &initiator.public_key_bytes(),
+            &EQUIVALENT,
+            spk_id,
+            otp_id,
+            true,
+        )
+        .unwrap();
+        assert_ne!(
+            honest.shared_secret, altered.shared_secret,
+            "an equivalent ephemeral must not derive the handshake's secret"
+        );
+
+        // And the prekey selection is bound too: the same ephemeral against a
+        // different prekey id is a different handshake.
+        let other_prekey = kdf_x3dh(
+            &[7u8; 96],
+            &mycelium_protocol::wire::session_init_binding(
+                &EPHEMERAL,
+                &[3u8; 32],
+                1,
+                Some(3),
+                true,
+            ),
+        );
+        let same_prekey = kdf_x3dh(
+            &[7u8; 96],
+            &mycelium_protocol::wire::session_init_binding(
+                &EPHEMERAL,
+                &[3u8; 32],
+                1,
+                Some(2),
+                true,
+            ),
+        );
+        assert_ne!(other_prekey, same_prekey);
+    }
+
+    /// A one-time prekey is spent by the caller once a message authenticates,
+    /// not by the derivation: peeking must leave it available, or a corrupted
+    /// copy of an init burns it and the genuine init fails (ADR-015).
+    #[test]
+    fn test_deriving_does_not_spend_the_one_time_prekey() {
+        let identity = Identity::generate();
+        let mut state = PrekeyState::new(identity);
+        state.generate_one_time_prekeys(1);
+        let bundle = state.issue_bundle();
+        let otp_id = bundle
+            .one_time_prekey_id
+            .expect("the bundle offers the prekey just generated");
+
+        let initiator = Identity::generate();
+        let init = x3dh_initiate(&initiator, &bundle, true).expect("initiate");
+
+        let first = x3dh_respond(
+            &mut state,
+            &initiator.public_key_bytes(),
+            &init.ephemeral_public,
+            bundle.signed_prekey_id,
+            Some(otp_id),
+            true,
+        )
+        .expect("respond");
+        assert!(
+            state.one_time_prekey_secret(otp_id).is_some(),
+            "the prekey is still there for the genuine init"
+        );
+
+        // So the same init derives the same secret again, which is what lets
+        // the real one succeed after a corrupted copy failed.
+        let second = x3dh_respond(
+            &mut state,
+            &initiator.public_key_bytes(),
+            &init.ephemeral_public,
+            bundle.signed_prekey_id,
+            Some(otp_id),
+            true,
+        )
+        .expect("respond again");
+        assert_eq!(first.shared_secret, second.shared_secret);
+
+        state.consume_one_time_prekey(otp_id);
+        assert!(
+            state.one_time_prekey_secret(otp_id).is_none(),
+            "and it is gone once the caller spends it"
+        );
+    }
     use super::*;
 
     /// A non-decompressible Ed25519 encoding (y = 2 has no valid x) must be
@@ -514,13 +921,14 @@ mod tests {
         );
 
         let alice = Identity::generate();
-        let init = x3dh_initiate(&alice, &cached).unwrap();
+        let init = x3dh_initiate(&alice, &cached, true).unwrap();
         let respond = x3dh_respond(
             &mut bob_state,
             &alice.public_key_bytes(),
             &init.ephemeral_public,
             cached.signed_prekey_id,
             cached.one_time_prekey_id,
+            true,
         )
         .expect("a bundle from before the rotation must still complete X3DH");
 
@@ -542,13 +950,14 @@ mod tests {
         }
 
         let alice = Identity::generate();
-        let init = x3dh_initiate(&alice, &cached).unwrap();
+        let init = x3dh_initiate(&alice, &cached, true).unwrap();
         let result = x3dh_respond(
             &mut bob_state,
             &alice.public_key_bytes(),
             &init.ephemeral_public,
             cached.signed_prekey_id,
             cached.one_time_prekey_id,
+            true,
         );
 
         assert!(
@@ -582,13 +991,14 @@ mod tests {
         // And it still completes X3DH after the round trip.
         let mut restored = restored;
         let alice = Identity::generate();
-        let init = x3dh_initiate(&alice, &cached).unwrap();
+        let init = x3dh_initiate(&alice, &cached, true).unwrap();
         let respond = x3dh_respond(
             &mut restored,
             &alice.public_key_bytes(),
             &init.ephemeral_public,
             cached.signed_prekey_id,
             cached.one_time_prekey_id,
+            true,
         )
         .unwrap();
         assert_eq!(init.shared_secret, respond.shared_secret);
@@ -600,7 +1010,7 @@ mod tests {
         let mut bad_key = [0u8; 32];
         bad_key[0] = 0x02;
         let spk_id = bob_state.signed_prekey_id;
-        let result = x3dh_respond(&mut bob_state, &bad_key, &[7u8; 32], spk_id, None);
+        let result = x3dh_respond(&mut bob_state, &bad_key, &[7u8; 32], spk_id, None, true);
         assert!(matches!(result, Err(X3dhError::InvalidIdentityKey)));
     }
 
@@ -618,14 +1028,15 @@ mod tests {
         // Both initiators can still complete X3DH with their issued OTP.
         let alice = Identity::generate();
         let carol = Identity::generate();
-        let a = x3dh_initiate(&alice, &b1).unwrap();
-        let c = x3dh_initiate(&carol, &b2).unwrap();
+        let a = x3dh_initiate(&alice, &b1, true).unwrap();
+        let c = x3dh_initiate(&carol, &b2, true).unwrap();
         let ra = x3dh_respond(
             &mut bob_state,
             &alice.public_key_bytes(),
             &a.ephemeral_public,
             b1.signed_prekey_id,
             b1.one_time_prekey_id,
+            true,
         )
         .unwrap();
         let rc = x3dh_respond(
@@ -634,6 +1045,7 @@ mod tests {
             &c.ephemeral_public,
             b2.signed_prekey_id,
             b2.one_time_prekey_id,
+            true,
         )
         .unwrap();
         assert_eq!(a.shared_secret, ra.shared_secret);
@@ -663,7 +1075,7 @@ mod tests {
         let bundle = bob_state.bundle();
 
         // Alice initiates
-        let init_result = x3dh_initiate(&alice, &bundle).unwrap();
+        let init_result = x3dh_initiate(&alice, &bundle, true).unwrap();
 
         // Bob responds
         let respond_result = x3dh_respond(
@@ -672,6 +1084,7 @@ mod tests {
             &init_result.ephemeral_public,
             bundle.signed_prekey_id,
             bundle.one_time_prekey_id,
+            true,
         )
         .unwrap();
 
@@ -690,7 +1103,7 @@ mod tests {
         let bundle = bob_state.bundle();
         assert!(bundle.one_time_prekey.is_none());
 
-        let init_result = x3dh_initiate(&alice, &bundle).unwrap();
+        let init_result = x3dh_initiate(&alice, &bundle, true).unwrap();
 
         let respond_result = x3dh_respond(
             &mut bob_state,
@@ -698,6 +1111,7 @@ mod tests {
             &init_result.ephemeral_public,
             bundle.signed_prekey_id,
             None,
+            true,
         )
         .unwrap();
 
@@ -818,5 +1232,108 @@ mod tests {
         // Truncate: claim 5 OTPs but only provide data for 2
         bytes.truncate(48 + 2 * 36);
         assert!(PrekeyState::from_bytes_with_identity(&bytes, identity2).is_none());
+    }
+
+    /// The answered-handshake record is bounded, does not grow on a repeat,
+    /// and retires with the signed prekey it belongs to.
+    ///
+    /// Retiring with the prekey is the point: that is when the init it
+    /// remembers stops being derivable, so keeping the entry any longer would
+    /// be bookkeeping for an attack that can no longer happen (ADR-015).
+    #[test]
+    fn test_answered_handshakes_are_bounded_and_retire_with_their_prekey() {
+        let mut state = PrekeyState::new(Identity::generate());
+        let first_spk = state.signed_prekey_id;
+
+        let binding = |n: u8| vec![n; 69];
+        state.mark_handshake_answered(first_spk, &binding(1));
+        state.mark_handshake_answered(first_spk, &binding(1));
+        assert!(state.has_answered_handshake(&binding(1)));
+        assert!(!state.has_answered_handshake(&binding(2)));
+        assert_eq!(
+            state.answered_handshake_count(),
+            1,
+            "a repeat must not take a second slot"
+        );
+
+        // One rotation: the prekey is retained, so the record stays.
+        state.rotate_signed_prekey();
+        let second_spk = state.signed_prekey_id;
+        state.mark_handshake_answered(second_spk, &binding(2));
+        assert!(state.has_answered_handshake(&binding(1)));
+
+        // Enough rotations to push the first prekey out of retention, and the
+        // record goes with it.
+        for _ in 0..MAX_RETAINED_SIGNED_PREKEYS {
+            state.rotate_signed_prekey();
+        }
+        assert!(state.signed_prekey_secret_for(first_spk).is_none());
+        assert!(
+            !state.has_answered_handshake(&binding(1)),
+            "an init whose signed prekey has retired cannot be derived again"
+        );
+        assert!(
+            state.has_answered_handshake(&binding(2)),
+            "and one whose prekey is still retained is still remembered"
+        );
+
+        // Nor can a retired one come back. A long-lived session re-offers its
+        // marker on every decrypt, so without this the obsolete entries would
+        // accumulate and, at capacity, evict the ones still doing work.
+        state.mark_persisted(); // the inserts above set it
+        state.mark_handshake_answered(first_spk, &binding(1));
+        assert!(!state.has_answered_handshake(&binding(1)));
+        assert!(
+            !state.needs_persist(),
+            "and a refused entry must not ask for a blob write either"
+        );
+    }
+
+    /// The bound holds, oldest first.
+    #[test]
+    fn test_the_answered_handshake_record_evicts_its_oldest() {
+        let mut state = PrekeyState::new(Identity::generate());
+        let spk = state.signed_prekey_id;
+        let binding = |n: u32| n.to_le_bytes().to_vec();
+
+        for n in 0..(MAX_ANSWERED_HANDSHAKES as u32 + 2) {
+            state.mark_handshake_answered(spk, &binding(n));
+        }
+        assert_eq!(state.answered_handshake_count(), MAX_ANSWERED_HANDSHAKES);
+        assert!(!state.has_answered_handshake(&binding(0)));
+        assert!(!state.has_answered_handshake(&binding(1)));
+        assert!(state.has_answered_handshake(&binding(MAX_ANSWERED_HANDSHAKES as u32 + 1)));
+    }
+
+    /// The record survives the prekey blob, and a blob written before it
+    /// existed still loads.
+    #[test]
+    fn test_answered_handshakes_round_trip_through_the_blob() {
+        let identity = Identity::generate();
+        let identity_bytes = identity.to_bytes();
+        let mut state = PrekeyState::new(identity);
+        state.generate_one_time_prekeys(3);
+        state.rotate_signed_prekey();
+        let spk = state.signed_prekey_id;
+        state.mark_handshake_answered(spk, b"a binding");
+
+        let blob = state.to_bytes();
+        let restored = PrekeyState::from_bytes_with_identity(
+            &blob,
+            Identity::from_bytes(&identity_bytes).unwrap(),
+        )
+        .expect("round-trips");
+        assert!(restored.has_answered_handshake(b"a binding"));
+        assert_eq!(restored.signed_prekey_id, spk);
+
+        let older = &blob[..blob.len() - (4 + 36)];
+        let legacy = PrekeyState::from_bytes_with_identity(
+            older,
+            Identity::from_bytes(&identity_bytes).unwrap(),
+        )
+        .expect("an older blob still loads");
+        assert_eq!(legacy.answered_handshake_count(), 0);
+        assert_eq!(legacy.signed_prekey_id, spk);
+        assert_eq!(legacy.one_time_prekeys.len(), 3);
     }
 }

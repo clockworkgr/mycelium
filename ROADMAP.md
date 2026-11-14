@@ -14,7 +14,7 @@ authentication:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **472 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **493 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -318,6 +318,50 @@ initiator will act on: accept the altered copy, then replay the original.
    lost on restart, so a discarded init can be replayed afterwards for an
    actionable rejection. The evidence has to outlive both.
 
+**Landed 2026-11-14 (ADR-015).** All three are closed.
+
+1. `session_init_binding` — the `SessionInit` header exactly as it travels —
+   is an input to the X3DH derivation, under the info string
+   `MyceliumX3DH-v2:`. An equivalent ephemeral now derives a different secret,
+   so its first message does not decrypt and it cannot mint a second identity
+   for one handshake. The regression test carries a real `u`/`u⁻¹ mod p` pair,
+   re-derives their equivalence from the responder's own prekeys so a wrong
+   constant cannot make it pass vacuously, and runs the real responder
+   derivation on both encodings.
+2. The derivation peeks at the one-time prekey; the caller spends it when the
+   enclosed message decrypts, on the tie-break path as well as the ordinary
+   one. A message-less init that names a prekey is refused
+   (`PrekeyWithoutMessage`) and uses the signed-prekey-only variant instead; a
+   non-empty nested payload that is not an `EncryptedMessage` is refused
+   outright.
+3. The 60-second timer is gone: a rejection is sent only when no session with
+   that peer exists. The maintenance tick's handshake sweep
+   (two DTN delivery windows — `2 × max(dtn.ttl_hours, 72)`) is what makes
+   the legitimate case recover, since a responder sitting on a stale session
+   says nothing at all. It keeps a handshake the peer has acknowledged, because
+   a one-way conversation never confirms; the acknowledgement lives on the
+   handshake rather than in the message rows, which can be deleted. **T-41**
+   (the record is in memory, so a restart loses it) and **T-42** (receipts are
+   forgeable, so confirmation needs an authenticated acknowledgement) are what
+   remain.
+4. A handshake is answered once, on two records keyed on the binding — which
+   now covers whether the init carries a message, so neither substituting the
+   nested message nor stripping it makes an answered handshake answerable
+   again. `Session::accepted_binding` is one slot, ungrowable by a forgery and
+   so able to cover the unauthenticated message-less form; the first successful
+   decrypt copies it into `PrekeyState::answered_handshakes`, which retires
+   with the signed prekey and is written to the blob on that decrypt. A
+   recognised init installs nothing and draws no rejection, and nothing is
+   delivered from it either: an init encloses message 0 of its chain or it is
+   refused, so by the time a handshake is on record its message has been
+   delivered or has failed in a way a second attempt cannot change. Found in
+   review, in five steps: retiring the
+   prekey only covers an init that named one; a record of the payload is
+   bypassed by substituting the message; a per-session record dies while the
+   prekey lives on; a prekey-scoped record cannot cover the message-less init
+   without giving a forgery something to fill; and a promotion never persisted
+   is gone on the next start.
+
 **Acceptance** (designs per ADR-015):
 - The raw init header's bytes are an input to the X3DH key derivation, so a
   copy carrying an equivalent ephemeral (`u⁻¹ mod p`) derives a different key
@@ -566,6 +610,111 @@ them caused by that work:
 - Either fragment reassembly is integrity-checked, or ADR-008 states which
   layer is responsible for detecting a corrupted reassembly and why that is
   sufficient.
+
+---
+
+### T-41 · An unconfirmed handshake does not survive a restart
+
+**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §5.2 · **ADR-012**,
+**ADR-015**
+
+A `SessionInit` the peer never answers is given up on after
+its deadline: the sweep landed with T-35 on 2026-11-14 and
+is what makes ADR-015's rule 3 — reject only when no session with the peer
+exists — safe for the legitimate case. But the record it sweeps,
+`SessionManager::unconfirmed_handshakes`, is in memory only. The session itself
+is persisted, so a restart during an unconfirmed handshake leaves a session
+with no handshake behind it: the sweep cannot fire, and a late `SessionReject`
+is ignored for the same reason (`handshake_transcript` returns `None`). Every
+later message to that peer goes out as a bare `EncryptedMessage` it cannot
+read, for ever.
+
+Narrow but permanent, and it predates the sweep rather than being caused by it:
+before T-35 the restart lost the same record and with it the only thing that
+made a rejection actionable.
+
+**Acceptance:**
+- The unconfirmed-handshake record — transcript, the message ids sent under it,
+  and when the init went out — survives a restart, so both the sweep and a late
+  rejection still work. Storing it with the session row is the obvious place;
+  a new table needs a reason.
+- Tests: a node restarted mid-handshake still gives the handshake up on time,
+  and still acts on a rejection that names it.
+- Spec §5.2 states what a restart keeps, since it is now load-bearing for
+  recovery.
+
+---
+
+### T-42 · A handshake is confirmed only by traffic, and receipts are forgeable
+
+**Area:** `mycelium-node`, `mycelium-protocol` · **Spec:** §5.2 · **ADR-015**
+
+A handshake is confirmed when the initiator decrypts something from the peer:
+only that peer's ratchet could have produced it. A conversation where the peer
+reads and acknowledges but never replies therefore never confirms, and T-35's
+sweep would abandon a working session every
+the handshake deadline. The sweep now keeps a handshake whose
+message has been acknowledged (`handshake_was_acknowledged`), which covers the
+honest case — but receipts are unauthenticated (§14.3), so a forged receipt
+suppresses the sweep for that pairing, and a forged one is also the reason a
+receipt must not count as *confirmation*: that would strip a live handshake of
+its rejection protection and pin a dead session indefinitely.
+
+The fix is an acknowledgement the peer cannot forge: on accepting a
+`SessionInit`, the responder sends something encrypted under the new session —
+an empty `SYSTEM` message, or a payload of its own — which confirms the
+handshake on arrival by the ordinary rule, within one round trip, with no
+reliance on receipts.
+
+**Acceptance:**
+- Accepting a session produces an authenticated acknowledgement, and the
+  initiator's handshake is confirmed by it; a one-way conversation survives
+  the handshake deadline with no receipt involved.
+- The acknowledgement is not surfaced to API clients as a message.
+- It is not itself a `SessionInit`, so it cannot start a handshake loop between
+  two nodes that both accept.
+- Tests: a one-way conversation across the timeout; an acknowledgement for a
+  handshake we do not have is ignored.
+- Covers two cases receipts cannot. A session carrying only sender-key
+  distribution never confirms *and* never draws a receipt, because
+  `finalize_incoming_message` returns early for `ContentType::System` — so it
+  is swept and re-handshaked at every deadline. And a
+  conversation of exactly one message cannot be acknowledged at all, since a
+  receipt for an init's own message is no evidence the peer kept the session
+  (§5.2).
+- Spec §5.2 states what confirms a handshake, and §14.3 what is accepted.
+
+---
+
+### T-43 · A one-time prekey is not bound to the initiator it was issued to
+
+**Area:** `mycelium-crypto`, `mycelium-api` · **Spec:** §5.2 · **ADR-009**,
+**ADR-015**
+
+A prekey bundle is public. Any node holding Bob's bundle can initiate with it —
+under its own identity, with its own valid first message — and so consume the
+one-time prekey that Alice's init names. Alice's untouched init then fails with
+`UnknownOneTimePrekey` and draws a rejection that is entirely honest, because
+Bob really cannot complete it; but a third party has forced that pairing to
+re-handshake at the cost of one prekey. Bundles served from a supernode cache
+make the collision ordinary rather than adversarial: the same cached bundle goes
+to many initiators, which is why stale bundles have their own recovery
+(ADR-009).
+
+Found by the ADR review on 2026-11-14 against ADR-015, whose consequence
+"a forged or provoked `SessionReject` changes nothing" holds for a forgery and
+for a replay but not for this — it provokes a *true* refusal. The cost is one
+handshake per prekey spent, against a responder that replenishes to 100 when it
+drops below 20, so this is a nuisance rather than a denial of service; it is
+listed because the guarantee is worded more strongly than the code can keep.
+
+**Acceptance:**
+- Either an issued prekey names the NodeId it was issued to and a mismatch is
+  refused — which needs the bundle request to carry an authenticated requester,
+  and a policy for bundles served from a cache — or §5.2 states the property and
+  why it is acceptable, and ADR-015's rejection guarantee is reworded to match.
+- Tests: a third party consuming the prekey another initiator named; whichever
+  rule is chosen, the genuine initiator's recovery still works.
 
 ---
 

@@ -236,7 +236,7 @@ async fn test_session_persistence_roundtrip() {
 
     let mut sm = SessionManager::new();
     let init_result = sm
-        .initiate_session(&alice_id, bob_node_id, &bob_bundle)
+        .initiate_session(&alice_id, bob_node_id, &bob_bundle, true)
         .unwrap();
 
     // Serialize and deserialize

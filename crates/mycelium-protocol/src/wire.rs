@@ -157,7 +157,65 @@ pub struct SessionInitPayload {
     pub encrypted_payload: Vec<u8>,
 }
 
+/// What identifies a handshake: the `SessionInit` header as it appears on the
+/// wire — the ephemeral key, the initiator's identity key and the prekeys it
+/// selected — followed by one byte saying whether the init carries a message.
+///
+/// Fed into the X3DH key derivation by both sides (ADR-015). RFC 7748 §7 is
+/// the reason: for any X25519 public key there are other, publicly computable
+/// keys that produce the same shared secret, so the ephemeral alone does not
+/// identify a handshake. With these bytes in the derivation, a copy carrying
+/// an equivalent key derives a *different* secret, its first message does not
+/// decrypt, and it cannot be accepted as a second version of the same
+/// handshake.
+///
+/// `carries_message` is in here although it is not a header field, because an
+/// init that encloses a message and one that does not are different
+/// handshakes: they take different X3DH variants (the message-less form is
+/// signed-prekey-only) and they are answered on different paths, one
+/// authenticated and one not. Without it, stripping the payload from an init
+/// left the binding untouched, so the stripped copy was answered on the
+/// unauthenticated path and the genuine init — same binding, already answered
+/// — was then met with silence, losing its message. With it, the stripped copy
+/// derives a different secret and cannot stand in for the real handshake.
+///
+/// Both sides must produce these bytes identically — the initiator from what
+/// it is about to serialize, the responder from what it parsed — so the layout
+/// lives here beside the serializer it mirrors.
+pub fn session_init_binding(
+    ephemeral_public: &[u8; 32],
+    identity_key: &[u8; 32],
+    signed_prekey_id: u32,
+    one_time_prekey_id: Option<u32>,
+    carries_message: bool,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32 + 32 + 4 + 5 + 1);
+    buf.extend_from_slice(ephemeral_public);
+    buf.extend_from_slice(identity_key);
+    buf.extend_from_slice(&signed_prekey_id.to_le_bytes());
+    match one_time_prekey_id {
+        Some(id) => {
+            buf.push(1);
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        None => buf.push(0),
+    }
+    buf.push(carries_message as u8);
+    buf
+}
+
 impl SessionInitPayload {
+    /// This init's binding — see `session_init_binding`.
+    pub fn binding(&self) -> Vec<u8> {
+        session_init_binding(
+            &self.ephemeral_public,
+            &self.identity_key,
+            self.signed_prekey_id,
+            self.one_time_prekey_id,
+            !self.encrypted_payload.is_empty(),
+        )
+    }
+
     pub fn serialize(&self) -> Vec<u8> {
         let otp_size = if self.one_time_prekey_id.is_some() {
             5
@@ -1182,6 +1240,84 @@ mod tests {
         let decoded = EncryptedPayload::deserialize_body(&bytes[1..]).unwrap();
         assert_eq!(decoded.content_type, 0);
         assert_eq!(decoded.ciphertext, b"encrypted data here");
+    }
+
+    /// The binding is exactly the header bytes the serializer writes before
+    /// the enclosed message, so the initiator and the responder derive the
+    /// same value from the same init (ADR-015).
+    #[test]
+    fn test_the_binding_matches_the_serialized_header() {
+        let payload = SessionInitPayload {
+            ephemeral_public: [1u8; 32],
+            identity_key: [2u8; 32],
+            signed_prekey_id: 7,
+            one_time_prekey_id: Some(9),
+            encrypted_payload: vec![0xAA; 16],
+        };
+        let wire = payload.serialize();
+        // Skip the payload type byte; the header ends before the length, and
+        // the binding is that header plus the carries-a-message byte.
+        let binding = payload.binding();
+        assert_eq!(binding[..32 + 32 + 4 + 5], wire[1..1 + 32 + 32 + 4 + 5]);
+        assert_eq!(binding.len(), 32 + 32 + 4 + 5 + 1);
+        assert_eq!(
+            *binding.last().unwrap(),
+            1,
+            "this init carries a message, and that is part of its identity"
+        );
+
+        let no_otp = SessionInitPayload {
+            one_time_prekey_id: None,
+            ..payload.clone()
+        };
+        let wire = no_otp.serialize();
+        let binding = no_otp.binding();
+        assert_eq!(binding[..32 + 32 + 4 + 1], wire[1..1 + 32 + 32 + 4 + 1]);
+        assert_eq!(binding.len(), 32 + 32 + 4 + 1 + 1);
+
+        // Stripping the payload changes the handshake, which is the point: a
+        // relay cannot turn one form of init into the other.
+        let stripped = SessionInitPayload {
+            encrypted_payload: Vec::new(),
+            ..payload.clone()
+        };
+        assert_ne!(stripped.binding(), payload.binding());
+        assert_eq!(*stripped.binding().last().unwrap(), 0);
+    }
+
+    /// Every field it covers changes it: an init differing in any of them is
+    /// a different handshake.
+    #[test]
+    fn test_the_binding_covers_every_field_it_claims_to() {
+        let base = session_init_binding(&[1u8; 32], &[2u8; 32], 7, Some(9), true);
+        assert_ne!(
+            base,
+            session_init_binding(&[9u8; 32], &[2u8; 32], 7, Some(9), true)
+        );
+        assert_ne!(
+            base,
+            session_init_binding(&[1u8; 32], &[9u8; 32], 7, Some(9), true)
+        );
+        assert_ne!(
+            base,
+            session_init_binding(&[1u8; 32], &[2u8; 32], 8, Some(9), true)
+        );
+        assert_ne!(
+            base,
+            session_init_binding(&[1u8; 32], &[2u8; 32], 7, Some(8), true)
+        );
+        assert_ne!(
+            base,
+            session_init_binding(&[1u8; 32], &[2u8; 32], 7, None, true)
+        );
+        assert_ne!(
+            base,
+            session_init_binding(&[1u8; 32], &[2u8; 32], 7, Some(9), false)
+        );
+        assert_eq!(
+            base,
+            session_init_binding(&[1u8; 32], &[2u8; 32], 7, Some(9), true)
+        );
     }
 
     #[test]

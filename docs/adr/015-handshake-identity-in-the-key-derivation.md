@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted (2026-11-12). **Implementation pending — ROADMAP T-35.**
+Accepted (2026-11-12). **Implemented (2026-11-14) — ROADMAP T-35.** See the
+note at the end: one mechanism this record relied on did not exist when it was
+written.
 
 ## Context
 
@@ -124,3 +126,208 @@ The consequence is that such a handshake gets no one-time-prekey forward
 secrecy. That is the honest trade for a form of init that has nothing to
 authenticate, and the spec must say which variant each init form uses rather
 than describing one X3DH.
+
+## Note (2026-11-14): implemented, and the timeout this record assumed
+
+All three decisions are built. The binding is
+`mycelium_protocol::wire::session_init_binding` — the `SessionInit` header as
+it travels — fed to HKDF as `b"MyceliumX3DH-v2:" ‖ binding`, so the initiator
+binds what it serialized and the responder what it received.
+
+**"The 60-second initiation timer goes" is too broad.** What stopped depending
+on it is *rejection suppression*: a rejection is now sent on the state question
+"do we hold a session with this peer". ADR-007's tie-break still asks whether we
+initiated within `SIMULTANEOUS_INIT_WINDOW`, because that is a genuinely
+time-bounded question — did these two inits cross? — and it is still 60 seconds.
+What the tie-break no longer carries is the *replay* protection it used to imply:
+that comes from the records below and from requiring an init to enclose message
+0 of its chain, neither of which expires.
+
+**The handshake timeout did not exist.** Twice above — the accepted cost of
+rule 3, and alternative 4's "a case a timeout already covers" — this record
+leaned on a recovery mechanism that was nowhere in the code. Nothing had ever
+given up on an unconfirmed handshake. That made rule 3 a straight loss for the
+legitimate case: an initiator holding an optimistic session against a dead
+bundle, whose responder keeps a stale session and therefore stays silent, had
+no way back at all. The code review found it.
+
+It exists now, and the shape it settled into after review is not quite the one
+this paragraph first described. `SessionManager::stale_handshakes` *lists* the
+handshakes past the deadline without touching anything, and the 30-second
+maintenance tick decides: for each one it abandons it does what a rejection does
+— drop the session row, drop the cached bundle from memory and from storage,
+report the messages sent under it — and only then calls
+`give_up_on_handshake`. The split is there so the caller can skip a handshake
+the peer has acknowledged, and so that every durable write commits *before*
+anything is forgotten: while the handshake is still in place a failed write is
+retried on the next tick, and once it is gone a failure would strand durable
+state with nothing left to clean it up.
+
+The deadline is two DTN delivery windows — the init's and the reply's, together
+the slowest a legitimate handshake can confirm — as
+`handshake_confirmation_timeout(dtn.ttl_hours)`: `2 × max(dtn.ttl_hours, 72)`.
+Derived rather than fixed because `dtn.ttl_hours` is configurable and bounds how
+long our own init can still be in flight, and floored at the documented default
+because the *reply's* window is the peer's choice and nothing on the wire says
+what it is. A shorter bound would tear down handshakes still in flight and
+report messages the peer had read as failed; the shape is fixed here, the
+multiplier is a knob to measure (T-15).
+
+**A limitation this leaves, stated rather than hidden.** The floor assumes the
+peer keeps bundles for no longer than the 72-hour default. A peer configured
+above that can have a legitimate reply still queued when we give up at 144
+hours, and that reply then arrives for a session we have dropped. Closing it
+needs the peer's window on the wire, which is capability negotiation (T-20);
+until then §5.2 states the assumption and a node that raises its own
+`dtn.ttl_hours` should expect peers to expire its handshakes on the default.
+
+One gap stays, recorded rather than papered over: `unconfirmed_handshakes` is
+in memory, so a restart loses the record and the sweep cannot fire. It predates
+the sweep — a late rejection is ignored after a restart for the same reason —
+so it is not a regression from rule 3. **ROADMAP T-41.**
+
+**Two things the implementation found.** Deferring the prekey spend to "the
+caller" has *two* callers, and the second was missed: the tie-break path that
+keeps our own session and decrypts only the loser's first message left the
+prekey unspent, so a replay of that init under a fresh envelope id could derive
+the handshake again and reinstall the session we had deliberately discarded.
+Both paths now spend it on the same event — the AEAD verifying. And the
+message-less path needed the refusal stated here to be a refusal *before* any
+derivation, not after: accepting such an init and merely not spending the
+prekey leaves it for the next forgery.
+
+**The reciprocal-key claim was checked, not assumed.** `u⁻¹ mod p` is canonical
+— under `p`, so `is_canonical_x25519` admits it — and it does produce the
+identical shared secret; verified against an independent implementation of RFC
+7748 before the test was written. With the binding removed from the KDF, the
+honest init and the swapped one derive the same secret byte for byte, which is
+what the regression test now demonstrates through the real responder
+derivation.
+
+**Five more replays, found in review, and each fix found the next.** Retiring
+the one-time prekey on authentication stops the replay of a discarded tie-break
+loser only when that init *named* a prekey. A signed-prekey-only loser retires
+nothing and stayed replayable for as long as its signed prekey was retained — a
+fortnight, not the sixty seconds of the initiation window.
+
+The first attempt was a per-session list of discarded init **transcripts**, and
+each round took the next layer off it:
+
+1. A transcript covers the whole payload, so **substituting the nested message**
+   walks past it. The loser had sent follow-ups on the same chain, the ratchet
+   retains skipped keys so a later message decrypts on a fresh one, and the
+   derivation binds only the header.
+2. A per-session record **dies with the session** while the prekey it depends on
+   lives on, so an expiry or a re-handshake made the old init replayable again.
+3. A prekey-scoped record cannot cover the **message-less** init: that path
+   authenticates nothing, so recording there would let an attacker generating
+   identities fill a bound shared with every real handshake. Left uncovered, an
+   attacker holding the init header and any later ciphertext from the peer's
+   chain could have the session derived from scratch over one that had moved on
+   — rewinding a ratchet and reusing message keys.
+4. **Stripping** a payload left the binding untouched, so a stripped copy was
+   answered on the unauthenticated path and the genuine init was then met with
+   silence, losing its message.
+5. And a marker promoted but **never written** was gone on the next start, which
+   is the only place that record is kept.
+
+So: two records, keyed on a binding that now says whether the init carries a
+message. `Session::accepted_binding` is one slot — ungrowable by a forgery,
+which is what lets it cover the message-less form — and the first successful
+decrypt copies it into `PrekeyState::answered_handshakes`, which retires with the
+signed prekey, writing the blob on that decrypt. The session's entry is kept
+rather than moved: a handover across two stores has an order to get wrong, and a
+promotion followed by a lost write would leave neither marker, while two
+independent records mean losing either leaves the other. Promotion is driven by
+an authenticated event, is refused once the prekey has retired — a long-lived
+session re-offers its entry on every decrypt, and obsolete entries would evict
+live ones at capacity — and is the earliest moment that matters, because a
+responder has no sending chain until the initiator speaks.
+
+Both are enforced in the derivation layer, not only at the node's gate, because
+a refusal there maps to a `SessionReject` and signing anything about an init the
+peer really sent is the lever ADR-012 is about. Alternative 4's "persist the
+discarded transcripts" was the right instinct with the wrong key and lifetime.
+
+Changing what `accepted_binding` holds let the `init_transcript` parameter go
+from both accept methods: they derive the binding from fields they already have,
+so a caller cannot pass the wrong thing. The prekey-scoped record is capped at
+1024, oldest evicted: a peer able to complete 1024 handshakes could evict an
+entry and replay that init, where an uncapped record would let any peer grow a
+blob rewritten on every init. A table deleted on rotation is the alternative if
+it ever outgrows the blob.
+
+**And an init encloses message 0 of its chain.** A relay could otherwise
+reorder: wrap a captured later message from the chain into a copy of the init,
+have *that* answered first, and leave the genuine init — a handshake already
+answered — to be met with silence, losing the conversation's first message
+silently, because the session works and nothing retries. Delivering the enclosed
+message from the already-answered path was the first answer to this, and it was
+the wrong one: on the tie-break path the surviving session is not the one that
+payload was encrypted under, so the delivery could not succeed there anyway.
+Requiring message 0 stops the reorder at the source, and the captured message
+then arrives as what it always was — an ordinary message. The nested-type check
+moved ahead of the record lookup in the same change, so an unknown type is
+refused before anything consults any state.
+
+**And the message-less variant is chosen by the form.** `x3dh_initiate` used the
+bundle's one-time prekey whatever the form, so a message-less init named a prekey
+it was not allowed to name: an init the responder could only reject, against any
+bundle with prekeys left in it. The variant now decides the derivation, the
+binding and the id named, and `InitiateResult` reports what was used rather than
+what was offered.
+
+**The sweep keeps an acknowledged handshake.** A conversation where the peer
+reads and acknowledges but never replies never confirms — confirmation needs
+something of the peer's to decrypt — so the sweep abandoned working sessions
+every 144 h, and everything the peer then sent was dropped until our own next
+send. The acknowledgement lives on the handshake, which knows the messages it sent,
+and it is noted without consulting the message rows at all, because those can be
+deleted. A receipt counts only if it names a message sent **after** the init:
+receipts arrive late, so one from a session long gone must not vouch for a newer
+handshake, and — the subtle half — the init's own message is decrypted by an
+ADR-007 tie-break winner with a session it then *discards*, and receipted
+honestly. Such a receipt proves the peer read the message, not that it holds the
+session the message arrived under; if the winner's own init were then lost, it
+would pin an unusable handshake for ever.
+
+Two kinds of conversation therefore cannot be acknowledged at all: one of
+exactly a single message, and one carrying only sender-key distribution, since
+`ContentType::System` draws no receipt. Both are swept at the deadline and
+re-handshaked on the next send, which costs a handshake and loses nothing. T-42
+is the acknowledgement that would settle all of it.
+Receipts are *not* treated as confirmation: they are unauthenticated, and a
+forged one would then pin a dead session for ever and strip a live handshake of
+its rejection protection. As a gate on keeping something, a forgery costs that
+pairing its recovery, which is the behaviour from before the sweep. The
+unforgeable version — an acknowledgement encrypted under the new session — is
+ROADMAP T-42.
+
+**And the sweep is one critical section.** Dropping a session and then deleting
+its row left a gap in which another task could accept and persist a new session
+for that peer, whose row the delete would then remove — a session that works
+until the next restart and is gone after it. The sweep holds the session write
+lock across the row delete, the bundle eviction and the status writes; nothing
+takes the bundle cache and then that lock, so the order is safe. What remains is
+in the send path, not here: a send that has already copied a cached bundle can
+still initiate from it after the invalidation, costing one handshake that the
+next sweep retires. The rejection path has always had that same window.
+
+**One stale comment mattered.** `PrekeyState::to_bytes` reserves its capacity up
+front *because* a realloc would free an allocation holding prekey secrets
+without wiping it, which the caller's `Zeroizing` wrapper cannot undo. Two
+fields had been appended since without being added to the reservation.
+
+**What the rejection guarantee still does not cover.** Retiring the one-time
+prekey on authentication stops a *corrupted copy* of an init from burning it.
+It does not bind the prekey to the initiator it was issued to, and a bundle is
+public: any node holding Bob's bundle can initiate with it, under its own
+identity and its own valid first message, and consume the prekey Alice's init
+names. Alice's untouched init then fails with `UnknownOneTimePrekey` and draws a
+rejection that is entirely *honest* — Bob really cannot complete it — but a
+third party has forced that pairing to re-handshake at the cost of one prekey.
+Bundles served from a supernode cache make the collision ordinary rather than
+adversarial, since the same cached bundle goes to many initiators. So the claim
+"a forged or provoked `SessionReject` changes nothing" holds for a forged one
+and for a replay, and not for this: it provokes a true refusal. **ROADMAP
+T-43.**
