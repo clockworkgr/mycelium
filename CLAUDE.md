@@ -25,7 +25,7 @@ Then, as needed:
 3. [`CONTRIBUTING.md`](CONTRIBUTING.md) — build setup, test commands, project
    structure, commit conventions.
 4. [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-001 …
-   ADR-022). Append-only; never rewrite one. ADR-014 … ADR-021 are decided but
+   ADR-022). Append-only; never rewrite one. ADR-017 … ADR-021 are decided but
    not yet implemented — one per open P0 — and each names its ROADMAP task and
    flips its own status in the commit that implements it.
 5. [`docs/plugin-api.md`](docs/plugin-api.md) — transport plugin development
@@ -66,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 495 tests).
+- `cargo test` runs the whole workspace (currently 548 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -208,7 +208,7 @@ detail matters.
 - SQLCipher. Key is `SHA-256("mycelium-db-key:" || identity_bytes)`.
 - Feature flag `bundled-sqlcipher-vendored-openssl` (vendors OpenSSL for
   cross-compilation).
-- 12 tables. Groups and prekey state are opaque blobs in `config`, not their
+- 13 tables. Groups and prekey state are opaque blobs in `config`, not their
   own tables.
 
 ### Wire format (spec §4)
@@ -259,7 +259,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-15: 495 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-15: 548 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -275,11 +275,13 @@ The highest-priority open items (all P0, all defects in shipped features): FFI
 panic guards (`T-01`), group-discovery proof of possession (`T-04`), emergency
 co-signer signatures (`T-05`, wire format and verification landed; collecting
 co-signatures is not built), identity key at rest (`T-08`), BLE/Wi-Fi Direct
-peer identity, which is asserted rather than proved (`T-34`), and DHT record
-eviction, which undoes ADR-011's rollback protection (`T-38`).
+peer identity, which is asserted rather than proved (`T-34`).
 
 Landed: T-36 on 2026-11-12 (ADR-013); T-37, T-39 and T-35 on 2026-11-14
-(ADR-014, ADR-022, ADR-015). `T-40` collects four LoRa defects found reviewing
+(ADR-014, ADR-022, ADR-015); T-38 on 2026-11-15 (ADR-016) — persisted DHT
+high-water marks, so a replayed record cannot roll an address back once the
+newer one has been evicted, with `T-44` for what it left behind.
+`T-40` collects four LoRa defects found reviewing
 ADR-008 against the code. `T-41` and `T-42` are what T-35 left behind — the
 unconfirmed-handshake record is in memory, so a restart loses both the sweep
 and a late rejection, and receipts are unauthenticated, so confirming a

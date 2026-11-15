@@ -1,6 +1,6 @@
 # Mycelium Roadmap
 
-**Last updated:** 2026-11-13 · **Current version:** 0.1 (pre-release)
+**Last updated:** 2026-11-15 · **Current version:** 0.1 (pre-release)
 
 The companion document is [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md), which
 specifies the protocol and describes what is built. This document tracks only
@@ -9,18 +9,18 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-13 against the working tree, after T-37's origin
-authentication:
+Verified on 2026-11-15 against the working tree, after T-38's persisted DHT
+high-water marks:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **495 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **548 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
 
 10 Rust crates (~26.6k lines), 49 Dart files, 38 REST endpoints + 7 WebSocket
-event types, 64 FFI functions, 17 wire payload types, 12 database tables.
+event types, 64 FFI functions, 17 wire payload types, 13 database tables.
 
 Everything specified for v0.1 is implemented except the items below. The
 remaining work is concentrated in four places: **FFI robustness**, **protocol
@@ -52,6 +52,12 @@ internet transport, binary framing, signed DHT records, ADR-011), T-10
 (discovery timeout on its own sweep, one attempt per destination), T-11
 (origin-aware DTN eviction, persisted origin + spray history).
 
+**Landed 2026-11-15:** T-38 (a persisted per-publisher high-water mark that
+outlives both the record's eviction and the process, so ADR-011's rollback rule
+no longer depends on still holding the record; wildcard addresses refused in
+common admission; a per-peer share of the record store — ADR-016). What it left
+behind is T-44.
+
 **Landed 2026-11-12:** T-36 (emergency broadcasts are checked before they are
 remembered, keyed on their digest, bounded in time by a signed `signed_at`,
 and the flood-dedup set expires by age instead of clearing itself — ADR-013).
@@ -64,21 +70,22 @@ the T-06 work; T-37 is what reviewing ADR-010 during T-36 turned up next — an
 emergency broadcast's origin is not authenticated at all; and T-38 is how
 capacity eviction undoes the rollback protection ADR-011 claims.
 
-**Decided 2026-11-12, not yet implemented.** Every P0 below now has its design
-on record: T-37 (ADR-014), T-35's remainder (ADR-015), T-38 (ADR-016), T-14's
-row identity (ADR-017), T-01 (ADR-018), T-04 (ADR-019), T-08 (ADR-020) and
-T-34 (ADR-021). Each ADR names the task that implements it and flips its own
+**Decided 2026-11-12.** Every P0 below has its design on record: T-14's row
+identity (ADR-017), T-01 (ADR-018), T-04 (ADR-019), T-08 (ADR-020) and T-34
+(ADR-021). ADR-014, ADR-015 and ADR-016 have been implemented (T-37, T-35,
+T-38). Each ADR names the task that implements it and flips its own
 status in that commit; the acceptance criteria below carry the decisions.
 
-Planned order: **T-37, then T-35, then T-38**, with T-14's migration after —
-by severity, since anyone holding the group seed phrase can inject a mesh-wide
-alert today, while T-35's residual costs one discarded handshake. The remaining
-four (T-01, T-04, T-08, T-34) are designed but unsequenced.
+T-37, T-35 and T-38 have landed in that order. T-14's migration is next by the
+same reasoning — severity — and the remaining four (T-01, T-04, T-08, T-34) are
+designed but unsequenced.
 
 Two standing rules from those decisions: constants are **shapes now, numbers
 later** — the DHT publisher quota, the level-1/2 reach limits and the dedup
 retention period are to be measured against the testbed (T-19) or hardware
-(T-15), not guessed; and the radio features (T-04, T-34) keep "Implemented,
+(T-15), not guessed — T-38 added four more to that list (`mark_capacity` 8192,
+`mark_first_seen_reserve` 512, `mark_retention_grace_secs` 86 400 and
+`max_records_per_peer` 256, each with its basis in ADR-016's 2026-11-15 note); and the radio features (T-04, T-34) keep "Implemented,
 untested on hardware" until T-15's report, however complete the software
 tests are.
 
@@ -471,53 +478,6 @@ Two related defects, found while fixing T-36:
 
 ---
 
-### T-38 · DHT record eviction undoes the rollback protection
-
-**Area:** `mycelium-core` · **Spec:** §8.4 · **ADR-011**, **ADR-016**
-(design decided 2026-11-12)
-
-ADR-011 states that a replayed old address cannot displace a current one:
-`store_record` refuses a record no newer than the one it holds. That rule
-depends on *holding* the current record, and capacity eviction throws it away.
-At `max_records` the store drops whatever is closest to expiring and admits
-the newcomer, so a peer can fill it with records for identities it generates
-itself — a record is self-signed, and identities are free — evict a victim's
-current record, and then replay that victim's older, still-fresh record. It is
-accepted, and lookups answer with the stale address.
-
-The consequence is the one ADR-011 exists to prevent: traffic for the victim
-sent to an address it no longer holds, chosen by the attacker.
-
-Found by reviewing ADR-011 against the code during T-36. The eviction policy
-and the rollback rule need to be reconciled: a high-water mark per NodeId that
-outlives the record, admission bounded per publisher so one identity cannot
-fill the store, or both.
-
-**Acceptance** (designs per ADR-016 — both halves, not either):
-- A record for a wildcard address (`0.0.0.0`, `::`) is refused in
-  `store_record`, not only in the publish path. Today the internet transport
-  declines to sign one while a peer's correctly signed wildcard record is
-  admitted and served to `FindValue`, where nothing can dial it (ADR-011's
-  appended note).
-- A persisted `NodeId → newest published_at` table outlives the record, so a
-  record older than one ever held for that id is refused whether or not that
-  record is still resident. **A mark inside the replay window is never
-  evicted**: when the table is full, a publisher it has never seen is refused
-  instead. That inversion is the decision, because identities are free — a
-  per-publisher quota does not survive an attacker rotating keypairs, and an
-  evictable table inherits the attack it was meant to stop. Test rotating
-  publishers explicitly.
-- Admission is still bounded per publisher, as fairness rather than as the
-  rollback defence: one identity must not crowd out records for peers the node
-  actually talks to.
-- Admission order is fixed and each refusal is tested: signature and NodeId
-  binding, freshness, wildcard address, high-water mark, publisher quota,
-  capacity.
-- Tests: eviction pressure followed by a replay of an evicted record is
-  refused; a store filled by one publisher still admits records from others.
-
----
-
 ### T-39 · A co-signed emergency alert does not fit BLE
 
 **Area:** `mycelium-core`, `mycelium-protocol` · **Spec:** §8.4, §9.5 ·
@@ -740,6 +700,138 @@ listed because the guarantee is worded more strongly than the code can keep.
   why it is acceptable, and ADR-015's rejection guarantee is reworded to match.
 - Tests: a third party consuming the prekey another initiator named; whichever
   rule is chosen, the genuine initiator's recovery still works.
+
+---
+
+### T-44 · A lost DHT mark deletion can outlive the run that lost it
+
+**Area:** `mycelium-core`, `mycelium-storage` · **Spec:** §8.4 · **ADR-016**
+
+A high-water mark deletion that cannot be queued — the writer's bounded queue
+full — is remembered in a bounded retry list (`MAX_PENDING_DROPS`, 4096) and
+folded into the next attempt. When that list overflows, the oldest entries are
+dropped, and the `dht_marks` rows they named are left with nothing in memory
+pointing at them: no later sweep can target them, because the marks they
+belonged to are gone from the table. They are reclaimed only by the next start,
+which reconciles the whole store against the table.
+
+Found by the Codex reviews on 2026-11-15 while implementing T-38, in two parts.
+Row by row it is narrow: rows and deletions are produced in pairs — the
+eviction's deletion is queued immediately before the new mark's write — so under
+saturation *both* are lost and the store does not grow. Growth that way needs
+the queue to reject a deletion and then accept the write issued right after it,
+repeatedly, which is not an interleaving an attacker can drive.
+
+**In bulk it is not narrow.** The retention sweep returns every expired mark at
+once, so a single failed sweep carrying more than 4096 deletions overflows the
+list in one step and discards the surplus. On a node that has tracked many
+publishers that is one bad moment rather than thousands, which is why this is
+worth its own task rather than a footnote. On a long-running daemon the growth
+is unbounded over time, and the only thing that reclaims it is a restart.
+
+The fix is reconciliation that does not need one: the writer already has both
+the store and the mark table in hand, so a `Reconcile` message it answers by
+loading the store and dropping what the table does not hold is the same work
+`restore_marks` does at startup. It needs a guard so it cannot run before
+restoration, which is the part that makes it more than a few lines.
+
+**Acceptance:**
+- Repeated retry-list overflow within one run does not grow `dht_marks` past
+  `mark_capacity`, with no restart.
+- A single sweep whose deletion batch exceeds `MAX_PENDING_DROPS` and fails is
+  covered: that is the reachable case, and the one the first analysis missed.
+- Reconciliation cannot run before the marks have been restored, and a test
+  covers that ordering — deleting rows whose marks have not been read yet would
+  discard live protection.
+- §8.4's "Known gaps" paragraph loses the sentence that points here.
+
+---
+
+### T-45 · A DHT high-water mark remembers when, not what
+
+**Area:** `mycelium-core`, `mycelium-storage` · **Spec:** §8.4 · **ADR-016**,
+**ADR-011**
+
+The rollback rule refuses a record **strictly older** than the newest ever
+admitted for that publisher. The strictness is deliberate — a node that lost a
+record to capacity eviction has to be able to re-learn the very record the mark
+was set from, and refusing an equal timestamp would make a peer's current
+address unlearnable — but it means the mark records *when*, not *what*.
+
+A publisher that signed two records with the same `published_at` and
+**different addresses** therefore has no protection between them. Once its
+record is evicted, either is admissible, and an attacker holding the other can
+install it and have lookups answer with it. The mark survives the eviction and
+does not help.
+
+Found by the ADR review on 2026-11-15 while implementing T-38. Nothing in the
+implementation signs two addresses in one second — `store_self` publishes one
+address per re-sign, every TTL/3 — so reaching it needs a publisher that
+double-signed inside a second, by restarting onto a different port within it or
+by its own choice. Narrow, and a real hole in a claim ADR-011 and ADR-016 both
+state unconditionally.
+
+**Acceptance:**
+- A mark remembers the record it was set from, not only its timestamp, and an
+  equal `published_at` is admitted only for that same record.
+- A column and a migration for it, with the `Mark` type and both `MarkStore`
+  implementations carrying it.
+- Tests: two addresses signed at one timestamp, the second refused after the
+  first's record is evicted; and the case the strictness exists for — the same
+  record re-learned after eviction — still works.
+- The residual notes in ADR-016, ADR-011 and §8.4 lose their pointers here.
+
+---
+
+### T-46 · The internet transport cannot be replaced while a node runs
+
+**Area:** `mycelium-ffi`, `mycelium-core` · **Spec:** §8.4 · **ADR-016**,
+**ADR-011**
+
+`mycelium_register_internet_transport` and
+`mycelium_register_internet_transport_configured` used to replace an already
+registered internet transport. Since T-38 they refuse with `-3` instead, and
+changing the internet transport means stopping the node and starting it again.
+
+The reason is the DHT's high-water marks. A second engine over the same
+database brings its own mark writer, and there is no ordering between two
+writers: one engine's eviction can land after the other's restoration and erase
+a mark it had just adopted, which is exactly the rollback protection the
+database exists to hold. Every invariant in ADR-016's persistence contract is a
+property of *one* writer applying writes in issue order.
+
+Four successive attempts to sequence a safe swap each uncovered the next hole,
+and the Codex reviews on 2026-11-15 found them in this order: draining before
+the stop proved nothing because the old transport was still serving; stopping
+first and draining after left the manager able to restart it; deregistering
+first fixed that but `add_transport` starts what it is given; and underneath all
+of them, **`stop()` cannot promise quiescence at all** — its connection drain is
+bounded and only warns, so a stuck handler can still be admitting records when
+`stop()` returns, whatever the mark writer reports. Refusing the replacement
+closes the class rather than narrowing it.
+
+Handle recreation is the same defect one level out: two node handles over one
+database file are two engines, `mycelium_node_new` does not refuse the second,
+and nothing could stop a second process opening the same file. Freeing a handle
+now drains the mark writer first, so the ordinary free-then-recreate sequence
+starts clean, but a drain that times out still leaves a detached writer holding
+deletions that can land after the new engine has restored them.
+
+**Acceptance:**
+- Either `stop()` reports whether every connection handler actually exited, and
+  replacement is refused unless it did — which makes the drain's outcome part
+  of the transport's contract, affecting every caller — or the engine is made
+  shareable across transport instances so no second writer exists.
+- A deletion cannot erase a row written since the sweep read it, whoever wrote
+  it: a revision column the delete must still match, rather than the watermark
+  alone, which is what makes the invariant hold across engines instead of only
+  within one. This also subsumes the equal-timestamp case in T-45, so the two
+  share a migration if they land together.
+- Registration replaces again, with a test that a replacement cannot lose a
+  mark the new engine has adopted: a stalled handler on the old transport, a
+  replacement, and a restart that still refuses the replay.
+- The notes in ADR-016, ADR-011 and §8.4 lose their pointers here, and the FFI
+  return codes are documented without `-3`.
 
 ---
 

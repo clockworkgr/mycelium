@@ -34,6 +34,7 @@ use mycelium_crypto::identity::{node_id_from_public_key, verify_signature_bytes,
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
 use super::{SendPriority, Transport, TransportError, TransportEvent, TransportType};
+use crate::dht::marks::MarkStore;
 use crate::dht::record::{DhtRecord, RECORD_TTL_SECS};
 use crate::dht::rpc::{
     deserialize_wire_message, encode_body, DhtReply, DhtRequest, DhtRequestBody,
@@ -905,12 +906,39 @@ impl InternetTransport {
     /// Takes the node's identity rather than its NodeId: the handshake has to
     /// sign with it, and deriving the id here means the two cannot disagree.
     pub fn new(identity: Arc<Identity>, config: InternetConfig) -> Self {
+        Self::with_mark_store(
+            identity,
+            config,
+            Arc::new(crate::dht::marks::MemoryMarkStore::default()),
+        )
+    }
+
+    /// Create a transport whose DHT persists its high-water marks.
+    ///
+    /// Rollback protection that lives only in memory lasts as long as the
+    /// process, and on a phone the daemon stops whenever the OS decides — so
+    /// an embedder with a database should use this (ADR-016, ROADMAP T-38).
+    /// The marks are read in [`Transport::start`] and drained in
+    /// [`Transport::stop`].
+    ///
+    /// A constructor rather than a field on `InternetConfig`, because that is
+    /// `Debug + Clone` and `dyn MarkStore` is neither. The DHT engine has the
+    /// same pair for the same reason.
+    pub fn with_mark_store(
+        identity: Arc<Identity>,
+        config: InternetConfig,
+        mark_store: Arc<dyn MarkStore>,
+    ) -> Self {
         let (event_tx, _) = broadcast::channel(256);
         let dht_config = DhtConfig {
             bootstrap_nodes: config.bootstrap_nodes.clone(),
             ..DhtConfig::default()
         };
-        let dht = Arc::new(DhtEngine::new(identity.clone(), dht_config));
+        let dht = Arc::new(DhtEngine::with_mark_store(
+            identity.clone(),
+            dht_config,
+            mark_store,
+        ));
         // Clamped to what a single `acquire_many` can ask for *and* to what
         // the semaphore accepts — `Semaphore::MAX_PERMITS` is below `u32::MAX`
         // on 32-bit targets, where a larger value would panic here. The same
@@ -1148,6 +1176,14 @@ impl Transport for InternetTransport {
         // along with the future and left the transport marked started with no
         // accept task, so every later `start()` returned `AlreadyStarted`.
 
+        // Read the persisted high-water marks *before* anything can be
+        // admitted. A record admitted ahead of restoration never faced the
+        // rollback check, and a mark restored afterwards cannot retract the
+        // address already being served (ADR-016). Nothing is listening yet —
+        // the accept loop is spawned below — so this is the only ordering
+        // that holds.
+        self.shared.dht.restore_marks().await;
+
         // Publish our own address, if it is one anyone could dial.
         if self.shared.has_publishable_address() {
             self.shared.dht.store_self(listen_addr).await;
@@ -1346,6 +1382,14 @@ impl Transport for InternetTransport {
             warn!("Internet: a connection did not release its slot within the stop timeout");
         }
         self.shared.connections.write().await.clear();
+
+        // Last, once nothing can still be admitting: drain the mark writer.
+        // It is a detached task, so a teardown that simply drops the runtime
+        // discards whatever it had not reached — losing marks with no storage
+        // error to show for it, and reopening rollback at the next start.
+        // Bounded inside `flush_marks`, so a stuck backend delays stop rather
+        // than hanging it.
+        let _ = self.shared.dht.flush_marks().await;
         info!("Internet transport stopped");
         Ok(())
     }
@@ -1432,6 +1476,72 @@ mod tests {
             bootstrap_nodes: Vec::new(),
             max_connections: 64,
         }
+    }
+
+    /// `start()` must read the marks before anything can be admitted, and
+    /// `stop()` must drain the writer before the runtime goes.
+    ///
+    /// Without the `stop()` flush the writer is a detached task and an orderly
+    /// teardown discards whatever it had not reached — marks lost with no
+    /// storage error to show for it. Without the `start()` restore the whole
+    /// durable table is inert: the protection exists in the database and the
+    /// engine never looks at it.
+    #[tokio::test]
+    async fn test_the_transport_reads_the_marks_on_start_and_drains_them_on_stop() {
+        use crate::dht::marks::{Mark, MarkStore, MemoryMarkStore};
+        use crate::dht::RecordSource;
+
+        let marks = Arc::new(MemoryMarkStore::default());
+        let known = Identity::generate();
+        let at = crate::dht::record::unix_now();
+        marks
+            .put(
+                known.node_id(),
+                Mark {
+                    newest_published_at: at,
+                    first_seen: at,
+                    last_refreshed: at,
+                    established: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let t = InternetTransport::with_mark_store(
+            Arc::new(Identity::generate()),
+            config_on(free_port().await),
+            marks.clone(),
+        );
+        t.start().await.expect("start");
+
+        // Start read the table: the engine knows a publisher it never saw.
+        assert_eq!(
+            t.dht().newest_mark_for(&known.node_id()).await,
+            Some(at),
+            "start() must restore the persisted marks"
+        );
+
+        // A record admitted during the run, whose mark only reaches the store
+        // if the writer is drained.
+        let fresh = Identity::generate();
+        t.dht()
+            .store_record(
+                DhtRecord::new_signed(&fresh, "198.51.100.9:9736".parse().unwrap(), at),
+                RecordSource::Peer(NodeId([0x11; 32])),
+            )
+            .await
+            .expect("admit");
+
+        t.stop().await.expect("stop");
+        assert!(
+            marks
+                .load()
+                .await
+                .expect("load")
+                .iter()
+                .any(|(id, _)| *id == fresh.node_id()),
+            "stop() must drain the mark writer"
+        );
     }
 
     fn transport(port: u16) -> (Arc<Identity>, InternetTransport) {

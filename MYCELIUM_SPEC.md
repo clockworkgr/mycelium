@@ -1169,14 +1169,72 @@ lost the tie-break never rewrites the contact of the one that was kept.
 **DHT records are signed.** A record is a node's claim about its own address —
 `public_key(32) ‖ addr ‖ published_at(8) ‖ signature(64)`, signed over
 `b"mycelium-dht-record-v1:" ‖ public_key ‖ addr ‖ published_at` and keyed under
-`SHA-256(public_key)`. A record is refused if the signature fails, if it is
-dated more than 300 s ahead, if it is older than the 3600 s TTL, if it is no
-newer than one already held (so a replayed older record cannot roll an address
-back *while that record is held* — see ROADMAP T-38, since capacity eviction
-discards what the rule compares against), or if the store is full. The store is
-capped at 4096 records, swept of expired entries before each insert, and evicts
-the entry closest to expiry when at capacity. A record found over the network is subjected to the same checks
-and returned only if they pass. A DHT request carries no sender identity: the
+`SHA-256(public_key)`. A record is refused, in order, if the signature fails or
+the NodeId does not bind to the key; if it is dated more than 300 s ahead; if it
+is older than the 3600 s TTL; if its address is a wildcard (`0.0.0.0` or `::`),
+which nothing could dial; if it is no newer than one already held; if it is
+older than the newest ever admitted for that publisher; if the peer that
+delivered it already holds its share of the store; and finally if the store is
+full. Each refusal has its own reason and its own test. The store is capped at
+4096 records, swept of expired entries before each insert, and evicts the entry
+closest to expiry when at capacity. A record found over the network is subjected
+to the same checks and returned only if they pass.
+
+**A replayed older record cannot roll an address back, and that no longer
+depends on still holding the newer one (ADR-016).** The node keeps a persisted
+`node_id → newest published_at` **high-water mark** per publisher, in the
+`dht_marks` table (§15), which outlives both the record's eviction and the
+process. The table holds 8192 marks in two regions: *established* publishers,
+seen continuously for a full replay window (TTL + a 86 400 s clock-regression
+grace, so 25 h), which are never evicted inside that window and are dropped only
+by the retention sweep; and *probationary* ones, evicted
+least-recently-refreshed first, of which a full table always holds at least 512
+because establishment is capped at the remaining 7680 — a floor for newcomers to
+evict, not a ceiling. The reserve is what
+guarantees a publisher the node has never seen is always admitted rather than
+refused when the table is full — an attacker minting identities churns only that
+slice. **The cost of that reserve: a probationary mark can be evicted inside the
+replay window, so rollback protection is unconditional for established
+publishers and lasts only as long as a probationary slot for publishers seen
+recently and briefly.** A record admitted raises its mark; a mark is never
+lowered in memory, and never un-established. Persisting an update is best
+effort: a write is lost if the writer's queue is full, if the backend refuses
+it, or if the process ends without an orderly stop — the last being the ordinary
+case on a phone. So the watermark restored after a restart is the last one that
+reached storage, and a replay dated between that and the value the previous run
+held is accepted until the publisher's next record, within one TTL, carries it
+forward. Deletions are retried instead, because a lost deletion leaves a row
+nothing in memory points at. The two regions also assume a fixed configuration:
+shrinking the table between runs demotes or discards established marks that no
+longer fit, inside the replay window.
+
+Marks are written through a single writer task rather than on the admission
+path, because admission holds a lock and a caller can be cancelled: each
+durable write is conditional on the stored row rather than a delta — a write
+states the publisher's whole mark unless the stored watermark is newer, and a
+deletion applies only while the stored mark is no newer than the one the sweep
+saw — so neither cancellation nor reordering can lower a watermark. A deletion
+is never applied to an id the table still holds, decided when the delete runs
+rather than when it was queued. Writing the whole mark rather than merging
+fields is what lets retention end a publisher's lifetime (otherwise it banks
+establishment across a silence longer than the replay window) and lets
+restoration withdraw establishment it had to demote.
+
+Those guarantees belong to the engine's single writer, which applies writes in
+the order they were issued, so **one mark store serves one engine**: a node
+builds one, and the FFI refuses to register a second internet transport rather
+than replace the first, because a replacement cannot be made safe without the
+old engine being provably quiet and `stop()` does not give that (ROADMAP T-46). The marks are read
+once before anything is admitted, and admission itself reads them if nothing
+has — dialling does not require starting the transport. An unreadable mark store
+refuses admission rather than being treated as an empty one.
+
+**A single delivering peer may occupy at most 256 of the 4096 record slots.**
+The principal is the peer the channel handshake authenticated, not the record's
+signer — the store already holds at most one record per signer, so a signer
+quota would be vacuous, and identities are free, so this is fairness rather than
+the rollback defence. A replacement from the same peer is exempt; one from a
+different peer is not. A DHT request carries no sender identity: the
 sender is whoever holds that channel's key, and in-flight requests are tracked
 per connection so no peer can answer another's. A node offers its own record to
 every peer it authenticates, and re-signs and re-offers it every TTL/3.
@@ -1193,7 +1251,12 @@ concurrent lookup looks like.
 
 **Known gaps:** a node listening on a wildcard address (the `0.0.0.0` default)
 neither stores nor publishes a record, because signing `0.0.0.0` would be valid
-and useless — external address discovery is ROADMAP T-31. Nothing prunes a DHT
+and useless — external address discovery is ROADMAP T-31. A mark deletion that
+cannot be queued is retried through a bounded list, and when that list overflows
+the rows it was holding survive until the next start reconciles them
+(ROADMAP T-44). A high-water mark records when, not what, so a publisher that
+signed two addresses with the same `published_at` has no protection between them
+once its record is evicted (ROADMAP T-45). Nothing prunes a DHT
 contact whose peer is gone for good, so a k-bucket can fill with dead entries
 (ROADMAP T-32). Resolution is available but not automatic: `resolve()` will
 find a peer's address through the DHT, and no send path calls it, so a send to
@@ -1881,7 +1944,7 @@ A wrong key yields `StorageError::WrongKey`. The build uses the
 `bundled-sqlcipher-vendored-openssl` feature so OpenSSL is vendored for
 cross-compilation.
 
-### Schema — 12 tables
+### Schema — 13 tables
 
 | Table | Key | Purpose |
 |-------|-----|---------|
@@ -1897,6 +1960,7 @@ cross-compilation.
 | `channel_messages` | `message_id` | Channel message store |
 | `channel_subscriptions` | `channel_id` | Subscription state |
 | `config` | `key` | Key-value store: prekey state, group blobs |
+| `dht_marks` | `node_id` | Newest DHT record ever admitted per publisher (ADR-016) |
 
 Design choices: all writes are `INSERT OR REPLACE` (idempotent upserts); status
 is `TEXT` for extensibility; group and prekey state are opaque blobs (groups
@@ -2228,6 +2292,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 8.1 | BT Classic | **Implemented, untested** | Rust + Kotlin SPP + Dart bridge; no hardware test (T-15) |
 | 8.1 | LoRa | **Implemented, untested** | Fragmentation, ADR, duty cycle, broadcast beacons (ADR-008); no hardware test (T-15) |
 | 8.1 | Internet tunnel | **Implemented** | Keyed mutually authenticated channel with per-frame AEAD, binary framing, enforced connection cap, signed and expiring DHT records, bounded iterative lookup (ADR-011) |
+| 8.4 | DHT rollback protection | **Implemented** | Persisted per-publisher high-water marks that outlive record eviction and the process, wildcard refusal in common admission, per-peer record share (ADR-016). Probationary marks are evicted inside the replay window — see §8.4 |
 | 8.2 | Transport handoff | **Partial** | First-available selection; no session migration (T-03) |
 | 8.5 | Plugin API | **Implemented** | Trait, registry, config, distinct `TransportType` per adapter. Nothing instantiates plugins (T-13) |
 | 8.6 | iOS strategy | **Implemented** | Dual-role CoreBluetooth, background restoration, LoRa bridge |

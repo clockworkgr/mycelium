@@ -554,3 +554,78 @@ in common admission, and is recorded as an acceptance bullet on T-38 with the
 rest of the admission work.
 
 Appended rather than edited in place, because these records are append-only.
+
+## Note (2026-11-15)
+
+The two claims the 2026-11-12 note qualified are now implemented, as ROADMAP
+T-38. Both hold in `store_record` rather than only in the publish path or only
+while a record happens to be resident — with one exception on the first, stated
+below because the unqualified sentence is what a reader would otherwise rely on.
+
+**"A record no newer than the one held is refused" no longer depends on holding
+it.** A persisted `NodeId → newest published_at` mark outlives the record it
+guards, so a record older than one ever admitted for that id is refused whether
+or not that record is still resident, and across a restart. The eviction policy
+described above is unchanged — at `max_records` the entry closest to expiring is
+still evicted rather than the newcomer refused — but what eviction throws away
+is now only the record, not the memory of it.
+
+**The exception: a mark that has not yet graduated can still be evicted inside
+the replay window.** ADR-016 bounds the mark table with a region reserved for
+publishers it has never seen, so a new publisher is always admitted rather than
+refused when the table is full — and that reserve is the same region a new
+publisher's own mark lives in. Enough first-seen publishers therefore evict it,
+and the replay then lands. The protection is unconditional for *established*
+publishers, those seen continuously for a full replay window; for a publisher
+seen recently and briefly it lasts only as long as its probationary slot.
+ADR-016's 2026-11-15 note has the regions, the figures and the second residual.
+
+**Durability of a mark update is best effort, so "across a restart" has a
+caveat.** The watermark restored after a restart is the last one that reached
+storage, which can be lower than the one the previous run held; a replay dated
+between the two is accepted until the publisher's next record carries it forward,
+within one TTL. Three things lose a write: a full writer queue, a backend that
+refuses it, and a process that ends without an orderly stop — the last being the
+ordinary case on a phone, where the OS kills the app and `stop()`'s drain never
+runs. ADR-016's 2026-11-15 note has all three and the deliberate asymmetry with
+deletions, which *are* retried.
+
+**"Never evicted inside the replay window" also assumes a fixed
+configuration.** Lowering the mark table's capacity, or raising its first-seen
+reserve, between runs demotes or discards established marks that no longer fit —
+inside the window. Tuning those figures downward on a constrained device
+forfeits protection for whatever no longer fits.
+
+**An equal timestamp does not distinguish addresses.** The rollback rule
+refuses a record strictly older than the newest ever admitted, because a node
+that lost a record to eviction has to be able to re-learn the very record the
+mark was set from. So a publisher that signed two records with the same
+`published_at` and different addresses has no protection between them: once the
+record is evicted, either is admissible. This transport never signs two
+addresses in one second, so reaching it needs a publisher that double-signed
+within a second. ADR-016's 2026-11-15 note has the fix it would take
+(a record digest beside the watermark) and the task, ROADMAP T-45.
+
+**A wildcard record is now refused in common admission.** `0.0.0.0` and `::`
+are rejected by `store_record`, so a peer's correctly signed wildcard record is
+no longer admitted and served to `FindValue` where nothing can dial it. The
+publish path still declines to sign one; the check now exists in both places,
+with a test on each.
+
+**The per-publisher quota exists, as fairness rather than as the rollback
+defence.** This note said a quota "is explicitly *not* the defence", and that
+stands — identities are free, so rotation defeats it. It survives because one
+peer should not be able to crowd out the records of peers a node actually talks
+to. Its principal is the peer the handshake above authenticated: the delivering
+peer, which this transport already has in `PeerInfo` and now passes down. That
+is the identity ADR-016's note said `store_record` lacked — it existed here all
+along and was simply not forwarded.
+
+Two consequences for this transport's lifecycle: `start()` reads the persisted
+marks before it publishes our own record or accepts a connection, and `stop()`
+drains the mark writer after the connection drain, because the writer is a
+detached task and a teardown that dropped the runtime would discard marks with
+no storage error to show for it. Admission also restores the marks itself if
+nobody has, since `connect_to` does not require `start()`.
+
+Appended rather than edited in place, because these records are append-only.

@@ -19,6 +19,7 @@ use mycelium_core::transport::internet::{InternetConfig, InternetTransport};
 use mycelium_core::transport::Transport;
 use mycelium_crypto::identity::Identity;
 use mycelium_node::config::NodeConfig;
+use mycelium_node::dht_marks::DbMarkStore;
 use mycelium_node::node::Node;
 use mycelium_protocol::types::{ContentType, NodeId};
 use mycelium_storage::db::Database;
@@ -395,11 +396,30 @@ pub unsafe extern "C" fn mycelium_node_id(handle: *const MyceliumNode, out: *mut
 
 /// Free the node handle.
 ///
+/// Drains the DHT mark writer first. The writer is a detached task owned by the
+/// engine, and dropping the handle used to abandon whatever it had not reached:
+/// high-water marks lost with no storage error to show for it, and worse, a
+/// task still holding queued deletions that could apply *after* a new handle
+/// over the same database had restored those marks — erasing rollback
+/// protection the new engine believed it had (ADR-016).
+///
+/// Bounded by the flush's own timeout, so a stuck backend delays this by
+/// seconds rather than hanging it. A flush that times out leaves the hazard
+/// open, which is ROADMAP T-46: nothing here can enforce that one engine owns
+/// a database, and `mycelium_node_new` does not refuse a second handle.
+///
 /// # Safety
 /// `handle` must be a valid pointer from `mycelium_node_new`, called exactly once.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_node_free(handle: *mut MyceliumNode) {
     if !handle.is_null() {
+        let mycelium = &*handle;
+        runtime().block_on(async {
+            let internet = mycelium.node.internet_transport.read().await.clone();
+            if let Some(internet) = internet {
+                internet.dht().flush_marks().await;
+            }
+        });
         ACTIVE_NODE.store(std::ptr::null_mut(), Ordering::Release);
         drop(Box::from_raw(handle));
     }
@@ -2203,7 +2223,11 @@ pub unsafe extern "C" fn mycelium_bt_classic_dequeue_send(
 
 /// Register the Internet (TCP) transport with default settings (port 9736).
 ///
-/// Returns 0 on success, -1 on null handle.
+/// Returns 0 on success, -1 on null handle, or -3 if an internet transport is
+/// already registered — it is left running and untouched. Changing the
+/// internet transport means stopping the node and starting it again: a second
+/// DHT engine over the same database would have its own mark writer, with no
+/// ordering against the first's (ROADMAP T-46).
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
@@ -2214,24 +2238,79 @@ pub unsafe extern "C" fn mycelium_register_internet_transport(handle: *mut Mycel
     }
 
     let node = &(*handle).node;
-    let internet = Arc::new(InternetTransport::new(
+    // The same durable marks the node's own registration uses. An
+    // FFI-registered transport that quietly fell back to in-memory marks
+    // would lose rollback protection on exactly the platform where restarts
+    // are most frequent (ADR-016, T-38).
+    let internet = Arc::new(InternetTransport::with_mark_store(
         node.identity_handle(),
         InternetConfig::default(),
+        Arc::new(DbMarkStore::new(node.db.clone())),
     ));
     runtime().block_on(async {
+        // Settle whatever was registered before, rather than dropping it.
+        //
+        // Two DHT engines over one database have two independent mark-writer
+        // tasks and no ordering between them, so the old engine's pending
+        // eviction can land after the new engine has restored and erase a mark
+        // it had just adopted. A *confirmed* drain of the old writer is the
+        // only thing that establishes an order between the two.
+        //
+        // Stop first, then confirm. Draining before the stop proved nothing:
+        // the old transport was still serving, so it could queue more writes
+        // in the gap, and `stop()`'s own flush only warns. Stopping quiesces
+        // admission — no accept loop, no connections — and the drain after it
+        // is therefore final.
+        //
+        // If it still will not drain, the old transport is restarted and the
+        // replacement refused, because the alternatives are both worse:
+        // installing the new engine risks the silent loss of the protection
+        // this database exists to hold, and leaving the old one stopped would
+        // hand back no transport at all.
+        // The write guard is held across the whole swap, which is what makes
+        // it exclusive: it is the lock every path that reaches the internet
+        // transport takes, so nothing can dial or reuse the old transport
+        // between the stop and the swap, and two concurrent registrations
+        // cannot both get as far as installing an engine over this database.
+        // Refused rather than replaced, when one is already registered.
+        //
+        // A second DHT engine over this node's database brings its own mark
+        // writer, and there is no ordering between two writers: one engine's
+        // eviction can land after the other's restoration and erase a mark it
+        // had just adopted, which is the rollback protection the database
+        // exists to hold (ADR-016).
+        //
+        // Making a swap safe needs the old engine to be provably quiet, and
+        // `stop()` cannot give that. Its connection drain is bounded and only
+        // warns, so a stuck handler can still be alive — and still admitting
+        // records — when `stop()` returns, whatever the mark writer says about
+        // having caught up. Four successive attempts at sequencing this each
+        // uncovered the next hole; not creating the second engine closes the
+        // class instead. Doing it properly is ROADMAP T-46.
+        //
+        // The slot lock is held across the check and the install, so two
+        // concurrent registrations cannot both get past it.
+        let mut slot = node.internet_transport.write().await;
+        if slot.is_some() {
+            return -3;
+        }
         node.transport_manager
             .replace_transport(internet.clone())
             .await;
-        *node.internet_transport.write().await = Some(internet);
-    });
-    0
+        *slot = Some(internet);
+        0
+    })
 }
 
 /// Register the Internet (TCP) transport with custom port and bootstrap nodes.
 ///
 /// `bootstrap_csv` is a comma-separated list of "ip:port" entries (or NULL for none).
 ///
-/// Returns 0 on success, -1 on null handle, -2 on invalid port.
+/// Returns 0 on success, -1 on null handle, -2 on invalid port, or -3 if an
+/// internet transport is already registered — it is left running and
+/// untouched. Changing the internet transport means stopping the node and
+/// starting it again: a second DHT engine over the same database would have
+/// its own mark writer, with no ordering against the first's (ROADMAP T-46).
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
@@ -2265,14 +2344,64 @@ pub unsafe extern "C" fn mycelium_register_internet_transport_configured(
     };
 
     let node = &(*handle).node;
-    let internet = Arc::new(InternetTransport::new(node.identity_handle(), config));
+    let internet = Arc::new(InternetTransport::with_mark_store(
+        node.identity_handle(),
+        config,
+        Arc::new(DbMarkStore::new(node.db.clone())),
+    ));
     runtime().block_on(async {
+        // Settle whatever was registered before, rather than dropping it.
+        //
+        // Two DHT engines over one database have two independent mark-writer
+        // tasks and no ordering between them, so the old engine's pending
+        // eviction can land after the new engine has restored and erase a mark
+        // it had just adopted. A *confirmed* drain of the old writer is the
+        // only thing that establishes an order between the two.
+        //
+        // Stop first, then confirm. Draining before the stop proved nothing:
+        // the old transport was still serving, so it could queue more writes
+        // in the gap, and `stop()`'s own flush only warns. Stopping quiesces
+        // admission — no accept loop, no connections — and the drain after it
+        // is therefore final.
+        //
+        // If it still will not drain, the old transport is restarted and the
+        // replacement refused, because the alternatives are both worse:
+        // installing the new engine risks the silent loss of the protection
+        // this database exists to hold, and leaving the old one stopped would
+        // hand back no transport at all.
+        // The write guard is held across the whole swap, which is what makes
+        // it exclusive: it is the lock every path that reaches the internet
+        // transport takes, so nothing can dial or reuse the old transport
+        // between the stop and the swap, and two concurrent registrations
+        // cannot both get as far as installing an engine over this database.
+        // Refused rather than replaced, when one is already registered.
+        //
+        // A second DHT engine over this node's database brings its own mark
+        // writer, and there is no ordering between two writers: one engine's
+        // eviction can land after the other's restoration and erase a mark it
+        // had just adopted, which is the rollback protection the database
+        // exists to hold (ADR-016).
+        //
+        // Making a swap safe needs the old engine to be provably quiet, and
+        // `stop()` cannot give that. Its connection drain is bounded and only
+        // warns, so a stuck handler can still be alive — and still admitting
+        // records — when `stop()` returns, whatever the mark writer says about
+        // having caught up. Four successive attempts at sequencing this each
+        // uncovered the next hole; not creating the second engine closes the
+        // class instead. Doing it properly is ROADMAP T-46.
+        //
+        // The slot lock is held across the check and the install, so two
+        // concurrent registrations cannot both get past it.
+        let mut slot = node.internet_transport.write().await;
+        if slot.is_some() {
+            return -3;
+        }
         node.transport_manager
             .replace_transport(internet.clone())
             .await;
-        *node.internet_transport.write().await = Some(internet);
-    });
-    0
+        *slot = Some(internet);
+        0
+    })
 }
 
 /// Connect to a peer at the given "ip:port" address via the Internet transport.

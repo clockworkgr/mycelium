@@ -51,6 +51,23 @@ pub enum RecordRejection {
     /// The store is at capacity and nothing could be evicted for this record.
     #[error("record store is full")]
     StoreFull,
+    /// The record names a wildcard address, which nothing can dial.
+    #[error("record names an unspecified address")]
+    WildcardAddress,
+    /// Older than a record we have previously held for this id, whether or not
+    /// we still hold one. Distinct from [`RecordRejection::Stale`], which means
+    /// a *resident* record is at least as new: this one is the rollback the
+    /// high-water marks exist to catch, and it says the attempt survived
+    /// eviction (ADR-016).
+    #[error("record is older than one previously held for this node")]
+    RolledBack,
+    /// The peer that delivered this record already occupies its share of the
+    /// store. Fairness rather than a defence against rollback — identities are
+    /// free, so a bound per publisher cannot survive rotation (ADR-016).
+    #[error("the persisted high-water marks could not be read")]
+    MarksUnavailable,
+    #[error("the delivering peer holds its share of the record store")]
+    PublisherQuota,
 }
 
 /// A signed claim by a node about its own address.
@@ -114,6 +131,20 @@ impl DhtRecord {
     /// Whether the record has outlived `ttl_secs` as of `now`.
     pub fn is_expired(&self, now: u64, ttl_secs: u64) -> bool {
         self.published_at.saturating_add(ttl_secs) <= now
+    }
+
+    /// Whether the record names an address nothing can dial — `0.0.0.0` or
+    /// `::`.
+    ///
+    /// A node binding a wildcard listen address does not know its own
+    /// reachable address, and the internet transport declines to sign a record
+    /// for one. That check protects only us: a *peer's* correctly signed
+    /// wildcard record is still a valid record, and admitting it takes a slot
+    /// and answers a `FindValue` with an address the caller cannot use
+    /// (ADR-011's appended note, ADR-016). `is_unspecified` is the same test
+    /// the publish path uses, so both families are covered by one rule.
+    pub fn is_wildcard_addr(&self) -> bool {
+        self.addr.ip().is_unspecified()
     }
 }
 

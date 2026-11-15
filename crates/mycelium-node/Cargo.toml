@@ -10,6 +10,7 @@ mycelium-crypto = { workspace = true }
 zeroize = { workspace = true }
 mycelium-protocol = { workspace = true }
 mycelium-storage = { workspace = true }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

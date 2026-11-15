@@ -1168,13 +1168,17 @@ impl Node {
                 .iter()
                 .filter_map(|s| s.parse().ok())
                 .collect();
-            let internet = Arc::new(InternetTransport::new(
+            // The DHT's high-water marks go in this node's own database, so
+            // rollback protection survives a restart rather than lasting only
+            // as long as the process (ADR-016, T-38).
+            let internet = Arc::new(InternetTransport::with_mark_store(
                 self.identity_handle(),
                 InternetConfig {
                     listen_addr: format!("0.0.0.0:{}", inet_cfg.listen_port).parse().unwrap(),
                     bootstrap_nodes: bootstrap,
                     max_connections: inet_cfg.max_connections,
                 },
+                Arc::new(crate::dht_marks::DbMarkStore::new(self.db.clone())),
             ));
             self.transport_manager.add_transport(internet.clone()).await;
             *self.internet_transport.write().await = Some(internet);

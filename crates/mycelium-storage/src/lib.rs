@@ -1,6 +1,7 @@
 pub mod channels;
 pub mod contacts;
 pub mod db;
+pub mod dht_marks;
 pub mod dtn;
 pub mod groups;
 pub mod messages;

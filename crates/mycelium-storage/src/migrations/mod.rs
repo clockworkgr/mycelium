@@ -29,6 +29,39 @@ pub fn run_all(conn: &Connection) -> Result<(), StorageError> {
     if current_version < 3 {
         migrate_v3(conn)?;
     }
+    if current_version < 4 {
+        migrate_v4(conn)?;
+    }
+
+    Ok(())
+}
+
+/// v4: remember the newest record ever admitted for each DHT publisher.
+///
+/// ADR-011's rule that a replayed older record cannot roll an address back
+/// depends on *holding* the newer record, and capacity eviction throws it
+/// away. A mark outlives the record it guards, which is what makes the rule
+/// unconditional — and it has to outlive the process too, because on a phone
+/// the daemon stops whenever the OS decides, so in-memory marks would rarely
+/// be more than a few hours old (ADR-016, ROADMAP T-38).
+///
+/// No index beyond the primary key: every access is by `node_id`, or a full
+/// scan at startup.
+fn migrate_v4(conn: &Connection) -> Result<(), StorageError> {
+    conn.execute_batch(
+        "
+        BEGIN;
+        CREATE TABLE IF NOT EXISTS dht_marks (
+            node_id             BLOB PRIMARY KEY,
+            newest_published_at INTEGER NOT NULL,
+            first_seen          INTEGER NOT NULL,
+            last_refreshed      INTEGER NOT NULL,
+            established         INTEGER NOT NULL DEFAULT 0
+        );
+        INSERT INTO schema_version (version) VALUES (4);
+        COMMIT;
+        ",
+    )?;
 
     Ok(())
 }
