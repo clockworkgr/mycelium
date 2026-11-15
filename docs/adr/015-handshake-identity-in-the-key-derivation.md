@@ -331,3 +331,54 @@ adversarial, since the same cached bundle goes to many initiators. So the claim
 "a forged or provoked `SessionReject` changes nothing" holds for a forged one
 and for a replay, and not for this: it provokes a true refusal. **ROADMAP
 T-43.**
+
+## Note (2026-11-15)
+
+A review of the landed change against this record found two ways the two
+answered-handshake stores could disagree. Both are durability, not derivation,
+and both are fixed; the record is appended rather than rewritten.
+
+**The teardown is one transaction, because the retry is not guaranteed.** The
+note above has the sweep committing every durable write before anything is
+forgotten in memory, so that a failure leaves the handshake stale and the next
+tick retries. Ordering was necessary and not sufficient. As three independent
+writes, a failure part-way through had already deleted the session row while the
+live session stayed in memory — and the retry it was counting on could be
+cancelled outright by a single follow-up receipt, because acknowledging a
+handshake removes it from `stale_handshakes` for good. The result was a working
+session with no row to reload. `abandon_unconfirmed_handshake` now does the
+session delete, the bundle eviction and the status writes in one SQLCipher
+transaction, so "the next tick retries" is true rather than merely intended.
+
+**The two answered-handshake stores can still diverge across a restart, and
+reconciling them from the session rows would be worse.** Keeping both markers —
+rather than clearing one on promotion — was chosen to avoid an ordering hazard
+across two stores. It leaves a different one: they are separate rows, written
+separately, so a failed prekey-blob write leaves the marker on the session
+alone, and a session holds exactly one slot, so the next handshake with that
+peer overwrites it. The ADR-007 tie-break winner is worse off still: it records
+the loser's init in the durable record *only*, because the session it keeps has
+no marker of its own, so a lost write there loses the marker with nothing to
+repair it from. In memory both survive — `needs_persist` stays set and any later
+successful write commits them — so a restart is required for either to bite.
+
+Re-asserting every loaded session's `accepted_binding` at startup was
+implemented and then **withdrawn**, because it trades a narrow durability hole
+for a cheaper attack on the same guarantee. The two records have deliberately
+different shapes: the session's single slot can cover the message-less init
+precisely because a forgery cannot grow it, while `answered_handshakes` is
+bounded and shared and is therefore written only where the AEAD has verified.
+A session built from a message-less init authenticates nothing, so promoting
+every loaded session's marker would let an attacker — identities are free, and
+the message-less form needs no key of ours — stand up more sessions than the
+bound and evict the authenticated markers out of it on the next restart. That
+is a worse failure than the one it repairs, and it would have been introduced by
+the fix rather than found in the design.
+
+What a sound version needs is authentication evidence stored *with* the marker,
+so only markers whose peer has authenticated are reconciled. The session's
+ratchet does not supply it: `recv_count` resets on every DH step, so "has ever
+decrypted" is not recoverable from it. That means a trailing field on the
+serialized session, or the session row and the prekey blob written in one
+transaction — which the in-memory records of **T-41** have to settle anyway.
+Folded into that task rather than guessed at here.

@@ -567,11 +567,19 @@ default: a reply still queued under a longer window arrives for a session they
 have dropped. Carrying the window on the wire is capability negotiation
 (ROADMAP T-20).
 
-The teardown commits in storage before anything is forgotten in memory. A
-failed write would otherwise leave durable state — a session row that reloads
-unreachable, a cached bundle the next send initiates from, a message still
-claiming "sent" — with no handshake left to retry the cleanup; a failure instead
-leaves the handshake in place, still stale, and the next tick retries.
+The teardown commits in storage before anything is forgotten in memory, and
+it commits as **one transaction**. A failed write would otherwise leave durable
+state — a session row that reloads unreachable, a cached bundle the next send
+initiates from, a message still claiming "sent" — with no handshake left to
+retry the cleanup; a failure instead leaves the handshake in place, still stale,
+and the next tick retries.
+
+Ordering alone was not enough, because the retry is not guaranteed to come. As
+three independent writes, a failure part-way through had already deleted the
+session row while the live session stayed in memory, and a single follow-up
+receipt could then acknowledge that handshake — which takes it out of the sweep
+for good, by the rule below — leaving a working session with no row to reload.
+All or nothing is what makes "the next tick retries" true.
 
 **A handshake the peer has acknowledged is kept.** "Unconfirmed" means nothing
 of the peer's has arrived for us to decrypt, which is not the same as the peer
@@ -601,6 +609,20 @@ peer cannot forge is ROADMAP T-42.
 
 The handshake record is in memory only, so a restart loses it and neither the
 sweep nor a late rejection can fire — ROADMAP T-41.
+
+**The two answered-handshake records can also diverge across a restart**, and
+for the same reason: they are separate rows, written separately. A lost
+prekey-blob write leaves the marker on the session alone, where the next
+handshake with that peer overwrites its single slot; and the ADR-007 tie-break
+winner, which records the loser's init in the durable record *only* — the
+session it keeps has none of its own — loses that marker outright. In memory
+both are retried on the next successful write, so a restart is required for
+either to bite. Reconciling them at startup from the session rows is **not**
+sound: a session built from a message-less init authenticates nothing, so
+re-asserting every loaded session's marker would let forged inits across free
+identities evict the authenticated markers out of the bounded record. Closing
+this needs authentication evidence stored with the marker, or the session row
+and the prekey blob written in one transaction — ROADMAP T-41.
 
 Accepting an authenticated `SessionInit` clears any unconfirmed handshake of
 our own that it supersedes, and reports the messages sent *after* that init as

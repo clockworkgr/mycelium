@@ -759,23 +759,32 @@ impl Node {
                                 // place keeps it stale, so the next tick
                                 // retries.
                                 // *All* of it commits before anything is
-                                // forgotten. The handshake is what makes this
-                                // peer a candidate again, so while it is still
-                                // here a failed write is simply retried on the
-                                // next tick; once it is gone, a failure leaves
-                                // durable state with nothing left to clean it
-                                // up — a session row that reloads unreachable,
-                                // a dead bundle the next send initiates from,
-                                // or a message still claiming "sent".
+                                // forgotten, and it commits as one
+                                // transaction. The handshake is what makes
+                                // this peer a candidate again, so while it is
+                                // still here a failed write is simply retried
+                                // on the next tick; once it is gone, a failure
+                                // leaves durable state with nothing left to
+                                // clean it up — a session row that reloads
+                                // unreachable, a dead bundle the next send
+                                // initiates from, or a message still claiming
+                                // "sent".
+                                //
+                                // Ordering alone was not enough: as three
+                                // independent writes, a failure part-way
+                                // through had already deleted the session row
+                                // while the live session stayed in memory, and
+                                // the retry this `continue` arranges could be
+                                // cancelled by a single follow-up receipt —
+                                // acknowledging the handshake takes it out of
+                                // `stale_handshakes` for good, leaving a
+                                // working session with no row to reload (T-41).
                                 //
                                 // The bundle goes from storage as well as
                                 // memory, or a restart reloads it and undoes
                                 // the recovery.
-                                let committed = db_m.delete_session(&peer).is_ok()
-                                    && db_m.remove_cached_prekey_bundle(peer.as_bytes()).is_ok()
-                                    && sent
-                                        .iter()
-                                        .all(|id| db_m.mark_message_failed(id).is_ok());
+                                let committed =
+                                    db_m.abandon_unconfirmed_handshake(&peer, &sent).is_ok();
                                 if !committed {
                                     debug!(
                                         "Keeping the unconfirmed handshake with {}: its \

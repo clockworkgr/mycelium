@@ -14,7 +14,7 @@ authentication:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **493 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **495 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -632,6 +632,31 @@ read, for ever.
 Narrow but permanent, and it predates the sweep rather than being caused by it:
 before T-35 the restart lost the same record and with it the only thing that
 made a rejection actionable.
+
+The **answered**-handshake records have a restart problem of their own, found
+reviewing this work on 2026-11-15 and added to this task because the fix is the
+same fix. They live in two separately written rows, so a lost prekey-blob write
+leaves a marker on the session's single slot, which the next handshake with that
+peer overwrites; and the ADR-007 tie-break winner records the loser's init in
+the durable record *only*, so a lost write there leaves nothing to repair it
+from. Both are retried in memory and need a restart to bite.
+
+Reconciling from the session rows at startup was implemented and withdrawn: a
+session built from a message-less init authenticates nothing, so re-asserting
+every loaded marker lets forged inits across free identities evict the
+authenticated markers out of the bounded record — a cheaper attack than the one
+it closes (ADR-015, note of 2026-11-15).
+
+**Additional acceptance, from that:**
+- Authentication evidence is stored with the marker, so only an authenticated
+  one is ever reconciled — or the session row and the prekey blob commit in one
+  transaction, which this task's own persistence work may give for free.
+  `RatchetState::recv_count` is not usable as the evidence: it resets on every
+  DH ratchet step.
+- The tie-break winner's record of the loser's init survives a restart.
+- Tests: a message-less init cannot displace an authenticated marker across a
+  restart; a failed blob write on the tie-break path, followed by a restart,
+  still refuses the discarded init.
 
 **Acceptance:**
 - The unconfirmed-handshake record — transcript, the message ids sent under it,
