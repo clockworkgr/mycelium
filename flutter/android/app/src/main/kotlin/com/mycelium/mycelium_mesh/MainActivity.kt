@@ -54,38 +54,32 @@ class MainActivity : FlutterActivity() {
         }
 
         // --- BLE transport channels ---
+        // Links, not peers: this layer relays frames and the Rust side
+        // settles who is on the other end (ADR-021, T-34).
         bleService = BleService(this)
         bleService?.listener = object : BleService.EventListener {
-            override fun onPeerDiscovered(peerId: ByteArray) {
-                Log.i("MyceliumBLE", "EventListener.onPeerDiscovered, eventSink=${eventSink != null}")
+            override fun onLinkUp(linkId: String) {
                 handler.post {
                     val sink = eventSink
                     if (sink == null) {
-                        Log.w("MyceliumBLE", "eventSink is null, cannot send peerDiscovered")
+                        Log.w("MyceliumBLE", "eventSink is null, cannot send linkUp")
                     } else {
-                        Log.d("MyceliumBLE", "Sending peerDiscovered event to Dart")
-                        sink.success(mapOf(
-                            "type" to "peerDiscovered",
-                            "peerId" to peerId.toList()
-                        ))
+                        sink.success(mapOf("type" to "linkUp", "linkId" to linkId))
                     }
                 }
             }
 
-            override fun onPeerLost(peerId: ByteArray) {
+            override fun onLinkDown(linkId: String) {
                 handler.post {
-                    eventSink?.success(mapOf(
-                        "type" to "peerLost",
-                        "peerId" to peerId.toList()
-                    ))
+                    eventSink?.success(mapOf("type" to "linkDown", "linkId" to linkId))
                 }
             }
 
-            override fun onDataReceived(peerId: ByteArray, data: ByteArray) {
+            override fun onLinkData(linkId: String, data: ByteArray) {
                 handler.post {
                     eventSink?.success(mapOf(
-                        "type" to "dataReceived",
-                        "peerId" to peerId.toList(),
+                        "type" to "linkData",
+                        "linkId" to linkId,
                         "data" to data.toList()
                     ))
                 }
@@ -95,32 +89,41 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, BLE_METHOD_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
-                    val nodeId = (call.argument<List<Int>>("nodeId"))?.let {
-                        ByteArray(it.size) { i -> it[i].toByte() }
-                    }
-                    if (nodeId != null && nodeId.size == 32) {
-                        bleService?.start(nodeId)
-                        result.success(true)
-                    } else {
-                        result.error("INVALID_ARG", "nodeId must be 32 bytes", null)
-                    }
+                    bleService?.start()
+                    result.success(true)
                 }
                 "stop" -> {
                     bleService?.stop()
                     result.success(true)
                 }
                 "sendData" -> {
-                    val peerId = (call.argument<List<Int>>("peerId"))?.let {
-                        ByteArray(it.size) { i -> it[i].toByte() }
-                    }
+                    val linkId = call.argument<String>("linkId")
                     val data = (call.argument<List<Int>>("data"))?.let {
                         ByteArray(it.size) { i -> it[i].toByte() }
                     }
-                    if (peerId != null && data != null) {
-                        val ok = bleService?.sendData(peerId, data) ?: false
-                        result.success(ok)
+                    val isHandshake = call.argument<Boolean>("isHandshake") ?: false
+                    if (!linkId.isNullOrEmpty() && data != null) {
+                        result.success(bleService?.sendData(linkId, data, isHandshake) ?: false)
                     } else {
-                        result.error("INVALID_ARG", "peerId and data required", null)
+                        result.error("INVALID_ARG", "linkId and data required", null)
+                    }
+                }
+                "closeLink" -> {
+                    val linkId = call.argument<String>("linkId")
+                    if (!linkId.isNullOrEmpty()) {
+                        bleService?.closeLink(linkId)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARG", "linkId required", null)
+                    }
+                }
+                "linkEstablished" -> {
+                    val linkId = call.argument<String>("linkId")
+                    if (!linkId.isNullOrEmpty()) {
+                        bleService?.onLinkEstablished(linkId)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARG", "linkId required", null)
                     }
                 }
                 else -> result.notImplemented()
@@ -142,29 +145,23 @@ class MainActivity : FlutterActivity() {
         // --- Wi-Fi Direct transport channels ---
         wifiDirectService = WifiDirectService(this)
         wifiDirectService?.listener = object : WifiDirectService.EventListener {
-            override fun onPeerConnected(peerId: ByteArray) {
+            override fun onLinkUp(linkId: String) {
                 handler.post {
-                    wifiEventSink?.success(mapOf(
-                        "type" to "peerConnected",
-                        "peerId" to peerId.toList()
-                    ))
+                    wifiEventSink?.success(mapOf("type" to "linkUp", "linkId" to linkId))
                 }
             }
 
-            override fun onPeerDisconnected(peerId: ByteArray) {
+            override fun onLinkDown(linkId: String) {
                 handler.post {
-                    wifiEventSink?.success(mapOf(
-                        "type" to "peerDisconnected",
-                        "peerId" to peerId.toList()
-                    ))
+                    wifiEventSink?.success(mapOf("type" to "linkDown", "linkId" to linkId))
                 }
             }
 
-            override fun onDataReceived(peerId: ByteArray, data: ByteArray) {
+            override fun onLinkData(linkId: String, data: ByteArray) {
                 handler.post {
                     wifiEventSink?.success(mapOf(
-                        "type" to "dataReceived",
-                        "peerId" to peerId.toList(),
+                        "type" to "linkData",
+                        "linkId" to linkId,
                         "data" to data.toList()
                     ))
                 }
@@ -174,32 +171,41 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, WIFI_METHOD_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
                 "start" -> {
-                    val nodeId = (call.argument<List<Int>>("nodeId"))?.let {
-                        ByteArray(it.size) { i -> it[i].toByte() }
-                    }
-                    if (nodeId != null && nodeId.size == 32) {
-                        wifiDirectService?.start(nodeId)
-                        result.success(true)
-                    } else {
-                        result.error("INVALID_ARG", "nodeId must be 32 bytes", null)
-                    }
+                    wifiDirectService?.start()
+                    result.success(true)
                 }
                 "stop" -> {
                     wifiDirectService?.stop()
                     result.success(true)
                 }
                 "sendData" -> {
-                    val peerId = (call.argument<List<Int>>("peerId"))?.let {
-                        ByteArray(it.size) { i -> it[i].toByte() }
-                    }
+                    val linkId = call.argument<String>("linkId")
                     val data = (call.argument<List<Int>>("data"))?.let {
                         ByteArray(it.size) { i -> it[i].toByte() }
                     }
-                    if (peerId != null && data != null) {
-                        val ok = wifiDirectService?.sendData(peerId, data) ?: false
-                        result.success(ok)
+                    val isHandshake = call.argument<Boolean>("isHandshake") ?: false
+                    if (!linkId.isNullOrEmpty() && data != null) {
+                        result.success(wifiDirectService?.sendData(linkId, data, isHandshake) ?: false)
                     } else {
-                        result.error("INVALID_ARG", "peerId and data required", null)
+                        result.error("INVALID_ARG", "linkId and data required", null)
+                    }
+                }
+                "closeLink" -> {
+                    val linkId = call.argument<String>("linkId")
+                    if (!linkId.isNullOrEmpty()) {
+                        wifiDirectService?.closeLink(linkId)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARG", "linkId required", null)
+                    }
+                }
+                "linkEstablished" -> {
+                    val linkId = call.argument<String>("linkId")
+                    if (!linkId.isNullOrEmpty()) {
+                        wifiDirectService?.onLinkEstablished(linkId)
+                        result.success(true)
+                    } else {
+                        result.error("INVALID_ARG", "linkId required", null)
                     }
                 }
                 else -> result.notImplemented()

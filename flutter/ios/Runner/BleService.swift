@@ -2,10 +2,14 @@ import CoreBluetooth
 import os.log
 
 /// Delegate protocol for BLE transport events.
+///
+/// Links, not peers: this layer carries frames and does not know which node
+/// is on the other end. Identity is proved by a handshake in Rust over these
+/// frames (ADR-021, ROADMAP T-34).
 protocol BleServiceDelegate: AnyObject {
-    func bleService(_ service: BleService, didDiscoverPeer peerId: Data)
-    func bleService(_ service: BleService, didLosePeer peerId: Data)
-    func bleService(_ service: BleService, didReceiveData data: Data, fromPeer peerId: Data)
+    func bleService(_ service: BleService, didOpenLink linkId: String)
+    func bleService(_ service: BleService, didCloseLink linkId: String)
+    func bleService(_ service: BleService, didReceiveFrame data: Data, onLink linkId: String)
 }
 
 /// Dual-role BLE transport service using CoreBluetooth.
@@ -14,15 +18,20 @@ protocol BleServiceDelegate: AnyObject {
 /// for mesh peer discovery and data exchange. Supports iOS background
 /// modes via state preservation/restoration.
 ///
+/// The Node ID and Identity characteristics that used to exchange a bare,
+/// unprovable 32-byte id are gone: a peer's NodeId is derived from the key
+/// its handshake proves, and nothing here reports an identity at all.
+///
 /// GATT Service Layout (same as Android):
 ///   Service UUID:   a1b2c3d4-e5f6-7890-abcd-ef1234567890
-///   Node ID char:   ...7891  (Read)   — the node's own 32-byte NodeId
-///                                       (asserted, not proved — ROADMAP T-34)
-///   Identity char:  ...7894  (Write)  — maps BLE random address to node ID
-///   Data TX char:   ...7892  (Write)  — central writes data to peripheral
-///   Data RX char:   ...7893  (Notify) — peripheral notifies central with data
+///   Data TX char:   ...7892  (Write)  — central writes frames to peripheral
+///   Data RX char:   ...7893  (Notify) — peripheral notifies central with frames
 ///
-/// Fragmentation header (1 byte):
+/// Links are named `c:<peripheral UUID>` where we are the central and
+/// `s:<central identifier>` where we are the server. Both roles can be live
+/// with the same device at once, and they are two links with two handshakes.
+///
+/// Fragmentation header (1 byte), below Rust's own:
 ///   0x01 = first fragment
 ///   0x02 = last fragment
 ///   0x03 = first+last (single packet)
@@ -31,22 +40,53 @@ class BleService: NSObject {
     // MARK: - Constants
 
     static let serviceUUID    = CBUUID(string: "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-    static let nodeIdUUID     = CBUUID(string: "a1b2c3d4-e5f6-7890-abcd-ef1234567891")
     static let dataTxUUID     = CBUUID(string: "a1b2c3d4-e5f6-7890-abcd-ef1234567892")
     static let dataRxUUID     = CBUUID(string: "a1b2c3d4-e5f6-7890-abcd-ef1234567893")
-    static let identityUUID   = CBUUID(string: "a1b2c3d4-e5f6-7890-abcd-ef1234567894")
 
     static let flagFirst:  UInt8 = 0x01
     static let flagLast:   UInt8 = 0x02
     static let flagSingle: UInt8 = 0x03
 
-    /// Conservative default fragment size for 23-byte default MTU (23 - 3 ATT header).
-    static let defaultFragmentSize = 20
+    /// Our role in a link, and the prefix its name carries.
+    static let roleCentral = "c:"
+    static let roleServer  = "s:"
+
+    /// Payload bytes in one GATT write at the 23-byte default ATT MTU.
+    ///
+    /// An ATT MTU of 23 carries 20 bytes of attribute value (3 go to the ATT
+    /// header), and one of those 20 is our own fragment flag, so 19 are
+    /// payload. The old value of 20 produced a 21-byte write the link cannot
+    /// carry.
+    static let defaultFragmentSize = 19
 
     private static let maxConnectRetries = 3
     private static let baseRetryDelay: TimeInterval = 1.0
     private static let reconnectDelay: TimeInterval = 2.0
     private static let scanCycleInterval: TimeInterval = 25.0
+    /// How long an address refused by the Rust side is left alone.
+    private static let refusedBackoff: TimeInterval = 30.0
+    /// How long a link may stay announced without being established before
+    /// this layer closes it itself. Longer than the Rust side's ten-second
+    /// handshake deadline, so its own directive normally arrives first; this
+    /// is the backstop for when that directive never does.
+    private static let staleLink: TimeInterval = 20.0
+    /// How often the stale-link sweep runs.
+    private static let linkSweepInterval: TimeInterval = 5.0
+    /// Largest frame this layer will reassemble from GATT writes. The Rust
+    /// side fragments to its BLE frame MTU, so anything longer is not a
+    /// frame it sent — and the bounded reassembler above would never see it,
+    /// because it would never be handed over.
+    private static let maxFrameBytes = 512
+    /// Largest GATT attribute value to write. A peer's Android GATT server
+    /// refuses anything above 512, so a 512-byte Rust fragment plus this
+    /// layer's flag byte must not be attempted whatever the negotiated MTU
+    /// allows locally.
+    private static let maxAttValue = 512
+    /// How long a partial frame waits for the rest of itself.
+    private static let reassemblyTtl: TimeInterval = 10.0
+    /// How long a connection has to become announceable before this layer
+    /// gives up on it.
+    private static let setupDeadline: TimeInterval = 20.0
 
     private static let centralRestoreId    = "com.mycelium.ble.central"
     private static let peripheralRestoreId = "com.mycelium.ble.peripheral"
@@ -57,7 +97,6 @@ class BleService: NSObject {
 
     weak var delegate: BleServiceDelegate?
 
-    private var localNodeId = Data(count: 32)
     private var running = false
 
     // Peripheral role
@@ -73,47 +112,69 @@ class BleService: NSObject {
     /// connected yet. CoreBluetooth only keeps a weak reference, so without a
     /// strong one here the connection is cancelled ("unused peripheral").
     private var pendingPeripherals: [UUID: CBPeripheral] = [:]
-    private var peerNodeIds: [UUID: Data] = [:]        // peripheral UUID -> node ID
-    private var nodeIdToUUID: [String: UUID] = [:]      // hex node ID -> peripheral UUID
     private var pendingConnections: Set<UUID> = []
     private var connectRetryCounts: [UUID: Int] = [:]
     private var disconnectedPeers: [UUID: CBPeripheral] = [:]
 
-    // Server-connected centrals: identifier -> node ID
-    private var serverPeerNodeIds: [String: Data] = [:]
-    private var serverNodeIdToIdentifier: [String: String] = [:]  // hex node ID -> central identifier
+    /// Links announced to Rust, with when they were announced: one that
+    /// never becomes established is swept.
+    private var openLinks: [String: Date] = [:]
+    /// Links the Rust side has told us completed their handshake.
+    private var establishedLinks: Set<String> = []
+    /// Links Rust has refused, with the time they may be retried. By link,
+    /// not by device: both roles can be live with one device, and a handshake
+    /// that failed in one says nothing about the other.
+    private var refusedUntil: [String: Date] = [:]
 
     // Per-device negotiated MTU
     private var deviceMtus: [UUID: Int] = [:]
 
-    // Fragment reassembly: key -> partial buffer
+    // Fragment reassembly: link id -> partial buffer, and when it started
     private var reassemblyBuffers: [String: Data] = [:]
+    private var reassemblyStartedAt: [String: Date] = [:]
+
+    // Connections that exist but are not announceable yet, with when they
+    // connected: one that stalls in discovery is never announced, so nothing
+    // above this layer could notice it.
+    private var pendingSetup: [String: Date] = [:]
 
     // Sequential write queue
     private struct WriteOperation {
-        let targetId: String           // peripheral UUID or central identifier
+        let linkId: String
         let fragments: [Data]
         var currentIndex: Int = 0
         let isClientWrite: Bool        // true = GATT client write, false = server notify
         let peripheralUUID: UUID?      // set for client writes
+        let centralId: String?         // set for server notifies
+        /// Told to us by the Rust side, which is the only layer that knows:
+        /// a link counts as established there as soon as the peer's
+        /// confirmation arrives, which can be before our own has left. A
+        /// handshake operation is never delayed behind traffic and never
+        /// evicted.
+        let isHandshake: Bool
     }
 
     private var writeQueue: [WriteOperation] = []
     private var writeInProgress = false
     private let writeLock = NSLock()
+    /// Operations held for the radio at once.
+    ///
+    /// The Rust outbox is bounded, but polling frees its capacity as soon as
+    /// a frame is handed over, so without a bound here a slow peer
+    /// accumulates writes without limit. Past this, the oldest operation of
+    /// an *established* link is dropped — ordinary traffic, as in the outbox
+    /// one layer up (ADR-014) — and a handshake is never the one sacrificed.
+    private static let maxWriteQueue = 128
 
     // Scan cycling timer
     private var scanCycleTimer: Timer?
+    // Stale-link sweep timer
+    private var linkSweepTimer: Timer?
 
     // MARK: - Public API
 
-    func start(nodeId: Data) {
+    func start() {
         guard !running else { return }
-        guard nodeId.count == 32 else {
-            log.error("start: nodeId must be 32 bytes, got \(nodeId.count)")
-            return
-        }
-        localNodeId = nodeId
         running = true
 
         // Initialize managers with background restoration identifiers
@@ -128,6 +189,12 @@ class BleService: NSObject {
             options: [CBPeripheralManagerOptionRestoreIdentifierKey: BleService.peripheralRestoreId]
         )
 
+        linkSweepTimer = Timer.scheduledTimer(
+            withTimeInterval: BleService.linkSweepInterval,
+            repeats: true
+        ) { [weak self] _ in
+            self?.sweepStaleLinks()
+        }
         log.info("BLE service started")
     }
 
@@ -144,18 +211,18 @@ class BleService: NSObject {
         writeInProgress = false
         writeLock.unlock()
 
-        // Notify peer lost for all known peers
-        for (_, nodeId) in peerNodeIds {
-            delegate?.bleService(self, didLosePeer: nodeId)
-        }
-        for (_, nodeId) in serverPeerNodeIds {
-            delegate?.bleService(self, didLosePeer: nodeId)
-        }
+        linkSweepTimer?.invalidate()
+        linkSweepTimer = nil
 
-        peerNodeIds.removeAll()
-        nodeIdToUUID.removeAll()
-        serverPeerNodeIds.removeAll()
-        serverNodeIdToIdentifier.removeAll()
+        // Report every link down, so Rust drops the peers behind them.
+        for linkId in openLinks.keys {
+            delegate?.bleService(self, didCloseLink: linkId)
+        }
+        openLinks.removeAll()
+        establishedLinks.removeAll()
+        pendingSetup.removeAll()
+        reassemblyStartedAt.removeAll()
+        refusedUntil.removeAll()
         connectedPeripherals.removeAll()
         pendingPeripherals.removeAll()
         subscribedCentrals.removeAll()
@@ -171,46 +238,237 @@ class BleService: NSObject {
         log.info("BLE service stopped")
     }
 
-    func sendData(peerId: Data, data: Data) -> Bool {
-        let peerHex = peerId.hexString
+    /// Write one frame on a link. The link id says which role carries it, so
+    /// the two directions of a dual-role pair cannot be confused.
+    func sendData(linkId: String, data: Data, isHandshake: Bool) -> Bool {
+        guard let key = BleService.deviceKey(of: linkId) else {
+            log.warning("sendData: malformed link id \(linkId)")
+            return false
+        }
 
-        // Try GATT client write first (we are central, peer is peripheral)
-        if let uuid = nodeIdToUUID[peerHex],
-           let peripheral = connectedPeripherals[uuid] {
+        if linkId.hasPrefix(BleService.roleCentral) {
+            guard let uuid = UUID(uuidString: key),
+                  connectedPeripherals[uuid] != nil else {
+                log.warning("sendData: no GATT client link for \(linkId)")
+                return false
+            }
             let fragments = fragment(data, forDeviceUUID: uuid)
-            log.debug("sendData: \(data.count) bytes -> \(fragments.count) fragments via GATT client to \(peerHex.prefix(16))")
             enqueueWrite(WriteOperation(
-                targetId: uuid.uuidString,
+                linkId: linkId,
                 fragments: fragments,
                 isClientWrite: true,
-                peripheralUUID: uuid
+                peripheralUUID: uuid,
+                centralId: nil,
+                isHandshake: isHandshake
             ))
             return true
         }
 
-        // Try GATT server notify (we are peripheral, peer is central)
-        if let centralId = serverNodeIdToIdentifier[peerHex],
-           subscribedCentrals[centralId] != nil {
-            let fragments = fragmentDefault(data)
-            log.debug("sendData: \(data.count) bytes -> \(fragments.count) fragments via GATT server to \(peerHex.prefix(16))")
-            enqueueWrite(WriteOperation(
-                targetId: centralId,
-                fragments: fragments,
-                isClientWrite: false,
-                peripheralUUID: nil
-            ))
-            return true
+        guard subscribedCentrals[key] != nil else {
+            log.warning("sendData: central \(key) is not subscribed")
+            return false
+        }
+        let fragments = fragmentDefault(data)
+        enqueueWrite(WriteOperation(
+            linkId: linkId,
+            fragments: fragments,
+            isClientWrite: false,
+            peripheralUUID: nil,
+            centralId: key,
+            isHandshake: isHandshake
+        ))
+        return true
+    }
+
+    /// Close a link Rust refused: its handshake failed, timed out, named us,
+    /// or there was no room for it. Nothing was installed for it, so the
+    /// connection is of no use; the device is left alone for a while rather
+    /// than redialled at once.
+    func closeLink(_ linkId: String) {
+        guard let key = BleService.deviceKey(of: linkId) else { return }
+        log.info("Closing refused link \(linkId)")
+        refusedUntil[linkId] = Date().addingTimeInterval(BleService.refusedBackoff)
+        purgeWrites(for: linkId)
+        reportLinkDown(linkId)
+
+        if linkId.hasPrefix(BleService.roleCentral), let uuid = UUID(uuidString: key) {
+            disconnectedPeers.removeValue(forKey: uuid)
+            if let peripheral = connectedPeripherals.removeValue(forKey: uuid) {
+                centralManager?.cancelPeripheralConnection(peripheral)
+            }
+        } else {
+            // CoreBluetooth gives a peripheral manager no way to disconnect
+            // a central: there is no counterpart to Android's
+            // `BluetoothGattServer.cancelConnection`. The link is forgotten
+            // and its queued writes dropped, and a central that resubscribes
+            // opens a fresh link which is refused again — but its connection
+            // survives until it gives up, so a peer that keeps failing
+            // handshakes can hold a slot in our peripheral role. Recorded as
+            // a residual in ADR-021 rather than worked around here.
+            subscribedCentrals.removeValue(forKey: key)
+        }
+    }
+
+    /// A link became established: stop retrying, and stop sweeping it.
+    func onLinkEstablished(_ linkId: String) {
+        guard let key = BleService.deviceKey(of: linkId) else { return }
+        // The directive is polled, so it can arrive after the link it
+        // describes has gone. Marking a link we no longer hold would let a
+        // replacement of the same name inherit the mark and slip past the
+        // stale-link sweep.
+        guard openLinks[linkId] != nil else {
+            log.debug("Ignoring an establishment for a link we no longer hold: \(linkId)")
+            return
+        }
+        refusedUntil.removeValue(forKey: linkId)
+        establishedLinks.insert(linkId)
+        if let uuid = UUID(uuidString: key) {
+            connectRetryCounts.removeValue(forKey: uuid)
+        }
+        log.info("Link \(linkId) established")
+    }
+
+    /// Close links that never finished their handshake.
+    ///
+    /// The Rust side reaps them at its own deadline and asks us to close
+    /// them, but that directive is polled, and a queue that overflows or an
+    /// app that stops polling would leave a connection holding a slot with
+    /// nothing left to free it. This layer owns its connections, so it does
+    /// not depend on being told.
+    private func sweepStaleLinks() {
+        guard running else { return }
+        let now = Date()
+        // Peripheral identifiers are stable, but a central's is not, so an
+        // entry only reached when the same link comes back is an entry that
+        // never goes.
+        refusedUntil = refusedUntil.filter { $0.value > now }
+
+        // A partial frame whose rest never came.
+        for (linkId, startedAt) in reassemblyStartedAt
+        where now.timeIntervalSince(startedAt) >= BleService.reassemblyTtl {
+            reassemblyBuffers.removeValue(forKey: linkId)
+            reassemblyStartedAt.removeValue(forKey: linkId)
         }
 
-        log.warning("sendData: no connection to peer \(peerHex.prefix(16))")
-        return false
+        // A connection that never became announceable: nothing above this
+        // layer knows it exists, so nothing above it can give up on it.
+        for (linkId, connectedAt) in pendingSetup {
+            if openLinks[linkId] != nil {
+                pendingSetup.removeValue(forKey: linkId)
+                continue
+            }
+            if now.timeIntervalSince(connectedAt) < BleService.setupDeadline { continue }
+            log.warning("Dropping \(linkId): connected and never subscribed")
+            pendingSetup.removeValue(forKey: linkId)
+            if let key = BleService.deviceKey(of: linkId), let uuid = UUID(uuidString: key),
+               let peripheral = connectedPeripherals.removeValue(forKey: uuid) {
+                centralManager?.cancelPeripheralConnection(peripheral)
+            }
+        }
+
+        for (linkId, openedAt) in openLinks {
+            if establishedLinks.contains(linkId) { continue }
+            if now.timeIntervalSince(openedAt) < BleService.staleLink { continue }
+            log.warning("Closing \(linkId): announced and never established")
+            closeLink(linkId)
+        }
+    }
+
+    // MARK: - Link bookkeeping
+
+    private static func deviceKey(of linkId: String) -> String? {
+        guard linkId.hasPrefix(roleCentral) || linkId.hasPrefix(roleServer) else { return nil }
+        let key = String(linkId.dropFirst(2))
+        return key.isEmpty ? nil : key
+    }
+
+    private func reportLinkUp(_ linkId: String) {
+        pendingSetup.removeValue(forKey: linkId)
+        guard openLinks[linkId] == nil else { return }
+        openLinks[linkId] = Date()
+        log.info("Link up: \(linkId)")
+        delegate?.bleService(self, didOpenLink: linkId)
+    }
+
+    private func reportLinkDown(_ linkId: String) {
+        reassemblyBuffers.removeValue(forKey: linkId)
+        reassemblyStartedAt.removeValue(forKey: linkId)
+        pendingSetup.removeValue(forKey: linkId)
+        establishedLinks.remove(linkId)
+        guard openLinks.removeValue(forKey: linkId) != nil else { return }
+        log.info("Link down: \(linkId)")
+        delegate?.bleService(self, didCloseLink: linkId)
+    }
+
+    private func refused(_ linkId: String) -> Bool {
+        guard let until = refusedUntil[linkId] else { return false }
+        if Date() >= until {
+            refusedUntil.removeValue(forKey: linkId)
+            return false
+        }
+        return true
+    }
+
+    private func centralLink(_ uuid: UUID) -> String {
+        BleService.roleCentral + uuid.uuidString
     }
 
     // MARK: - Write Queue Management
 
+    /// Queue an operation. Frames for a link that is not established yet go
+    /// ahead of ordinary traffic: the Rust side puts a handshake frame first
+    /// in its own queue, and a FIFO native queue holding seconds of data
+    /// writes is what would undo that. A link that is not established can
+    /// only be carrying its handshake, so no inspection of the frame is
+    /// needed, and per-link order is kept because a link has no traffic
+    /// until it is established.
     private func enqueueWrite(_ op: WriteOperation) {
         writeLock.lock()
-        writeQueue.append(op)
+        if writeQueue.count >= BleService.maxWriteQueue {
+            // Drop the oldest ordinary operation, never a handshake, and
+            // never the one in flight.
+            let floorIndex = writeInProgress ? 1 : 0
+            let victim = (floorIndex..<writeQueue.count).first {
+                !writeQueue[$0].isHandshake
+            }
+            guard let victim = victim else {
+                log.warning("writeQueue: full of handshakes, refusing \(op.linkId)")
+                writeLock.unlock()
+                return
+            }
+            let victimLink = writeQueue[victim].linkId
+            log.warning("writeQueue: full, dropping an operation for \(victimLink)")
+            writeQueue.remove(at: victim)
+        }
+        if !op.isHandshake {
+            writeQueue.append(op)
+        } else {
+            // After *every* queued handshake, not between a link's own hello
+            // and confirmation, which the peer would then read in the wrong
+            // order. The operation in flight is never displaced.
+            let floorIndex = writeInProgress ? 1 : 0
+            var insertAt = writeQueue.count
+            for (index, queued) in writeQueue.enumerated() where index >= floorIndex {
+                if !queued.isHandshake {
+                    insertAt = index
+                    break
+                }
+            }
+            writeQueue.insert(op, at: min(max(insertAt, floorIndex), writeQueue.count))
+        }
+        writeLock.unlock()
+        processNextWrite()
+    }
+
+    /// Drop queued writes for a link that just went away, or the write queue
+    /// would stall on a callback that will never come.
+    private func purgeWrites(for linkId: String) {
+        writeLock.lock()
+        let headWasTheirs = writeQueue.first?.linkId == linkId
+        writeQueue.removeAll { $0.linkId == linkId }
+        if writeInProgress && headWasTheirs {
+            writeInProgress = false
+        }
         writeLock.unlock()
         processNextWrite()
     }
@@ -238,7 +496,7 @@ class BleService: NSObject {
         if op.isClientWrite {
             guard let uuid = op.peripheralUUID,
                   let peripheral = connectedPeripherals[uuid] else {
-                log.warning("writeQueue: GATT client gone for \(op.targetId)")
+                log.warning("writeQueue: GATT client gone for \(op.linkId)")
                 writeQueue.removeFirst()
                 writeInProgress = false
                 writeLock.unlock()
@@ -263,8 +521,9 @@ class BleService: NSObject {
         } else {
             // Server notify
             guard let rxChar = dataRxCharacteristic,
-                  let central = subscribedCentrals[op.targetId] else {
-                log.warning("writeQueue: GATT server or central gone for \(op.targetId)")
+                  let centralId = op.centralId,
+                  let central = subscribedCentrals[centralId] else {
+                log.warning("writeQueue: GATT server or central gone for \(op.linkId)")
                 writeQueue.removeFirst()
                 writeInProgress = false
                 writeLock.unlock()
@@ -290,10 +549,27 @@ class BleService: NSObject {
         }
     }
 
-    private func onWriteCompleted(success: Bool) {
+    /// A write completed for `uuid`, which is the only identity the
+    /// callback carries.
+    ///
+    /// Matched against the operation in flight, because a callback can
+    /// arrive after its own operation was purged — a link dropping takes its
+    /// queued writes with it — and an unmatched completion would otherwise
+    /// advance or discard the operation that took its place.
+    private func onWriteCompleted(peripheralUUID uuid: UUID, success: Bool) {
         writeLock.lock()
-        if !success && !writeQueue.isEmpty {
-            let remaining = writeQueue[0].fragments.count - writeQueue[0].currentIndex
+        // Only the central role gets a write completion here: a peripheral
+        // manager's `updateValue` reports synchronously, and this layer's
+        // purges of a central link all follow a cancelled connection — so
+        // unlike Android there is no live connection whose late completion
+        // could be mistaken for a later operation's.
+        guard let head = writeQueue.first, head.peripheralUUID == uuid else {
+            log.debug("writeQueue: ignoring a completion from \(uuid)")
+            writeLock.unlock()
+            return
+        }
+        if !success {
+            let remaining = head.fragments.count - head.currentIndex
             log.warning("writeQueue: write failed, dropping \(remaining) remaining fragments")
             writeQueue.removeFirst()
         }
@@ -308,20 +584,6 @@ class BleService: NSObject {
         guard let pm = peripheralManager, pm.state == .poweredOn else { return }
 
         // Build GATT service
-        let nodeIdChar = CBMutableCharacteristic(
-            type: BleService.nodeIdUUID,
-            properties: .read,
-            value: nil,  // dynamic read via delegate
-            permissions: .readable
-        )
-
-        let identityChar = CBMutableCharacteristic(
-            type: BleService.identityUUID,
-            properties: .write,
-            value: nil,
-            permissions: .writeable
-        )
-
         let dataTxChar = CBMutableCharacteristic(
             type: BleService.dataTxUUID,
             properties: .write,
@@ -338,7 +600,7 @@ class BleService: NSObject {
         dataRxCharacteristic = rxChar
 
         let service = CBMutableService(type: BleService.serviceUUID, primary: true)
-        service.characteristics = [nodeIdChar, identityChar, dataTxChar, rxChar]
+        service.characteristics = [dataTxChar, rxChar]
         gattService = service
 
         pm.add(service)
@@ -398,11 +660,12 @@ class BleService: NSObject {
 
     private func retryDisconnectedPeers() {
         for (uuid, peripheral) in disconnectedPeers {
-            if connectedPeripherals[uuid] != nil || pendingConnections.contains(uuid) {
+            if connectedPeripherals[uuid] != nil || pendingConnections.contains(uuid) ||
+                refused(centralLink(uuid)) {
                 disconnectedPeers.removeValue(forKey: uuid)
                 continue
             }
-            log.debug("Auto-reconnecting to previously known peer \(uuid)")
+            log.debug("Auto-reconnecting to \(uuid)")
             disconnectedPeers.removeValue(forKey: uuid)
             pendingConnections.insert(uuid)
             connectToPeripheral(peripheral, attempt: 0)
@@ -435,45 +698,65 @@ class BleService: NSObject {
 
     // MARK: - Fragmentation
 
-    private func handleFragment(key: String, raw: Data) {
-        guard !raw.isEmpty else { return }
-        let flags = raw[0]
-        let payload = raw.count > 1 ? raw.subdata(in: 1..<raw.count) : Data()
+    private func handleFragment(linkId: String, raw: Data) {
+        guard !raw.isEmpty, raw.count <= BleService.maxFrameBytes + 1 else { return }
+        // The peer's first frame can beat our own subscription callback, so
+        // a frame for a connection we already hold announces its link rather
+        // than being dropped — otherwise that handshake only recovers through
+        // the reaper and the backoff. A link just refused is not reopened by
+        // what was still in flight.
+        if openLinks[linkId] == nil {
+            guard let key = BleService.deviceKey(of: linkId), !refused(linkId) else {
+                log.debug("Dropping a frame on unannounced link \(linkId)")
+                return
+            }
+            let connected = (UUID(uuidString: key).flatMap { connectedPeripherals[$0] } != nil)
+                || subscribedCentrals[key] != nil
+            guard connected else {
+                log.debug("Dropping a frame on unannounced link \(linkId)")
+                return
+            }
+            log.debug("First frame on \(linkId) arrived before our own callback")
+            reportLinkUp(linkId)
+        }
+        let flags = raw[raw.startIndex]
+        let payload = raw.count > 1 ? raw.subdata(in: (raw.startIndex + 1)..<raw.endIndex) : Data()
 
         let isFirst = (flags & 0x01) != 0
         let isLast  = (flags & 0x02) != 0
 
         if isFirst {
-            reassemblyBuffers[key] = payload
+            reassemblyBuffers[linkId] = payload
+            reassemblyStartedAt[linkId] = Date()
         } else {
-            guard var existing = reassemblyBuffers[key] else { return }
+            guard var existing = reassemblyBuffers[linkId] else { return }
+            if existing.count + payload.count > BleService.maxFrameBytes {
+                // Longer than any frame the Rust side sends, so not one.
+                log.warning("Dropping an over-long reassembly on \(linkId)")
+                reassemblyBuffers.removeValue(forKey: linkId)
+                reassemblyStartedAt.removeValue(forKey: linkId)
+                return
+            }
             existing.append(payload)
-            reassemblyBuffers[key] = existing
+            reassemblyBuffers[linkId] = existing
         }
 
         if isLast {
-            guard let complete = reassemblyBuffers.removeValue(forKey: key) else { return }
-            // Look up node ID from peripheral UUID or central identifier
-            var peerId: Data?
-            if let uuid = UUID(uuidString: key) {
-                peerId = peerNodeIds[uuid]
-            }
-            if peerId == nil {
-                peerId = serverPeerNodeIds[key]
-            }
-            guard let nodeId = peerId else {
-                log.warning("Reassembled \(complete.count) bytes but no node ID for key \(key)")
-                return
-            }
-            log.debug("Reassembled \(complete.count) bytes from \(key)")
-            delegate?.bleService(self, didReceiveData: complete, fromPeer: nodeId)
+            reassemblyStartedAt.removeValue(forKey: linkId)
+            guard let complete = reassemblyBuffers.removeValue(forKey: linkId) else { return }
+            log.debug("Reassembled \(complete.count) bytes on \(linkId)")
+            delegate?.bleService(self, didReceiveFrame: complete, onLink: linkId)
         }
     }
 
     private func fragment(_ data: Data, forDeviceUUID uuid: UUID) -> [Data] {
         let mtu = deviceMtus[uuid] ?? 23
-        // ATT header: 3 bytes, our fragmentation header: 1 byte
-        let fragSize = max(mtu - 4, BleService.defaultFragmentSize)
+        // ATT header: 3 bytes, our fragmentation header: 1 byte, and never a
+        // value a peer's GATT server will refuse.
+        let fragSize = min(
+            max(mtu - 4, BleService.defaultFragmentSize),
+            BleService.maxAttValue - 1
+        )
         return fragmentWithSize(data, fragSize: fragSize)
     }
 
@@ -490,7 +773,7 @@ class BleService: NSObject {
         var offset = 0
         while offset < data.count {
             let end = min(offset + fragSize, data.count)
-            let chunk = data.subdata(in: offset..<end)
+            let chunk = data.subdata(in: (data.startIndex + offset)..<(data.startIndex + end))
 
             let flags: UInt8
             if offset == 0 && end == data.count {
@@ -509,55 +792,73 @@ class BleService: NSObject {
         return fragments
     }
 
-    // MARK: - Peer Disconnect Handling
+    // MARK: - Link Loss
 
-    private func handlePeerDisconnected(peripheralUUID uuid: UUID) {
-        guard let nodeId = peerNodeIds.removeValue(forKey: uuid) else { return }
-        nodeIdToUUID.removeValue(forKey: nodeId.hexString)
-        log.info("Peer lost: \(nodeId.hexString.prefix(16))...")
-        delegate?.bleService(self, didLosePeer: nodeId)
+    private func handleCentralLinkLost(peripheralUUID uuid: UUID, retryIfUnopened: Bool) {
+        let linkId = BleService.roleCentral + uuid.uuidString
+        let wasOpen = openLinks[linkId] != nil
+        purgeWrites(for: linkId)
+        reportLinkDown(linkId)
+        pendingConnections.remove(uuid)
 
-        // Schedule auto-reconnect if we have a peripheral reference
-        if let peripheral = connectedPeripherals[uuid] ?? disconnectedPeers[uuid], running {
-            disconnectedPeers[uuid] = peripheral
-            DispatchQueue.main.asyncAfter(deadline: .now() + BleService.reconnectDelay) { [weak self] in
-                guard let self = self, self.running,
-                      self.disconnectedPeers[uuid] != nil,
-                      self.connectedPeripherals[uuid] == nil,
-                      !self.pendingConnections.contains(uuid) else { return }
-                self.log.debug("Auto-reconnecting to lost peer \(uuid)")
-                self.disconnectedPeers.removeValue(forKey: uuid)
-                self.pendingConnections.insert(uuid)
-                self.connectToPeripheral(peripheral, attempt: 0)
-            }
-        }
-    }
-
-    private func handleServerPeerDisconnected(centralIdentifier: String) {
-        guard let nodeId = serverPeerNodeIds.removeValue(forKey: centralIdentifier) else { return }
-        serverNodeIdToIdentifier.removeValue(forKey: nodeId.hexString)
-        subscribedCentrals.removeValue(forKey: centralIdentifier)
-        log.info("Server peer lost: \(nodeId.hexString.prefix(16))...")
-        delegate?.bleService(self, didLosePeer: nodeId)
-    }
-
-    // MARK: - Identity Handshake
-
-    private func writeIdentityOrEmitDiscovered(_ peripheral: CBPeripheral) {
-        guard let service = peripheral.services?.first(where: { $0.uuid == BleService.serviceUUID }),
-              let identityChar = service.characteristics?.first(where: { $0.uuid == BleService.identityUUID }) else {
-            log.warning("No identity characteristic, emitting peerDiscovered directly")
-            emitPeerDiscoveredForPeripheral(peripheral)
+        guard running, !refused(linkId) else {
+            // Nothing further will be attempted, so the strong reference
+            // goes: peripherals rotate, and one kept per refusal would
+            // accumulate for as long as the app runs.
+            pendingPeripherals.removeValue(forKey: uuid)
+            connectRetryCounts.removeValue(forKey: uuid)
             return
         }
-        log.debug("Writing our node ID to server identity char at \(peripheral.identifier)")
-        peripheral.writeValue(localNodeId, for: identityChar, type: .withResponse)
-        // peerDiscovered will be emitted from peripheral(_:didWriteValueFor:error:)
+
+        if wasOpen {
+            // A link we had announced is worth getting back. The reference
+            // moves to `disconnectedPeers`, which the reconnect consumes.
+            if let peripheral = connectedPeripherals[uuid] ?? pendingPeripherals[uuid] ?? disconnectedPeers[uuid] {
+                scheduleReconnect(peripheral)
+            }
+            pendingPeripherals.removeValue(forKey: uuid)
+            connectRetryCounts.removeValue(forKey: uuid)
+            return
+        }
+
+        guard retryIfUnopened,
+              let peripheral = pendingPeripherals[uuid] ?? connectedPeripherals[uuid] else { return }
+        let attempt = connectRetryCounts[uuid] ?? 0
+        if attempt < BleService.maxConnectRetries {
+            let delay = BleService.baseRetryDelay * Double(attempt + 1) + Double.random(in: 0...0.5)
+            log.debug("Retrying connection to \(uuid) in \(delay)s (attempt \(attempt + 2))")
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self = self, self.running,
+                      self.connectedPeripherals[uuid] == nil,
+                      !self.refused(self.centralLink(uuid)) else {
+                    self?.pendingConnections.remove(uuid)
+                    self?.pendingPeripherals.removeValue(forKey: uuid)
+                    return
+                }
+                self.connectToPeripheral(peripheral, attempt: attempt + 1)
+            }
+        } else {
+            log.warning("Giving up connection to \(uuid) after \(attempt + 1) attempts")
+            pendingConnections.remove(uuid)
+            pendingPeripherals.removeValue(forKey: uuid)
+            connectRetryCounts.removeValue(forKey: uuid)
+        }
     }
 
-    private func emitPeerDiscoveredForPeripheral(_ peripheral: CBPeripheral) {
-        guard let nodeId = peerNodeIds[peripheral.identifier] else { return }
-        delegate?.bleService(self, didDiscoverPeer: nodeId)
+    private func scheduleReconnect(_ peripheral: CBPeripheral) {
+        let uuid = peripheral.identifier
+        disconnectedPeers[uuid] = peripheral
+        DispatchQueue.main.asyncAfter(deadline: .now() + BleService.reconnectDelay) { [weak self] in
+            guard let self = self, self.running,
+                  self.disconnectedPeers[uuid] != nil,
+                  self.connectedPeripherals[uuid] == nil,
+                  !self.pendingConnections.contains(uuid),
+                  !self.refused(self.centralLink(uuid)) else { return }
+            self.log.debug("Auto-reconnecting to \(uuid)")
+            self.disconnectedPeers.removeValue(forKey: uuid)
+            self.pendingConnections.insert(uuid)
+            self.connectToPeripheral(peripheral, attempt: 0)
+        }
     }
 }
 
@@ -575,9 +876,18 @@ extension BleService: CBCentralManagerDelegate {
     func centralManager(_ central: CBCentralManager, willRestoreState dict: [String: Any]) {
         log.info("Central manager restoring state")
         if let peripherals = dict[CBCentralManagerRestoredStatePeripheralsKey] as? [CBPeripheral] {
+            // A restored connection is of no use to us. CoreBluetooth
+            // brings back the connection *and* its subscription, but the
+            // channel keys behind it were in the Rust process that went
+            // away, and the remote still believes the link is established —
+            // so a fresh cleartext hello sent over it would arrive where a
+            // sealed frame is expected, fail to open, and be dropped. The
+            // connection is dropped instead; scanning reconnects and both
+            // ends handshake from the beginning.
             for peripheral in peripherals {
                 peripheral.delegate = self
-                connectedPeripherals[peripheral.identifier] = peripheral
+                log.info("Dropping a restored connection to \(peripheral.identifier)")
+                centralManager?.cancelPeripheralConnection(peripheral)
             }
         }
     }
@@ -586,10 +896,10 @@ extension BleService: CBCentralManagerDelegate {
                          advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let uuid = peripheral.identifier
 
-        // Skip if already connected or connection pending
+        // Skip if already connected or connection pending, or just refused
         guard connectedPeripherals[uuid] == nil,
               !pendingConnections.contains(uuid),
-              peerNodeIds[uuid] == nil else { return }
+              !refused(centralLink(uuid)) else { return }
 
         log.debug("Discovered Mycelium device: \(uuid)")
         pendingConnections.insert(uuid)
@@ -602,7 +912,7 @@ extension BleService: CBCentralManagerDelegate {
                 return
             }
             // Re-check
-            if self.connectedPeripherals[uuid] != nil || self.peerNodeIds[uuid] != nil {
+            if self.connectedPeripherals[uuid] != nil || self.refused(self.centralLink(uuid)) {
                 self.pendingConnections.remove(uuid)
                 return
             }
@@ -616,6 +926,9 @@ extension BleService: CBCentralManagerDelegate {
         pendingConnections.remove(uuid)
         pendingPeripherals.removeValue(forKey: uuid)
         connectRetryCounts.removeValue(forKey: uuid)
+        // Announceable only once discovery and subscription finish; if they
+        // stall, the sweep is what notices.
+        pendingSetup[centralLink(uuid)] = Date()
         connectedPeripherals[uuid] = peripheral
         peripheral.delegate = self
         peripheral.discoverServices([BleService.serviceUUID])
@@ -625,57 +938,18 @@ extension BleService: CBCentralManagerDelegate {
         let uuid = peripheral.identifier
         log.warning("GATT client failed to connect to \(uuid): \(error?.localizedDescription ?? "unknown")")
         connectedPeripherals.removeValue(forKey: uuid)
-        pendingPeripherals.removeValue(forKey: uuid)
         deviceMtus.removeValue(forKey: uuid)
-
-        let attempt = connectRetryCounts[uuid] ?? 0
-        if attempt < BleService.maxConnectRetries {
-            let delay = BleService.baseRetryDelay * Double(attempt + 1) + Double.random(in: 0...0.5)
-            log.debug("Retrying connection to \(uuid) in \(delay)s (attempt \(attempt + 2))")
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                guard let self = self, self.running,
-                      self.connectedPeripherals[uuid] == nil,
-                      self.peerNodeIds[uuid] == nil else {
-                    self?.pendingConnections.remove(uuid)
-                    return
-                }
-                self.connectToPeripheral(peripheral, attempt: attempt + 1)
-            }
-        } else {
-            log.warning("Giving up connection to \(uuid) after \(attempt + 1) attempts")
-            pendingConnections.remove(uuid)
-            connectRetryCounts.removeValue(forKey: uuid)
-        }
+        handleCentralLinkLost(peripheralUUID: uuid, retryIfUnopened: true)
+        pendingPeripherals.removeValue(forKey: uuid)
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
         let uuid = peripheral.identifier
         log.debug("GATT client disconnected from \(uuid)")
+        pendingPeripherals[uuid] = peripheral
         connectedPeripherals.removeValue(forKey: uuid)
         deviceMtus.removeValue(forKey: uuid)
-
-        if peerNodeIds[uuid] != nil {
-            handlePeerDisconnected(peripheralUUID: uuid)
-            pendingConnections.remove(uuid)
-        } else {
-            // Retry connection for never-identified peripherals
-            let attempt = connectRetryCounts[uuid] ?? 0
-            if attempt < BleService.maxConnectRetries {
-                let delay = BleService.baseRetryDelay * Double(attempt + 1) + Double.random(in: 0...0.5)
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    guard let self = self, self.running,
-                          self.connectedPeripherals[uuid] == nil,
-                          self.peerNodeIds[uuid] == nil else {
-                        self?.pendingConnections.remove(uuid)
-                        return
-                    }
-                    self.connectToPeripheral(peripheral, attempt: attempt + 1)
-                }
-            } else {
-                pendingConnections.remove(uuid)
-                connectRetryCounts.removeValue(forKey: uuid)
-            }
-        }
+        handleCentralLinkLost(peripheralUUID: uuid, retryIfUnopened: true)
     }
 }
 
@@ -695,7 +969,7 @@ extension BleService: CBPeripheralDelegate {
         }
 
         peripheral.discoverCharacteristics(
-            [BleService.nodeIdUUID, BleService.dataTxUUID, BleService.dataRxUUID, BleService.identityUUID],
+            [BleService.dataTxUUID, BleService.dataRxUUID],
             for: service
         )
     }
@@ -706,90 +980,53 @@ extension BleService: CBPeripheralDelegate {
             return
         }
 
-        // Read Node ID
-        if let nodeIdChar = service.characteristics?.first(where: { $0.uuid == BleService.nodeIdUUID }) {
-            log.debug("Reading Node ID from \(peripheral.identifier)")
-            peripheral.readValue(for: nodeIdChar)
+        let uuid = peripheral.identifier
+
+        // Store MTU. `.withResponse` always reports 512 (long writes are
+        // split into prepare/execute, which the Android GATT server does
+        // not reassemble); `.withoutResponse` reports the negotiated ATT
+        // MTU minus the 3-byte header, which is the real single-packet size.
+        let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
+        if mtu > 0 {
+            deviceMtus[uuid] = mtu + 3  // maximumWriteValueLength already subtracts ATT header
         }
+
+        // Subscribe to RX notifications. The link is announced once that
+        // completes: before it, frames could leave but none could arrive, so
+        // a handshake would stall and be reaped.
+        guard let rxChar = service.characteristics?.first(where: { $0.uuid == BleService.dataRxUUID }) else {
+            log.warning("No RX characteristic on \(uuid), nothing can arrive")
+            centralManager?.cancelPeripheralConnection(peripheral)
+            return
+        }
+        peripheral.setNotifyValue(true, for: rxChar)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic, error: Error?) {
         if let error = error {
-            log.warning("Read/notify failed: \(error.localizedDescription)")
+            log.warning("Notify failed: \(error.localizedDescription)")
             return
         }
-
-        let uuid = peripheral.identifier
-
-        if characteristic.uuid == BleService.nodeIdUUID {
-            guard let value = characteristic.value, value.count == 32 else {
-                log.warning("Node ID read: unexpected size \(characteristic.value?.count ?? 0)")
-                return
-            }
-
-            // Don't connect to ourselves
-            if value == localNodeId {
-                log.debug("Discovered self at \(uuid), ignoring")
-                centralManager?.cancelPeripheralConnection(peripheral)
-                connectedPeripherals.removeValue(forKey: uuid)
-                pendingConnections.remove(uuid)
-                return
-            }
-
-            peerNodeIds[uuid] = value
-            nodeIdToUUID[value.hexString] = uuid
-            log.info("Peer discovered: \(value.hexString.prefix(16))... at \(uuid)")
-
-            // Store MTU. `.withResponse` always reports 512 (long writes are
-            // split into prepare/execute, which the Android GATT server does
-            // not reassemble); `.withoutResponse` reports the negotiated ATT
-            // MTU minus the 3-byte header, which is the real single-packet size.
-            let mtu = peripheral.maximumWriteValueLength(for: .withoutResponse)
-            if mtu > 0 {
-                deviceMtus[uuid] = mtu + 3  // maximumWriteValueLength already subtracts ATT header
-            }
-
-            // Subscribe to RX notifications, then write identity, then emit peerDiscovered
-            if let rxChar = peripheral.services?
-                .first(where: { $0.uuid == BleService.serviceUUID })?
-                .characteristics?.first(where: { $0.uuid == BleService.dataRxUUID }) {
-                peripheral.setNotifyValue(true, for: rxChar)
-                // peerDiscovered will be emitted after identity write in
-                // peripheral(_:didWriteValueFor:error:)
-            } else {
-                writeIdentityOrEmitDiscovered(peripheral)
-            }
-        } else if characteristic.uuid == BleService.dataRxUUID {
-            // Received data notification from peripheral
-            guard let value = characteristic.value, !value.isEmpty else { return }
-            log.debug("GATT client: received \(value.count) bytes from \(uuid)")
-            handleFragment(key: uuid.uuidString, raw: value)
-        }
+        guard characteristic.uuid == BleService.dataRxUUID,
+              let value = characteristic.value, !value.isEmpty else { return }
+        handleFragment(linkId: BleService.roleCentral + peripheral.identifier.uuidString, raw: value)
     }
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
-        if characteristic.uuid == BleService.dataRxUUID {
-            if error != nil {
-                log.warning("CCCD subscription failed, emitting peerDiscovered anyway")
-                emitPeerDiscoveredForPeripheral(peripheral)
-            } else {
-                // Subscribed — now write identity
-                writeIdentityOrEmitDiscovered(peripheral)
-            }
+        guard characteristic.uuid == BleService.dataRxUUID else { return }
+        let uuid = peripheral.identifier
+        if error != nil {
+            log.warning("Subscription failed for \(uuid); nothing could arrive")
+            centralManager?.cancelPeripheralConnection(peripheral)
+            return
+        }
+        if !refused(centralLink(uuid)) {
+            reportLinkUp(centralLink(uuid))
         }
     }
 
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
-        if characteristic.uuid == BleService.identityUUID {
-            log.debug("Identity write completed for \(peripheral.identifier)")
-            // Identity handshake done — emit peerDiscovered
-            emitPeerDiscoveredForPeripheral(peripheral)
-            return
-        }
-
-        // Data TX write completed
-        log.debug("onCharacteristicWrite: \(error == nil ? "success" : "failed") for \(peripheral.identifier)")
-        onWriteCompleted(success: error == nil)
+        onWriteCompleted(peripheralUUID: peripheral.identifier, success: error == nil)
     }
 }
 
@@ -806,7 +1043,21 @@ extension BleService: CBPeripheralManagerDelegate {
 
     func peripheralManager(_ peripheral: CBPeripheralManager, willRestoreState dict: [String: Any]) {
         log.info("Peripheral manager restoring state")
-        // Restored services/advertising will be re-configured in didUpdateState
+        // A restored service brings back its subscribed centrals, and their
+        // channel keys were in the Rust process that went away: those
+        // centrals believe their links are established, and nothing here
+        // could answer them. Every restored service is therefore removed,
+        // which invalidates the subscriptions with it, and `startPeripheral`
+        // adds a fresh one on `didUpdateState` — the same reasoning as for a
+        // restored central connection, and the same cost.
+        if let services = dict[CBPeripheralManagerRestoredStateServicesKey] as? [CBMutableService],
+           !services.isEmpty {
+            log.info("Dropping \(services.count) restored GATT service(s)")
+        }
+        peripheral.removeAllServices()
+        subscribedCentrals.removeAll()
+        gattService = nil
+        dataRxCharacteristic = nil
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, didAdd service: CBService, error: Error?) {
@@ -826,38 +1077,12 @@ extension BleService: CBPeripheralManagerDelegate {
         }
     }
 
-    func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveRead request: CBATTRequest) {
-        if request.characteristic.uuid == BleService.nodeIdUUID {
-            log.debug("Node ID read by \(request.central.identifier)")
-            if request.offset < localNodeId.count {
-                request.value = localNodeId.subdata(in: request.offset..<localNodeId.count)
-                peripheral.respond(to: request, withResult: .success)
-            } else {
-                peripheral.respond(to: request, withResult: .invalidOffset)
-            }
-        } else {
-            peripheral.respond(to: request, withResult: .readNotPermitted)
-        }
-    }
-
     func peripheralManager(_ peripheral: CBPeripheralManager, didReceiveWrite requests: [CBATTRequest]) {
         for request in requests {
-            if request.characteristic.uuid == BleService.identityUUID {
-                // Client identifying itself
-                if let value = request.value, value.count == 32 {
-                    let centralId = request.central.identifier.uuidString
-                    serverPeerNodeIds[centralId] = value
-                    serverNodeIdToIdentifier[value.hexString] = centralId
-                    log.info("GATT server: client identified as \(value.hexString.prefix(16))... (central: \(centralId.prefix(8)))")
-                    // Emit peer discovered for server-side connections
-                    delegate?.bleService(self, didDiscoverPeer: value)
-                }
-                peripheral.respond(to: request, withResult: .success)
-            } else if request.characteristic.uuid == BleService.dataTxUUID {
+            if request.characteristic.uuid == BleService.dataTxUUID {
                 if let value = request.value, !value.isEmpty {
                     let centralId = request.central.identifier.uuidString
-                    log.debug("GATT server: received \(value.count) bytes from central \(centralId.prefix(8))")
-                    handleFragment(key: centralId, raw: value)
+                    handleFragment(linkId: BleService.roleServer + centralId, raw: value)
                     peripheral.respond(to: request, withResult: .success)
                 } else {
                     peripheral.respond(to: request, withResult: .unlikelyError)
@@ -873,19 +1098,32 @@ extension BleService: CBPeripheralManagerDelegate {
         let centralId = central.identifier.uuidString
         subscribedCentrals[centralId] = central
         log.debug("Central \(centralId.prefix(8)) subscribed to notifications")
+        // Now that we can notify, the link can carry a handshake.
+        if !refused(BleService.roleServer + centralId) {
+            reportLinkUp(BleService.roleServer + centralId)
+        }
     }
 
     func peripheralManager(_ peripheral: CBPeripheralManager, central: CBCentral,
                            didUnsubscribeFrom characteristic: CBCharacteristic) {
         let centralId = central.identifier.uuidString
         subscribedCentrals.removeValue(forKey: centralId)
-        handleServerPeerDisconnected(centralIdentifier: centralId)
+        let linkId = BleService.roleServer + centralId
+        purgeWrites(for: linkId)
+        reportLinkDown(linkId)
     }
 
     func peripheralManagerIsReady(toUpdateSubscribers peripheral: CBPeripheralManager) {
-        // Called when a previous updateValue returned false. Retry.
+        // Called when a previous `updateValue` returned false, and it names
+        // no central: it says the transmit queue has room, not that any
+        // operation finished. So it resumes the queue only if what is in
+        // flight is the notification that was rewound — clearing the flag
+        // while a client write is pending would start a second write on a
+        // connection that permits one.
         writeLock.lock()
-        writeInProgress = false
+        if let head = writeQueue.first, !head.isClientWrite {
+            writeInProgress = false
+        }
         writeLock.unlock()
         processNextWrite()
     }

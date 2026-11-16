@@ -253,9 +253,10 @@ class MyceliumService {
     if (_handle == null) return; // No BLE without FFI handle
     try {
       bindings.mycelium_register_ble_transport(_handle!);
-      final nodeId = getNodeId();
+      // No node id: the platform layer carries frames and the Rust side
+      // proves who is on the other end (ADR-021, T-34).
       _bleManager = BleManager(_handle!.cast());
-      await _bleManager!.start(nodeId.bytes);
+      await _bleManager!.start();
     } catch (e) {
       debugPrint('BLE init failed: $e');
     }
@@ -267,9 +268,8 @@ class MyceliumService {
     if (_handle == null) return; // No Wi-Fi Direct without FFI handle
     try {
       bindings.mycelium_register_wifi_direct_transport(_handle!);
-      final nodeId = getNodeId();
       _wifiDirectManager = WifiDirectManager(_handle!.cast());
-      await _wifiDirectManager!.start(nodeId.bytes);
+      await _wifiDirectManager!.start();
     } catch (e) {
       debugPrint('Wi-Fi Direct init failed: $e');
     }

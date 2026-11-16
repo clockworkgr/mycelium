@@ -361,7 +361,9 @@ mod tests {
         manager.add_transport(mock).await;
         assert_eq!(manager.min_mtu().await, Some(mock_mtu));
 
-        let ble = Arc::new(BleTransport::new(local));
+        let ble = Arc::new(BleTransport::new(std::sync::Arc::new(
+            mycelium_crypto::identity::Identity::generate(),
+        )));
         let ble_mtu = ble.mtu();
         manager.add_transport(ble).await;
         assert!(ble_mtu < mock_mtu, "BLE is the narrow one here");

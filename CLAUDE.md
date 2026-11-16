@@ -66,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 548 tests).
+- `cargo test` runs the whole workspace (currently 581 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -230,12 +230,25 @@ detail matters.
 
 ### BLE transport (spec §8.4)
 
-- Dual-role GATT (server + client), 4 characteristics.
-- Fragmentation: 1-byte header (`0x01` first, `0x02` last, `0x03` single,
-  `0x00` middle).
-- Outbox polling: Dart polls the Rust `VecDeque` every 50 ms over FFI.
-- The Identity characteristic (`…7894`) is what solves BLE Random Private
-  Address mapping.
+- Dual-role GATT (server + client), 2 characteristics: Data TX (`…7892`) and
+  Data RX (`…7893`). The Node ID (`…7891`) and Identity (`…7894`)
+  characteristics are **gone** (ADR-021, T-34): they carried a bare NodeId
+  nobody proved.
+- Peer identity is proved by ADR-011's handshake run over the frame layer, and
+  the NodeId is derived from the key the peer signed. The platform bridges
+  carry **links** — an address they already hold, prefixed `c:` (we are the
+  central) or `s:` (we are the server) — and opaque frames; they report no
+  identity at all. Random Private Addresses stop mattering for the same
+  reason.
+- Sealed frames carry their counter (8 bytes LE) and the receiver keeps a
+  floor, because a lost fragment on a radio would wedge an implicit counter
+  for good. The counter is taken as a frame *leaves*, since the outbox
+  reorders for emergencies.
+- Fragmentation: Rust splits a sealed frame into 512-byte fragments with a
+  6-byte header; the platform layer splits each of those into ATT writes with
+  a 1-byte header (`0x01` first, `0x02` last, `0x03` single, `0x00` middle).
+- Outbox polling: Dart polls the Rust `VecDeque` every 50 ms over FFI, and
+  polls a link-directive queue beside it (`established` / `close`).
 
 ## Crate Dependency Order
 
@@ -259,7 +272,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-15: 548 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-16: 581 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -274,13 +287,16 @@ clean, `flutter analyze` clean.
 The highest-priority open items (all P0, all defects in shipped features): FFI
 panic guards (`T-01`), group-discovery proof of possession (`T-04`), emergency
 co-signer signatures (`T-05`, wire format and verification landed; collecting
-co-signatures is not built), identity key at rest (`T-08`), BLE/Wi-Fi Direct
-peer identity, which is asserted rather than proved (`T-34`).
+co-signatures is not built), identity key at rest (`T-08`).
 
 Landed: T-36 on 2026-11-12 (ADR-013); T-37, T-39 and T-35 on 2026-11-14
 (ADR-014, ADR-022, ADR-015); T-38 on 2026-11-15 (ADR-016) — persisted DHT
 high-water marks, so a replayed record cannot roll an address back once the
-newer one has been evicted, with `T-44` for what it left behind.
+newer one has been evicted, with `T-44` for what it left behind; T-34 on
+2026-11-16 (ADR-021) — BLE and Wi-Fi Direct prove peer identity instead of
+asserting it, in Rust and both platform bridges at once, with `T-47` for the
+two transports (BT Classic, LoRa) that still assert one and `T-48` for link
+names that are not unique across a reconnection.
 `T-40` collects four LoRa defects found reviewing
 ADR-008 against the code. `T-41` and `T-42` are what T-35 left behind — the
 unconfirmed-handshake record is in memory, so a restart loses both the sweep

@@ -15,9 +15,15 @@ import java.io.*
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Wi-Fi Direct transport service using Android WifiP2pManager.
@@ -26,8 +32,13 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Group Owner runs a TCP server on port 9740
  * - Group Clients connect to the GO's IP
  * - TCP wire protocol: 1-byte type + 4-byte BE length + payload
- *   - Hello (0x01): 32-byte node ID exchange
- *   - MeshData (0x02): variable-length mesh payload
+ *   - Frame (0x02): one opaque frame for the Rust transport
+ *
+ * The `Hello` that used to carry a bare 32-byte NodeId is gone. Identity is
+ * proved by a handshake in Rust carried over these frames, and the NodeId is
+ * derived from the key it verifies (ADR-021, ROADMAP T-34); a second,
+ * weaker path here would have been a way around it. This layer reports
+ * **links**, named by the remote socket endpoint, and relays frames.
  */
 @SuppressLint("MissingPermission")
 class WifiDirectService(private val context: Context) {
@@ -38,19 +49,51 @@ class WifiDirectService(private val context: Context) {
         private const val SERVICE_NAME = "Mycelium"
         private const val TCP_PORT = 9740
 
-        private const val MSG_HELLO: Byte = 0x01
-        private const val MSG_MESH_DATA: Byte = 0x02
+        /** One opaque frame for the Rust transport. */
+        private const val MSG_FRAME: Byte = 0x02
+
+        /** Largest frame accepted in either direction. */
+        private const val MAX_FRAME = 65535
+
+        /**
+         * How long a link may stay announced without being established
+         * before this layer closes it itself.
+         *
+         * Longer than the Rust side's ten-second handshake deadline, so its
+         * own `close` normally arrives first. This is the backstop for the
+         * case where that directive never arrives: a silent socket and its
+         * reader thread would otherwise live as long as the group does.
+         */
+        private const val STALE_LINK_MS = 20_000L
+
+        /** How often the stale-link sweep runs. */
+        private const val LINK_SWEEP_MS = 5_000L
+
+        /** How long a refused peer is left alone before we redial it. */
+        private const val REFUSED_BACKOFF_MS = 30_000L
+
+        /** Writes queued for one link while its socket is not draining. */
+        private const val MAX_PENDING_WRITES = 32
+
+        /**
+         * Sockets this layer will hold at once.
+         *
+         * Matches the Rust transport's own link bound, and exists because
+         * that bound is only applied *after* an accepted socket has been
+         * announced through Dart: a burst of connections would otherwise
+         * have a reader thread each before anything decided to refuse them.
+         */
+        private const val MAX_NATIVE_LINKS = 16
     }
 
     interface EventListener {
-        fun onPeerConnected(peerId: ByteArray)
-        fun onPeerDisconnected(peerId: ByteArray)
-        fun onDataReceived(peerId: ByteArray, data: ByteArray)
+        fun onLinkUp(linkId: String)
+        fun onLinkDown(linkId: String)
+        fun onLinkData(linkId: String, data: ByteArray)
     }
 
     var listener: EventListener? = null
 
-    private var localNodeId: ByteArray = ByteArray(32)
     private val running = AtomicBoolean(false)
 
     private var manager: WifiP2pManager? = null
@@ -63,23 +106,57 @@ class WifiDirectService(private val context: Context) {
     // Group Owner server
     private var serverSocket: ServerSocket? = null
 
-    // Connected peers: node ID hex -> PeerConnection
-    private val peers = ConcurrentHashMap<String, PeerConnection>()
+    // Live links: link id -> socket
+    private val links = ConcurrentHashMap<String, LinkConnection>()
+
+    // When each link was announced, and which have been established: a link
+    // that never completes its handshake is closed here rather than waited on.
+    private val linkOpenedAt = ConcurrentHashMap<String, Long>()
+    private val establishedLinks = ConcurrentHashMap<String, Boolean>()
+
+    // Peers whose handshake was refused, by remote address, with the time
+    // they may be dialled again. By address rather than endpoint: the port is
+    // ephemeral and changes on every reconnection, so an endpoint-keyed entry
+    // would never match the socket it is meant to hold off.
+    private val refusedUntil = ConcurrentHashMap<String, Long>()
+
+    // Accepted sockets, counted from the accept rather than from
+    // registration: a handler is scheduled asynchronously, so a burst would
+    // otherwise see an empty table and give every socket a reader thread
+    // before anything refused it.
+    private val nativeSockets = AtomicInteger(0)
+
+    // Sweep timer
+    private var sweeper: ScheduledExecutorService? = null
+
+    /// Serialises a link's registration, its cleanup and the lifecycle
+    /// events either sends. Without it, removing the old socket publishes a
+    /// vacant name before the old cleanup has finished, so a replacement can
+    /// register and announce itself and then have its own bookkeeping
+    /// deleted — and its Rust link torn down — by the cleanup that was
+    /// already running.
+    private val lifecycleLock = Any()
 
     // Track whether we are Group Owner
     @Volatile private var isGroupOwner = false
 
-    private class PeerConnection(
-        val nodeId: ByteArray,
+    private class LinkConnection(
         val socket: Socket,
-        val output: DataOutputStream
+        val output: DataOutputStream,
+        /// One thread per link, so frames leave in the order they were
+        /// queued. A shared pool keeps whole frames intact but not their
+        /// order, and a frame overtaken on a link is refused by the
+        /// receiver's counter floor (ADR-021).
+        ///
+        /// Typed as the concrete executor because its backlog is inspected:
+        /// `ExecutorService` exposes no queue.
+        val writer: ThreadPoolExecutor
     )
 
     // --- Public API ---
 
-    fun start(nodeId: ByteArray) {
+    fun start() {
         if (running.getAndSet(true)) return
-        localNodeId = nodeId
         Log.i(TAG, "Starting Wi-Fi Direct service")
 
         manager = context.getSystemService(Context.WIFI_P2P_SERVICE) as? WifiP2pManager
@@ -94,18 +171,72 @@ class WifiDirectService(private val context: Context) {
         registerReceiver()
         registerService()
         discoverServices()
+
+        sweeper = Executors.newSingleThreadScheduledExecutor().also {
+            it.scheduleWithFixedDelay(
+                { sweepStaleLinks() }, LINK_SWEEP_MS, LINK_SWEEP_MS, TimeUnit.MILLISECONDS
+            )
+        }
+    }
+
+    /**
+     * Close links that never finished their handshake, and forget expired
+     * refusals.
+     *
+     * The Rust side reaps a stalled handshake at its own deadline and asks us
+     * to close the link, but that directive is polled; a queue that overflows
+     * or an app that stops polling would leave a socket and its reader thread
+     * alive for the life of the group. This layer owns the socket, so it does
+     * not depend on being told.
+     */
+    private fun sweepStaleLinks() {
+        if (!running.get()) return
+        val now = System.currentTimeMillis()
+        refusedUntil.entries.removeAll { now >= it.value }
+        for (linkId in linkOpenedAt.keys.toList()) {
+            // Read and acted on under the lifecycle lock, with the
+            // connection identified: between a check outside the lock and
+            // the close, a reconnection can take over the endpoint, and it
+            // would be the replacement that was closed.
+            synchronized(lifecycleLock) {
+                val openedAt = linkOpenedAt[linkId] ?: return@synchronized
+                if (establishedLinks.containsKey(linkId)) return@synchronized
+                if (now - openedAt < STALE_LINK_MS) return@synchronized
+                val held = links[linkId] ?: return@synchronized
+                Log.w(
+                    TAG,
+                    "Closing $linkId: announced ${now - openedAt} ms ago, never established"
+                )
+                dropLink(linkId, held)
+            }
+        }
+    }
+
+    private fun refused(address: String?): Boolean {
+        val until = refusedUntil[address ?: return false] ?: return false
+        if (System.currentTimeMillis() >= until) {
+            refusedUntil.remove(address)
+            return false
+        }
+        return true
     }
 
     fun stop() {
         if (!running.getAndSet(false)) return
         Log.i(TAG, "Stopping Wi-Fi Direct service")
 
-        // Fire peer disconnected for all connected peers
-        for ((_, peer) in peers) {
-            closePeerQuietly(peer)
-            listener?.onPeerDisconnected(peer.nodeId)
+        sweeper?.shutdownNow()
+        sweeper = null
+
+        for ((linkId, link) in links) {
+            closeQuietly(link)
+            listener?.onLinkDown(linkId)
         }
-        peers.clear()
+        links.clear()
+        nativeSockets.set(0)
+        linkOpenedAt.clear()
+        establishedLinks.clear()
+        refusedUntil.clear()
 
         // Close server socket
         try { serverSocket?.close() } catch (_: Exception) {}
@@ -132,31 +263,89 @@ class WifiDirectService(private val context: Context) {
         Log.i(TAG, "Wi-Fi Direct service stopped")
     }
 
-    fun sendData(peerId: ByteArray, data: ByteArray): Boolean {
-        val peerHex = peerId.toHex()
-        val peer = peers[peerHex] ?: run {
-            Log.w(TAG, "sendData: no connection for peer ${peerHex.take(16)}")
+    /**
+     * Write one frame on a link.
+     *
+     * `isHandshake` comes from the Rust side, which is the only layer that
+     * knows: a link counts as established there as soon as the peer's
+     * confirmation arrives, which can be before our own has left. A
+     * handshake frame makes room for itself in a full queue rather than
+     * being the frame that is dropped.
+     */
+    fun sendData(linkId: String, data: ByteArray, isHandshake: Boolean): Boolean {
+        val link = links[linkId] ?: run {
+            Log.w(TAG, "sendData: no link $linkId")
+            return false
+        }
+        if (data.size > MAX_FRAME) {
+            Log.w(TAG, "sendData: frame of ${data.size} bytes exceeds $MAX_FRAME")
             return false
         }
 
-        executor.execute {
-            try {
-                writeFrame(peer.output, MSG_MESH_DATA, data)
-            } catch (e: Exception) {
-                Log.w(TAG, "sendData failed for ${peerHex.take(16)}: ${e.message}")
-                handlePeerDisconnected(peerHex, peer)
+        val backlog = link.writer.queue
+        if (backlog.remainingCapacity() == 0) {
+            if (!isHandshake) {
+                Log.w(TAG, "sendData: $linkId has $MAX_PENDING_WRITES writes waiting, dropping a frame")
+                return false
             }
+            // The oldest ordinary write goes instead: a handshake frame that
+            // is dropped costs the link its whole authentication.
+            backlog.poll()
+            Log.w(TAG, "sendData: made room on $linkId for a handshake frame")
+        }
+
+        try {
+            link.writer.execute {
+                try {
+                    writeFrame(link.output, MSG_FRAME, data)
+                } catch (e: Exception) {
+                    Log.w(TAG, "sendData failed on $linkId: ${e.message}")
+                    dropLink(linkId, link)
+                }
+            }
+        } catch (e: RejectedExecutionException) {
+            Log.w(TAG, "sendData on a closed link $linkId")
+            return false
         }
         return true
+    }
+
+    /**
+     * Close a link Rust refused: its handshake failed, timed out, named us,
+     * or there was no room for it. Nothing was installed for it.
+     */
+    fun closeLink(linkId: String) {
+        Log.i(TAG, "Closing refused link $linkId")
+        // Held off by address: the group's own callbacks will otherwise
+        // redial the same peer as soon as the socket drops, and its handshake
+        // will fail again for whatever reason it failed the first time.
+        links[linkId]?.socket?.inetAddress?.hostAddress?.let { address ->
+            refusedUntil[address] = System.currentTimeMillis() + REFUSED_BACKOFF_MS
+        }
+        dropLink(linkId)
+    }
+
+    /** A link became established: stop sweeping it, and forget the backoff. */
+    fun onLinkEstablished(linkId: String) {
+        // The directive is polled, so it can arrive after the socket has
+        // gone; marking a link we no longer hold would let a replacement of
+        // the same name inherit the mark and skip the stale-link sweep.
+        if (!linkOpenedAt.containsKey(linkId)) {
+            Log.d(TAG, "Ignoring an establishment for a link we no longer hold: $linkId")
+            return
+        }
+        establishedLinks[linkId] = true
+        links[linkId]?.socket?.inetAddress?.hostAddress?.let { refusedUntil.remove(it) }
+        Log.i(TAG, "Link $linkId established")
     }
 
     // --- Service Registration ---
 
     private fun registerService() {
-        val nodePrefix = localNodeId.toHex().take(16)
-        val record = mapOf("node" to nodePrefix)
+        // The record carries no node id: nothing unproved identifies a node
+        // any more, and the service type is what discovery needs.
         val serviceInfo = WifiP2pDnsSdServiceInfo.newInstance(
-            SERVICE_NAME, SERVICE_TYPE, record
+            SERVICE_NAME, SERVICE_TYPE, emptyMap()
         )
 
         manager?.addLocalService(channel, serviceInfo, object : WifiP2pManager.ActionListener {
@@ -259,7 +448,13 @@ class WifiDirectService(private val context: Context) {
                 while (running.get()) {
                     try {
                         val client = serverSocket?.accept() ?: break
-                        executor.execute { handleClient(client) }
+                        if (nativeSockets.incrementAndGet() > MAX_NATIVE_LINKS) {
+                            nativeSockets.decrementAndGet()
+                            Log.w(TAG, "Refusing a socket: $MAX_NATIVE_LINKS already held")
+                            try { client.close() } catch (_: Exception) {}
+                            continue
+                        }
+                        executor.execute { handleClient(client, counted = true) }
                     } catch (e: Exception) {
                         if (running.get()) {
                             Log.w(TAG, "Server accept error: ${e.message}")
@@ -276,11 +471,25 @@ class WifiDirectService(private val context: Context) {
     // --- TCP Client (Group Client) ---
 
     private fun connectToGroupOwner(goIp: String) {
+        // Checked before the socket is opened: the group's own callbacks
+        // fire on every reconnection, and dialling a peer we just refused
+        // only to close its socket in `handleClient` is not the holdoff the
+        // backoff promises.
+        if (refused(goIp)) {
+            Log.d(TAG, "Not dialling $goIp: refused recently")
+            return
+        }
         try {
             Log.i(TAG, "Connecting to Group Owner at $goIp:$TCP_PORT")
             val socket = Socket()
             socket.connect(InetSocketAddress(goIp, TCP_PORT), 5000)
-            handleClient(socket)
+            if (nativeSockets.incrementAndGet() > MAX_NATIVE_LINKS) {
+                nativeSockets.decrementAndGet()
+                Log.w(TAG, "Not keeping the GO socket: $MAX_NATIVE_LINKS already held")
+                try { socket.close() } catch (_: Exception) {}
+                return
+            }
+            handleClient(socket, counted = true)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to connect to GO: ${e.message}")
         }
@@ -288,72 +497,93 @@ class WifiDirectService(private val context: Context) {
 
     // --- Shared Client Handler ---
 
-    private fun handleClient(socket: Socket) {
-        var peerHex: String? = null
+    /** The remote endpoint names the link; it is unique while the socket is. */
+    private fun linkIdFor(socket: Socket): String =
+        "${socket.inetAddress?.hostAddress ?: "?"}:${socket.port}"
+
+    private fun handleClient(socket: Socket, counted: Boolean) {
+        val linkId = linkIdFor(socket)
+        var announced = false
+        // This reader's own connection, so its cleanup cannot remove a
+        // replacement that reused the name.
+        var mine: LinkConnection? = null
+        if (refused(socket.inetAddress?.hostAddress)) {
+            Log.d(TAG, "Dropping a socket from a peer we just refused: $linkId")
+            try { socket.close() } catch (_: Exception) {}
+            return
+        }
         try {
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
 
-            // Send Hello with our node ID
-            writeFrame(output, MSG_HELLO, localNodeId)
-
-            // Read Hello from peer
-            val (type, payload) = readFrame(input)
-            if (type != MSG_HELLO || payload.size != 32) {
-                Log.w(TAG, "Invalid Hello from peer")
-                socket.close()
-                return
+            // One thread per link so frames leave in order, with a bounded
+            // backlog: the Rust outbox frees its own capacity as soon as a
+            // frame is handed over, so an unbounded queue here would grow
+            // without limit behind a stalled socket. The oldest queued write
+            // is what goes.
+            // Bounded, and rejecting rather than discarding: a
+            // discard policy decides *for* us which write goes, and it
+            // would throw away a handshake frame as readily as a data
+            // frame. `sendData` makes that choice instead.
+            val writer = ThreadPoolExecutor(
+                1, 1, 0L, TimeUnit.MILLISECONDS,
+                ArrayBlockingQueue(MAX_PENDING_WRITES)
+            )
+            val connection = LinkConnection(socket, output, writer)
+            synchronized(lifecycleLock) {
+                val existing = links.putIfAbsent(linkId, connection)
+                if (existing != null) {
+                    // The previous socket of the same name may already be
+                    // dead with its reader not yet finished cleaning up;
+                    // replace it then. Otherwise this is a real duplicate.
+                    if (existing.socket.isClosed) {
+                        links.remove(linkId, existing)
+                        closeQuietly(existing)
+                    }
+                    if (links.putIfAbsent(linkId, connection) != null) {
+                        writer.shutdownNow()
+                        Log.w(TAG, "A link named $linkId already exists; closing the duplicate")
+                        try { socket.close() } catch (_: Exception) {}
+                        return
+                    }
+                }
+                mine = connection
+                announced = true
+                linkOpenedAt[linkId] = System.currentTimeMillis()
+                // Rust answers with its handshake; nothing identifies the
+                // peer until that completes.
+                listener?.onLinkUp(linkId)
             }
 
-            val peerId = payload
-            peerHex = peerId.toHex()
-
-            // Don't connect to ourselves
-            if (peerId.contentEquals(localNodeId)) {
-                Log.d(TAG, "Connected to self, closing")
-                socket.close()
-                return
-            }
-
-            // Already connected?
-            if (peers.containsKey(peerHex)) {
-                Log.d(TAG, "Already connected to ${peerHex.take(16)}, closing duplicate")
-                socket.close()
-                return
-            }
-
-            val conn = PeerConnection(peerId, socket, output)
-            peers[peerHex] = conn
-            Log.i(TAG, "Peer connected: ${peerHex.take(16)}")
-            listener?.onPeerConnected(peerId)
-
-            // Read loop
             while (running.get() && !socket.isClosed) {
                 val (msgType, data) = readFrame(input)
                 when (msgType) {
-                    MSG_MESH_DATA -> {
-                        Log.d(TAG, "Received ${data.size} bytes from ${peerHex.take(16)}")
-                        listener?.onDataReceived(peerId, data)
+                    MSG_FRAME -> synchronized(lifecycleLock) {
+                        // Only while this reader still owns the link: an
+                        // endpoint is reused on reconnection, and a frame
+                        // read from the old socket would otherwise be fed
+                        // into the replacement's handshake and close it.
+                        if (links[linkId] === connection) {
+                            listener?.onLinkData(linkId, data)
+                        } else {
+                            Log.d(TAG, "Dropping a frame from a superseded link $linkId")
+                        }
                     }
-                    else -> {
-                        Log.w(TAG, "Unknown message type: $msgType")
-                    }
+                    else -> Log.w(TAG, "Unknown message type: $msgType")
                 }
             }
         } catch (e: Exception) {
             if (running.get()) {
-                Log.d(TAG, "Peer connection ended: ${e.message}")
+                Log.d(TAG, "Link $linkId ended: ${e.message}")
             }
         } finally {
-            if (peerHex != null) {
-                val peer = peers.remove(peerHex)
-                if (peer != null) {
-                    closePeerQuietly(peer)
-                    Log.i(TAG, "Peer disconnected: ${peerHex.take(16)}")
-                    listener?.onPeerDisconnected(peer.nodeId)
-                }
+            if (announced) {
+                dropLink(linkId, mine)
             } else {
                 try { socket.close() } catch (_: Exception) {}
+            }
+            if (counted) {
+                nativeSockets.decrementAndGet()
             }
         }
     }
@@ -372,7 +602,7 @@ class WifiDirectService(private val context: Context) {
     private fun readFrame(input: DataInputStream): Pair<Byte, ByteArray> {
         val type = input.readByte()
         val length = input.readInt()
-        if (length < 0 || length > 65535) {
+        if (length < 0 || length > MAX_FRAME) {
             throw IOException("Invalid frame length: $length")
         }
         val data = ByteArray(length)
@@ -430,27 +660,47 @@ class WifiDirectService(private val context: Context) {
 
     private fun handleGroupDisconnected() {
         Log.i(TAG, "Wi-Fi Direct group disconnected")
-        for ((hex, peer) in peers) {
-            closePeerQuietly(peer)
-            listener?.onPeerDisconnected(peer.nodeId)
+        for (linkId in links.keys) {
+            dropLink(linkId)
         }
-        peers.clear()
 
         // Close server socket so it can be restarted on next group formation
         try { serverSocket?.close() } catch (_: Exception) {}
         serverSocket = null
     }
 
-    private fun handlePeerDisconnected(peerHex: String, peer: PeerConnection) {
-        if (peers.remove(peerHex) != null) {
-            closePeerQuietly(peer)
-            listener?.onPeerDisconnected(peer.nodeId)
+    /**
+     * Forget a link, optionally only if it is still the connection expected.
+     *
+     * A group client always dials `goIp:9740`, so a reconnection reuses the
+     * link's name. Without the identity check, an old reader's cleanup — or a
+     * queued write failing on its closed socket — would remove the
+     * replacement that had just registered under that name and report *it*
+     * down.
+     */
+    private fun dropLink(linkId: String, expected: LinkConnection? = null) {
+        synchronized(lifecycleLock) {
+            val held = links[linkId] ?: return
+            if (expected != null && held !== expected) {
+                Log.d(TAG, "Not dropping $linkId: it is a newer connection")
+                return
+            }
+            if (!links.remove(linkId, held)) {
+                Log.d(TAG, "Not dropping $linkId: it changed under us")
+                return
+            }
+            linkOpenedAt.remove(linkId)
+            establishedLinks.remove(linkId)
+            closeQuietly(held)
+            Log.i(TAG, "Link down: $linkId")
+            listener?.onLinkDown(linkId)
         }
     }
 
-    private fun closePeerQuietly(peer: PeerConnection) {
-        try { peer.socket.close() } catch (_: Exception) {}
+    private fun closeQuietly(link: LinkConnection) {
+        try { link.socket.close() } catch (_: Exception) {}
+        // Cancelled rather than drained: a queued write would only fail
+        // against a closed socket and report the link down again.
+        link.writer.shutdownNow()
     }
 }
-
-private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }

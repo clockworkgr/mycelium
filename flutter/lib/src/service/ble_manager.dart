@@ -8,29 +8,20 @@ import 'package:flutter/services.dart';
 import '../ffi/native_library.dart';
 import 'ffi_helpers.dart';
 
-/// Signature of mycelium_ble_dequeue_send FFI function.
-typedef _DequeueSendNative = Int32 Function(
-  Pointer<Void> handle,
-  Pointer<Uint8> outPeerId,
-  Pointer<Uint8> outData,
-  Uint32 dataCapacity,
-  Pointer<Uint32> outDataLen,
-);
-typedef _DequeueSendDart = int Function(
-  Pointer<Void> handle,
-  Pointer<Uint8> outPeerId,
-  Pointer<Uint8> outData,
-  int dataCapacity,
-  Pointer<Uint32> outDataLen,
-);
-
-/// Bridges Kotlin BLE platform channel <-> Rust FFI transport events.
+/// Bridges Kotlin/Swift BLE platform channels <-> Rust FFI transport events.
 ///
-/// Listens for BLE events from Kotlin and forwards them to the Rust node
-/// via FFI. Polls the Rust outbox for outgoing data and sends it via Kotlin.
+/// Carries **links**, not peers: the platform layer reports the address it
+/// has for a connection and relays opaque frames, and who is on the other
+/// end is settled by a handshake inside Rust (ADR-021, ROADMAP T-34). This
+/// manager forwards link events to the Rust transport, drains its outbox, and
+/// executes the link directives it hands back.
 class BleManager {
   static const _methodChannel = MethodChannel('com.mycelium.ble');
   static const _eventChannel = EventChannel('com.mycelium.ble/events');
+
+  /// Link directives, matching MYCELIUM_LINK_* in mycelium.h.
+  static const _linkEstablished = 1;
+  static const _linkClose = 2;
 
   final Pointer<Void> _nodeHandle;
   Timer? _outboxTimer;
@@ -39,49 +30,53 @@ class BleManager {
   int _pollCount = 0;
   int _sendCount = 0;
 
-  // Lazily resolved dequeue_send function
-  _DequeueSendDart? _dequeueSend;
-
   // Pre-allocated buffers for outbox polling (avoid per-tick allocation)
-  Pointer<Uint8>? _peerBuf;
+  Pointer<Char>? _addrBuf;
   Pointer<Uint8>? _dataBuf;
   Pointer<Uint32>? _lenBuf;
+  Pointer<Uint32>? _eventBuf;
+  Pointer<Uint32>? _handshakeBuf;
+
+  /// Room for the longest link address the Rust side accepts, terminator
+  /// included (MAX_LINK_ADDR).
+  static const _addrCapacity = 64;
+
+  /// A BLE frame is at most 512 bytes; the margin costs nothing and a frame
+  /// that does not fit is dropped rather than truncated.
   static const _dataCapacity = 1024;
 
   BleManager(this._nodeHandle);
 
-  /// Start BLE transport: launch Kotlin BLE, listen for events, start outbox polling.
-  Future<void> start(Uint8List nodeId) async {
+  /// Start BLE transport: launch the platform service, listen for link
+  /// events, start outbox polling.
+  Future<void> start() async {
     if (_running) return;
     _running = true;
 
-    // Resolve the dequeue_send FFI function
-    _resolveDequeueSend();
-
-    // Allocate polling buffers
-    _peerBuf = calloc<Uint8>(32);
+    _addrBuf = calloc<Char>(_addrCapacity);
     _dataBuf = calloc<Uint8>(_dataCapacity);
     _lenBuf = calloc<Uint32>(1);
+    _eventBuf = calloc<Uint32>(1);
+    _handshakeBuf = calloc<Uint32>(1);
 
-    // Start Kotlin BLE
-    try {
-      await _methodChannel.invokeMethod('start', {
-        'nodeId': nodeId.toList(),
-      });
-    } catch (e) {
-      debugPrint('BleManager: failed to start Kotlin BLE: $e');
-    }
-
-    // Listen for events from Kotlin
+    // Listening before starting: an event emitted during startup would
+    // otherwise be dropped while the platform layer still counted its link
+    // as announced, and every frame on it would then reach Rust as an
+    // unknown link and be refused.
     _eventSubscription = _eventChannel.receiveBroadcastStream().listen(
       _onEvent,
       onError: (e) => debugPrint('BleManager: event error: $e'),
     );
 
-    // Poll outbox at 50ms
+    try {
+      await _methodChannel.invokeMethod('start');
+    } catch (e) {
+      debugPrint('BleManager: failed to start platform BLE: $e');
+    }
+
     _outboxTimer = Timer.periodic(
       const Duration(milliseconds: 50),
-      (_) => _pollOutbox(),
+      (_) => _poll(),
     );
 
     debugPrint('BleManager: started');
@@ -101,163 +96,160 @@ class BleManager {
     try {
       await _methodChannel.invokeMethod('stop');
     } catch (e) {
-      debugPrint('BleManager: failed to stop Kotlin BLE: $e');
+      debugPrint('BleManager: failed to stop platform BLE: $e');
     }
 
-    // Free polling buffers
-    if (_peerBuf != null) calloc.free(_peerBuf!);
+    if (_addrBuf != null) calloc.free(_addrBuf!);
     if (_dataBuf != null) calloc.free(_dataBuf!);
     if (_lenBuf != null) calloc.free(_lenBuf!);
-    _peerBuf = null;
+    if (_eventBuf != null) calloc.free(_eventBuf!);
+    if (_handshakeBuf != null) calloc.free(_handshakeBuf!);
+    _addrBuf = null;
     _dataBuf = null;
     _lenBuf = null;
+    _eventBuf = null;
+    _handshakeBuf = null;
 
     debugPrint('BleManager: stopped');
   }
 
-  /// Handle events from Kotlin BLE.
+  /// Handle link events from the platform layer.
   void _onEvent(dynamic event) {
-    debugPrint('BleManager: event received: $event');
-    if (event is! Map) {
-      debugPrint('BleManager: event is not a Map, ignoring');
-      return;
-    }
+    if (event is! Map) return;
     final type = event['type'] as String?;
-    final peerIdList = event['peerId'] as List?;
-
-    if (type == null || peerIdList == null) {
-      debugPrint('BleManager: event missing type or peerId');
+    final linkId = event['linkId'] as String?;
+    if (type == null || linkId == null || linkId.isEmpty) {
+      debugPrint('BleManager: event missing type or linkId');
       return;
     }
-    final peerId = Uint8List.fromList(peerIdList.cast<int>());
 
     switch (type) {
-      case 'peerDiscovered':
-        debugPrint('BleManager: forwarding peerDiscovered to FFI');
-        _forwardPeerDiscovered(peerId);
+      case 'linkUp':
+        _withLinkId(linkId, (ptr) => bindings.mycelium_ble_on_link_up(
+              _nodeHandle.cast(),
+              ptr,
+            ));
         break;
-      case 'peerLost':
-        debugPrint('BleManager: forwarding peerLost to FFI');
-        _forwardPeerLost(peerId);
+      case 'linkDown':
+        _withLinkId(linkId, (ptr) => bindings.mycelium_ble_on_link_down(
+              _nodeHandle.cast(),
+              ptr,
+            ));
         break;
-      case 'dataReceived':
+      case 'linkData':
         final dataList = event['data'] as List?;
-        if (dataList != null) {
-          final data = Uint8List.fromList(dataList.cast<int>());
-          debugPrint('BleManager: forwarding dataReceived (${data.length} bytes) to FFI');
-          _forwardDataReceived(peerId, data);
+        if (dataList == null) return;
+        final data = Uint8List.fromList(dataList.cast<int>());
+        final dataPtr = toNativeBytes(data);
+        try {
+          _withLinkId(linkId, (ptr) => bindings.mycelium_ble_on_link_data(
+                _nodeHandle.cast(),
+                ptr,
+                dataPtr,
+                data.length,
+              ));
+        } finally {
+          calloc.free(dataPtr);
         }
         break;
     }
   }
 
-  void _forwardPeerDiscovered(Uint8List peerId) {
-    final peerPtr = toNativeBytes(peerId);
+  void _withLinkId(String linkId, int Function(Pointer<Char>) call) {
+    final ptr = toNativeString(linkId);
     try {
-      final result = bindings.mycelium_ble_on_peer_discovered(
-        _nodeHandle.cast(),
-        peerPtr,
-      );
-      debugPrint('BleManager: mycelium_ble_on_peer_discovered returned $result');
-    } finally {
-      calloc.free(peerPtr);
-    }
-  }
-
-  void _forwardPeerLost(Uint8List peerId) {
-    final peerPtr = toNativeBytes(peerId);
-    try {
-      bindings.mycelium_ble_on_peer_lost(
-        _nodeHandle.cast(),
-        peerPtr,
-      );
-    } finally {
-      calloc.free(peerPtr);
-    }
-  }
-
-  void _forwardDataReceived(Uint8List peerId, Uint8List data) {
-    final peerPtr = toNativeBytes(peerId);
-    final dataPtr = toNativeBytes(data);
-    try {
-      bindings.mycelium_ble_on_data_received(
-        _nodeHandle.cast(),
-        peerPtr,
-        dataPtr,
-        data.length,
-      );
-    } finally {
-      calloc.free(peerPtr);
-      calloc.free(dataPtr);
-    }
-  }
-
-  /// Poll the Rust outbox and forward packets to Kotlin BLE.
-  void _pollOutbox() {
-    if (!_running || _dequeueSend == null) {
-      if (_pollCount == 0) {
-        debugPrint('BleManager: _pollOutbox skipped: running=$_running dequeueSend=${_dequeueSend != null}');
+      final result = call(ptr);
+      if (result < 0) {
+        debugPrint('BleManager: FFI link call for $linkId returned $result');
       }
-      return;
+    } finally {
+      calloc.free(ptr);
     }
-    final peerBuf = _peerBuf;
+  }
+
+  /// Drain the Rust outbox and the link directives it queues.
+  void _poll() {
+    if (!_running) return;
+    final addrBuf = _addrBuf;
     final dataBuf = _dataBuf;
     final lenBuf = _lenBuf;
-    if (peerBuf == null || dataBuf == null || lenBuf == null) return;
-
-    _pollCount++;
-    // Log heartbeat every 10 seconds (200 ticks at 50ms)
-    if (_pollCount % 200 == 0) {
-      debugPrint('BleManager: outbox poll heartbeat #$_pollCount (sent=$_sendCount)');
+    final eventBuf = _eventBuf;
+    final handshakeBuf = _handshakeBuf;
+    if (addrBuf == null ||
+        dataBuf == null ||
+        lenBuf == null ||
+        eventBuf == null ||
+        handshakeBuf == null) {
+      return;
     }
 
-    // Drain all queued packets in one poll cycle
+    _pollCount++;
+    if (_pollCount % 200 == 0) {
+      debugPrint('BleManager: poll heartbeat #$_pollCount (sent=$_sendCount)');
+    }
+
+    // Directives first: a link Rust has refused should stop carrying frames
+    // before anything else is written to it.
     while (true) {
-      final result = _dequeueSend!(
-        _nodeHandle,
-        peerBuf,
+      final result = bindings.mycelium_ble_dequeue_link_event(
+        _nodeHandle.cast(),
+        addrBuf,
+        _addrCapacity,
+        eventBuf,
+      );
+      if (result != 1) break;
+      final linkId = addrBuf.cast<Utf8>().toDartString();
+      switch (eventBuf.value) {
+        case _linkEstablished:
+          _methodChannel.invokeMethod('linkEstablished', {'linkId': linkId})
+              .catchError((e) {
+            debugPrint('BleManager: linkEstablished call failed: $e');
+          });
+          break;
+        case _linkClose:
+          _methodChannel.invokeMethod('closeLink', {'linkId': linkId})
+              .catchError((e) {
+            debugPrint('BleManager: closeLink call failed: $e');
+          });
+          break;
+      }
+    }
+
+    // Then every queued frame.
+    while (true) {
+      final result = bindings.mycelium_ble_dequeue_send(
+        _nodeHandle.cast(),
+        addrBuf,
+        _addrCapacity,
         dataBuf,
         _dataCapacity,
         lenBuf,
+        handshakeBuf,
       );
 
-      if (result != 1) break;
+      if (result != 1) {
+        if (result < 0) {
+          debugPrint('BleManager: dequeue_send returned $result');
+        }
+        break;
+      }
 
       _sendCount++;
-      final peerId = Uint8List.fromList(peerBuf.asTypedList(32));
+      final linkId = addrBuf.cast<Utf8>().toDartString();
       final dataLen = lenBuf.value;
       final data = Uint8List.fromList(dataBuf.asTypedList(dataLen));
 
-      debugPrint('BleManager: outbox dequeued $dataLen bytes for peer ${peerId.sublist(0, 4)}');
-
+      // Which frames are a handshake is the Rust side's to say: a link
+      // counts as established there as soon as the peer's confirmation
+      // arrives, which can be before our own has left, so the platform
+      // layer cannot work it out from what it can see.
       _methodChannel.invokeMethod('sendData', {
-        'peerId': peerId.toList(),
+        'linkId': linkId,
         'data': data.toList(),
+        'isHandshake': handshakeBuf.value != 0,
       }).catchError((e) {
         debugPrint('BleManager: sendData platform call failed: $e');
       });
     }
-  }
-
-  void _resolveDequeueSend() {
-    try {
-      final lib = _getNativeLibrary();
-      final funcPtr = lib.lookup<NativeFunction<_DequeueSendNative>>(
-        'mycelium_ble_dequeue_send',
-      );
-      _dequeueSend = funcPtr.asFunction<_DequeueSendDart>();
-    } catch (e) {
-      debugPrint('BleManager: could not resolve mycelium_ble_dequeue_send: $e');
-    }
-  }
-
-  DynamicLibrary _getNativeLibrary() {
-    // Same logic as native_library.dart but returns the raw DynamicLibrary
-    if (defaultTargetPlatform == TargetPlatform.android) {
-      return DynamicLibrary.open('libmycelium_ffi.so');
-    } else if (defaultTargetPlatform == TargetPlatform.iOS) {
-      return DynamicLibrary.process();
-    }
-    throw UnsupportedError('BLE not supported on this platform');
   }
 }

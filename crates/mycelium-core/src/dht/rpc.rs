@@ -1,4 +1,10 @@
-//! Wire messages for the internet transport and its DHT.
+//! Wire messages for keyed transport channels and the DHT.
+//!
+//! The handshake and data frames serve every authenticated channel: the
+//! internet transport over TCP, and BLE and Wi-Fi Direct over the local
+//! fragmentation layer (ADR-011, ADR-021). The `Dht` and `DhtReply` variants
+//! belong to the internet transport alone; a local link refuses them, since
+//! there is no DHT on a radio.
 //!
 //! Framing is a 4-byte little-endian body length followed by a binary body
 //! (little-endian throughout, as in §4). The previous encoding was JSON, which
@@ -125,7 +131,7 @@ pub enum DhtReplyBody {
 
 /// Messages exchanged over an internet-transport connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InternetWireMessage {
+pub enum ChannelWireMessage {
     /// A mesh envelope being carried between nodes.
     MeshData {
         sender_id: NodeId,
@@ -152,17 +158,17 @@ pub enum InternetWireMessage {
 }
 
 /// Encode a message body (no length prefix).
-pub fn encode_body(msg: &InternetWireMessage) -> Vec<u8> {
+pub fn encode_body(msg: &ChannelWireMessage) -> Vec<u8> {
     let mut out = Vec::new();
     match msg {
-        InternetWireMessage::MeshData { sender_id, data } => {
+        ChannelWireMessage::MeshData { sender_id, data } => {
             out.reserve(MESH_DATA_OVERHEAD + data.len());
             out.push(TAG_MESH_DATA);
             out.extend_from_slice(sender_id.as_bytes());
             out.extend_from_slice(&(data.len() as u32).to_le_bytes());
             out.extend_from_slice(data);
         }
-        InternetWireMessage::Dht(req) => {
+        ChannelWireMessage::Dht(req) => {
             out.push(TAG_DHT_REQUEST);
             out.extend_from_slice(&req.request_id.to_le_bytes());
             match &req.body {
@@ -181,7 +187,7 @@ pub fn encode_body(msg: &InternetWireMessage) -> Vec<u8> {
                 }
             }
         }
-        InternetWireMessage::DhtReply(reply) => {
+        ChannelWireMessage::DhtReply(reply) => {
             out.push(TAG_DHT_REPLY);
             out.extend_from_slice(&reply.request_id.to_le_bytes());
             match &reply.body {
@@ -205,7 +211,7 @@ pub fn encode_body(msg: &InternetWireMessage) -> Vec<u8> {
                 DhtReplyBody::Rejected => out.push(REP_REJECTED),
             }
         }
-        InternetWireMessage::Hello {
+        ChannelWireMessage::Hello {
             identity_key,
             ephemeral_public,
             listen_port,
@@ -217,7 +223,7 @@ pub fn encode_body(msg: &InternetWireMessage) -> Vec<u8> {
             out.extend_from_slice(&listen_port.to_le_bytes());
             out.extend_from_slice(signature);
         }
-        InternetWireMessage::Confirm { transcript } => {
+        ChannelWireMessage::Confirm { transcript } => {
             out.push(TAG_CONFIRM);
             out.extend_from_slice(transcript);
         }
@@ -233,7 +239,7 @@ fn encode_record(out: &mut Vec<u8>, record: &DhtRecord) {
 }
 
 /// Encode a message with its 4-byte little-endian length prefix.
-pub fn serialize_wire_message(msg: &InternetWireMessage) -> Vec<u8> {
+pub fn serialize_wire_message(msg: &ChannelWireMessage) -> Vec<u8> {
     let body = encode_body(msg);
     let mut buf = Vec::with_capacity(4 + body.len());
     buf.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -242,14 +248,14 @@ pub fn serialize_wire_message(msg: &InternetWireMessage) -> Vec<u8> {
 }
 
 /// Decode a message body (the bytes after the length prefix).
-pub fn deserialize_wire_message(data: &[u8]) -> Result<InternetWireMessage, CodecError> {
+pub fn deserialize_wire_message(data: &[u8]) -> Result<ChannelWireMessage, CodecError> {
     let mut r = Reader::new(data);
     let msg = match r.u8()? {
         TAG_MESH_DATA => {
             let sender_id = NodeId::from_bytes(r.array::<32>()?);
             let len = r.u32()? as usize;
             let data = r.take(len)?.to_vec();
-            InternetWireMessage::MeshData { sender_id, data }
+            ChannelWireMessage::MeshData { sender_id, data }
         }
         TAG_DHT_REQUEST => {
             let request_id = r.u64()?;
@@ -266,7 +272,7 @@ pub fn deserialize_wire_message(data: &[u8]) -> Result<InternetWireMessage, Code
                 },
                 tag => return Err(CodecError::UnknownTag(tag)),
             };
-            InternetWireMessage::Dht(DhtRequest { request_id, body })
+            ChannelWireMessage::Dht(DhtRequest { request_id, body })
         }
         TAG_DHT_REPLY => {
             let request_id = r.u64()?;
@@ -291,15 +297,15 @@ pub fn deserialize_wire_message(data: &[u8]) -> Result<InternetWireMessage, Code
                 REP_REJECTED => DhtReplyBody::Rejected,
                 tag => return Err(CodecError::UnknownTag(tag)),
             };
-            InternetWireMessage::DhtReply(DhtReply { request_id, body })
+            ChannelWireMessage::DhtReply(DhtReply { request_id, body })
         }
-        TAG_HELLO => InternetWireMessage::Hello {
+        TAG_HELLO => ChannelWireMessage::Hello {
             identity_key: r.array::<32>()?,
             ephemeral_public: r.array::<32>()?,
             listen_port: r.u16()?,
             signature: r.array::<64>()?,
         },
-        TAG_CONFIRM => InternetWireMessage::Confirm {
+        TAG_CONFIRM => ChannelWireMessage::Confirm {
             transcript: r.array::<32>()?,
         },
         tag => return Err(CodecError::UnknownTag(tag)),
@@ -393,7 +399,7 @@ mod tests {
         NodeId::from_bytes(rand::thread_rng().gen())
     }
 
-    fn roundtrip(msg: InternetWireMessage) {
+    fn roundtrip(msg: ChannelWireMessage) {
         let framed = serialize_wire_message(&msg);
         let len = u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
         assert_eq!(len, framed.len() - 4, "length prefix must match the body");
@@ -410,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_mesh_data_roundtrip() {
-        roundtrip(InternetWireMessage::MeshData {
+        roundtrip(ChannelWireMessage::MeshData {
             sender_id: random_node_id(),
             data: vec![0xAB; 5000],
         });
@@ -418,20 +424,20 @@ mod tests {
 
     #[test]
     fn test_hello_and_confirm_roundtrip() {
-        roundtrip(InternetWireMessage::Hello {
+        roundtrip(ChannelWireMessage::Hello {
             identity_key: [1u8; 32],
             ephemeral_public: [3u8; 32],
             listen_port: 9736,
             signature: [2u8; 64],
         });
-        roundtrip(InternetWireMessage::Confirm {
+        roundtrip(ChannelWireMessage::Confirm {
             transcript: [7u8; 32],
         });
     }
 
     #[test]
     fn test_a_sealed_confirmation_is_exactly_the_declared_size() {
-        let body = encode_body(&InternetWireMessage::Confirm {
+        let body = encode_body(&ChannelWireMessage::Confirm {
             transcript: [7u8; 32],
         });
         assert_eq!(
@@ -443,7 +449,7 @@ mod tests {
 
     #[test]
     fn test_a_hello_fits_the_handshake_frame_cap() {
-        let body = encode_body(&InternetWireMessage::Hello {
+        let body = encode_body(&ChannelWireMessage::Hello {
             identity_key: [1u8; 32],
             ephemeral_public: [3u8; 32],
             listen_port: 9736,
@@ -466,7 +472,7 @@ mod tests {
                 record: sample_record(),
             },
         ] {
-            roundtrip(InternetWireMessage::Dht(DhtRequest {
+            roundtrip(ChannelWireMessage::Dht(DhtRequest {
                 request_id: 0xDEAD_BEEF_CAFE_0001,
                 body,
             }));
@@ -489,7 +495,7 @@ mod tests {
             DhtReplyBody::Stored,
             DhtReplyBody::Rejected,
         ] {
-            roundtrip(InternetWireMessage::DhtReply(DhtReply {
+            roundtrip(ChannelWireMessage::DhtReply(DhtReply {
                 request_id: 42,
                 body,
             }));
@@ -498,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_mesh_payload_at_the_cap_fits_one_sealed_frame() {
-        let msg = InternetWireMessage::MeshData {
+        let msg = ChannelWireMessage::MeshData {
             sender_id: random_node_id(),
             data: vec![0u8; MAX_MESH_PAYLOAD],
         };
@@ -514,7 +520,7 @@ mod tests {
 
     #[test]
     fn test_truncated_frame_is_refused() {
-        let body = encode_body(&InternetWireMessage::Hello {
+        let body = encode_body(&ChannelWireMessage::Hello {
             identity_key: [1u8; 32],
             ephemeral_public: [3u8; 32],
             listen_port: 1,
@@ -531,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_trailing_bytes_are_refused() {
-        let mut body = encode_body(&InternetWireMessage::Confirm {
+        let mut body = encode_body(&ChannelWireMessage::Confirm {
             transcript: [0u8; 32],
         });
         body.push(0);
@@ -576,12 +582,12 @@ mod tests {
                 )
             })
             .collect();
-        let body = encode_body(&InternetWireMessage::DhtReply(DhtReply {
+        let body = encode_body(&ChannelWireMessage::DhtReply(DhtReply {
             request_id: 1,
             body: DhtReplyBody::FoundNodes { nodes },
         }));
         match deserialize_wire_message(&body).unwrap() {
-            InternetWireMessage::DhtReply(DhtReply {
+            ChannelWireMessage::DhtReply(DhtReply {
                 body: DhtReplyBody::FoundNodes { nodes },
                 ..
             }) => assert_eq!(nodes.len(), MAX_FOUND_NODES),
@@ -623,7 +629,7 @@ mod tests {
     fn test_binary_framing_does_not_expand_payloads() {
         // The JSON encoding this replaces expanded a byte array about 5×.
         let data = vec![0xFFu8; 64 * 1024];
-        let body = encode_body(&InternetWireMessage::MeshData {
+        let body = encode_body(&ChannelWireMessage::MeshData {
             sender_id: random_node_id(),
             data: data.clone(),
         });

@@ -11,13 +11,15 @@
 //! instance, so two senders' fragment ids cannot collide into one
 //! reassembly — the ids themselves are only unique per sender.
 //!
-//! Where the link knows who sent a frame, that peer is part of the key too. A
-//! 16-bit tag collides by accident often enough on a busy mesh, and a peer
-//! that wants to can simply copy another's; either way two senders' fragments
-//! would combine into one message, attributed to whoever completed it. LoRa
-//! has no link-layer address and passes `NodeId::ZERO`, which is one scope for
-//! every sender — there the tag is all that separates them, which is why it
-//! exists.
+//! Where the link can tell one sender from another, that scope is part of the
+//! key too. A 16-bit tag collides by accident often enough on a busy mesh,
+//! and a sender that wants to can simply copy another's; either way two
+//! senders' fragments would combine into one message, attributed to whoever
+//! completed it. The scope is whatever the transport can trust: the peer's
+//! NodeId where the link layer names it, the link itself on BLE and Wi-Fi
+//! Direct — where a frame arrives before the peer behind it is proved
+//! (ADR-021) — and `NodeId::ZERO` on LoRa, which has no link-layer address at
+//! all and so has only the tag to separate senders, which is why it exists.
 //!
 //! What the reassembler refuses, because none of it can be assumed of a
 //! stranger's frames: more than `max_message` bytes in total, more
@@ -113,13 +115,17 @@ struct Reassembly {
 }
 
 /// Collects fragments into whole messages, bounded in every direction.
-pub struct Reassembler {
-    pending: HashMap<(NodeId, u16, u16), Reassembly>,
+///
+/// `K` is the scope a frame's sender is identified by: `NodeId` where the
+/// link layer names the peer, the link address where the peer is not proved
+/// yet (ADR-021).
+pub struct Reassembler<K = NodeId> {
+    pending: HashMap<(K, u16, u16), Reassembly>,
     max_message: usize,
     label: &'static str,
 }
 
-impl Reassembler {
+impl<K: Clone + Eq + std::hash::Hash> Reassembler<K> {
     /// `max_message` is the largest reassembled message accepted; `label`
     /// names the transport in log lines.
     pub fn new(max_message: usize, label: &'static str) -> Self {
@@ -135,15 +141,28 @@ impl Reassembler {
         self.pending.len()
     }
 
-    /// Feed one received frame in, from `peer` where the link knows who sent
-    /// it (`NodeId::ZERO` where it does not). Returns the message once every
-    /// fragment has arrived.
-    pub fn push(&mut self, peer: NodeId, frame: &[u8]) -> Option<Vec<u8>> {
-        self.push_at(peer, frame, Instant::now())
+    /// Drop everything held for one scope.
+    ///
+    /// A link that goes away takes its partial messages with it, rather than
+    /// leaving them to occupy the table until the TTL and to be completed by
+    /// whatever reuses the address.
+    pub fn forget(&mut self, scope: &K) {
+        self.pending.retain(|(held, _, _), _| held != scope);
+    }
+
+    /// Drop everything held.
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    /// Feed one received frame in, under the scope the transport can trust
+    /// for it. Returns the message once every fragment has arrived.
+    pub fn push(&mut self, scope: K, frame: &[u8]) -> Option<Vec<u8>> {
+        self.push_at(scope, frame, Instant::now())
     }
 
     /// `push` with an explicit clock, for tests.
-    pub fn push_at(&mut self, peer: NodeId, frame: &[u8], now: Instant) -> Option<Vec<u8>> {
+    pub fn push_at(&mut self, scope: K, frame: &[u8], now: Instant) -> Option<Vec<u8>> {
         let (tag, id, index, count, payload) = match parse_fragment(frame) {
             Some(f) => f,
             None => {
@@ -163,7 +182,7 @@ impl Reassembler {
 
         self.pending
             .retain(|_, r| now.saturating_duration_since(r.started) < REASSEMBLY_TTL);
-        let key = (peer, tag, id);
+        let key = (scope, tag, id);
 
         // Before the single-fragment path, not after: a refused message must
         // not walk back in as a `count = 1` frame claiming the same key.
@@ -191,12 +210,12 @@ impl Reassembler {
                 .iter()
                 .filter(|(_, r)| !r.refused)
                 .min_by_key(|(_, r)| r.started)
-                .map(|(k, _)| *k)
+                .map(|(k, _)| k.clone())
                 .or_else(|| {
                     self.pending
                         .iter()
                         .min_by_key(|(_, r)| r.started)
-                        .map(|(k, _)| *k)
+                        .map(|(k, _)| k.clone())
                 });
             if let Some(victim) = victim {
                 self.pending.remove(&victim);
@@ -204,13 +223,19 @@ impl Reassembler {
         }
         let max_message = self.max_message;
         let label = self.label;
-        let entry = self.pending.entry(key).or_insert_with(|| Reassembly {
-            parts: vec![None; count as usize],
-            received: 0,
-            bytes: 0,
-            started: now,
-            refused: false,
-        });
+        // Cloned rather than moved: the key is needed again below to take the
+        // finished message out. For a `NodeId` that is a copy; for a link
+        // address it is a reference count.
+        let entry = self
+            .pending
+            .entry(key.clone())
+            .or_insert_with(|| Reassembly {
+                parts: vec![None; count as usize],
+                received: 0,
+                bytes: 0,
+                started: now,
+                refused: false,
+            });
         if entry.refused {
             return None;
         }

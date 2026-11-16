@@ -130,3 +130,48 @@ and the refusal is sticky, so that message would never arrive at all.
    reassembly, its bounds and its failure modes in two platform languages
    instead of one Rust module, and the other frame-capped transport (LoRa) has
    no platform layer to put it in.
+
+## Note (2026-11-16, T-34)
+
+ADR-021 put an authenticated channel under this fragmentation layer, which
+changes four things this ADR describes.
+
+**What is fragmented is a sealed frame, not a message.** A message is sealed
+into one frame — counter, `MeshData` header, ciphertext, AEAD tag — and *that*
+is what the 6-byte header splits. So the transport MTU is no longer the
+reassembly bound: it is the bound less what sealing costs, 61 bytes, which
+makes BLE 4035 bytes per message rather than 4096 and Wi-Fi Direct 65474.
+
+**Fragmentation happens on the way out, not at send.** The outbox holds the
+message; the frame is sealed and split when it is dequeued. The reason is the
+counter: the outbox puts an emergency ahead of ordinary traffic (§9.5,
+ADR-014), so sealing on the way in would hand the peer counters in a different
+order from the frames, and everything the alert overtook would be refused as
+stale. One frame's fragments are drained before the next frame is taken, for
+the same reason — two frames interleaved on one link would be reassembled in
+whichever order they completed, and the loser refused.
+
+This also retires the all-or-nothing batch rule. A batch existed because a
+message admitted in part is useless; a message is now one outbox entry, so
+there is nothing to admit in part.
+
+**Reassembly is keyed by the link, not the peer.** A frame arrives before the
+peer behind it is proved, so there is no peer to key on; the `Reassembler` is
+generic over its scope and BLE and Wi-Fi Direct pass the link address where
+LoRa passes `NodeId::ZERO`. The reasoning in this ADR for including the peer
+holds unchanged — it is the scope the transport can trust, and a link is what
+BLE can trust.
+
+**Wi-Fi Direct uses this fragmenter too**, with a 16 KB frame, so that one
+implementation serves both local transports.
+
+Two corrections to the layer below. The platform fragment size is
+`min(max(negotiated_MTU - 4, 19), 511)`, not `max(MTU - 4, 20)`. The floor was
+wrong because an ATT MTU of 23 carries 20 bytes of attribute value and one of
+those is the platform layer's own flag byte, so 19 are payload and 20 produced
+a write the link cannot carry. The cap is needed because a negotiated MTU of
+517 — which Android stacks do grant — would otherwise allow a 513-byte value:
+a full 512-byte fragment plus the flag byte, which the framework refuses, so
+no multi-fragment frame would ever cross.
+
+Appended rather than edited in place, because these records are append-only.

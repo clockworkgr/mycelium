@@ -29,17 +29,21 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use mycelium_crypto::channel::{channel_hello_payload, ChannelHandshake, FrameCipher};
-use mycelium_crypto::identity::{node_id_from_public_key, verify_signature_bytes, Identity};
+use mycelium_crypto::channel::FrameCipher;
+use mycelium_crypto::identity::Identity;
 use mycelium_protocol::types::{LinkQuality, NodeId};
 
+/// Only a test names a frame here; the handshake itself does its own naming.
+#[cfg(test)]
+use super::channel::discriminant_name;
+use super::channel::ChannelHandshakeDriver;
+pub use super::channel::{AuthenticatedPeer, Channel};
 use super::{SendPriority, Transport, TransportError, TransportEvent, TransportType};
 use crate::dht::marks::MarkStore;
 use crate::dht::record::{DhtRecord, RECORD_TTL_SECS};
 use crate::dht::rpc::{
-    deserialize_wire_message, encode_body, DhtReply, DhtRequest, DhtRequestBody,
-    InternetWireMessage, CONFIRM_FRAME_LEN, MAX_HANDSHAKE_FRAME, MAX_MESH_PAYLOAD,
-    MAX_WIRE_MESSAGE,
+    deserialize_wire_message, encode_body, ChannelWireMessage, DhtReply, DhtRequest,
+    DhtRequestBody, CONFIRM_FRAME_LEN, MAX_HANDSHAKE_FRAME, MAX_MESH_PAYLOAD, MAX_WIRE_MESSAGE,
 };
 use crate::dht::{AddrSource, DhtConfig, DhtEngine, DhtRpc, PeerInfo, REQUEST_TIMEOUT};
 
@@ -111,7 +115,7 @@ impl SealedWriter {
     /// the seal and the write would leave a truncated frame on the wire and
     /// every later frame mis-numbered — which is why no other code may call
     /// this directly.
-    async fn send(&mut self, msg: &InternetWireMessage) -> Result<(), TransportError> {
+    async fn send(&mut self, msg: &ChannelWireMessage) -> Result<(), TransportError> {
         let body = encode_body(msg);
         let sealed = self
             .cipher
@@ -141,8 +145,8 @@ impl SealedWriter {
 /// both this task and the read loop are gone.
 async fn writer_task(
     mut writer: SealedWriter,
-    mut outbox: mpsc::Receiver<InternetWireMessage>,
-    mut alerts: mpsc::Receiver<InternetWireMessage>,
+    mut outbox: mpsc::Receiver<ChannelWireMessage>,
+    mut alerts: mpsc::Receiver<ChannelWireMessage>,
     cancel: CancellationToken,
     _permit: Arc<OwnedSemaphorePermit>,
 ) {
@@ -197,7 +201,7 @@ struct SealedReader {
 }
 
 impl SealedReader {
-    async fn recv(&mut self) -> Result<InternetWireMessage, TransportError> {
+    async fn recv(&mut self) -> Result<ChannelWireMessage, TransportError> {
         let sealed = read_framed(&mut self.reader, MAX_WIRE_MESSAGE).await?;
         let body = self
             .cipher
@@ -226,13 +230,13 @@ struct PeerConnection {
     /// of the transport's lifetime token, so `stop()` still reaches it.
     cancel: CancellationToken,
     /// Queue into the connection's writer task.
-    outbox: mpsc::Sender<InternetWireMessage>,
+    outbox: mpsc::Sender<ChannelWireMessage>,
     /// Queue for emergency alerts, which the writer drains first.
     ///
     /// A separate channel rather than a priority flag, because an `mpsc` is
     /// first-in-first-out: an alert queued behind a hundred ordinary frames
     /// would leave last however it was labelled.
-    alerts: mpsc::Sender<InternetWireMessage>,
+    alerts: mpsc::Sender<ChannelWireMessage>,
     /// In-flight DHT requests on *this* connection, awaiting their replies.
     ///
     /// Per connection, not global: with one shared map any authenticated peer
@@ -247,14 +251,14 @@ impl PeerConnection {
     /// that goes away cannot leave the channel half-written. A full outbox
     /// means the peer is not draining, which the caller should treat as a
     /// failed send.
-    fn enqueue(&self, msg: InternetWireMessage) -> Result<(), TransportError> {
+    fn enqueue(&self, msg: ChannelWireMessage) -> Result<(), TransportError> {
         self.enqueue_with_priority(msg, SendPriority::Normal)
     }
 
     /// `enqueue`, choosing the queue the writer drains first for an alert.
     fn enqueue_with_priority(
         &self,
-        msg: InternetWireMessage,
+        msg: ChannelWireMessage,
         priority: SendPriority,
     ) -> Result<(), TransportError> {
         let queue = match priority {
@@ -405,17 +409,6 @@ pub struct InternetTransport {
     stopping: std::sync::atomic::AtomicBool,
 }
 
-/// A peer that has proved possession of the identity key behind its NodeId
-/// *and* of the channel key derived from the ephemeral key it signed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AuthenticatedPeer {
-    pub node_id: NodeId,
-    pub identity_key: [u8; 32],
-    /// The port the peer says it accepts connections on, covered by its
-    /// signature so a man in the middle cannot redirect later dials.
-    pub listen_port: u16,
-}
-
 /// Read one length-prefixed frame body, capped at `max`.
 async fn read_framed<R: AsyncRead + Unpin>(
     reader: &mut R,
@@ -455,21 +448,13 @@ async fn write_framed<W: AsyncWrite + Unpin>(
         .map_err(|e| TransportError::SendFailed(e.to_string()))
 }
 
-/// The result of a completed handshake: who the peer is, and the channel.
-pub struct Channel {
-    pub peer: AuthenticatedPeer,
-    /// Identifies this channel. Both ends derive the same value, and it
-    /// differs per connection, which is what makes it a usable tie-break when
-    /// two connections to one peer exist at once.
-    pub transcript: [u8; 32],
-    send: FrameCipher,
-    recv: FrameCipher,
-}
-
-/// Run the mutual handshake. Symmetric: the same code serves both ends.
+/// Run the mutual handshake over a stream. Symmetric: the same code serves
+/// both ends.
 ///
-/// Returns only once the peer has proved it holds the channel key, so a
-/// caller that gets a `Channel` is talking to the node it names.
+/// The proof itself is [`ChannelHandshakeDriver`], shared with the local
+/// transports (ADR-021); this is only the framing around it. Returns once the
+/// peer has proved it holds the channel key, so a caller that gets a
+/// [`Channel`] is talking to the node it names.
 pub async fn handshake<R, W>(
     identity: &Identity,
     listen_port: u16,
@@ -480,110 +465,17 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let exchange = ChannelHandshake::new();
-    let ephemeral_public = exchange.public_key();
-    let identity_key = identity.public_key_bytes();
-    let signature = identity
-        .sign(&channel_hello_payload(
-            &ephemeral_public,
-            &identity_key,
-            listen_port,
-        ))
-        .to_bytes();
-
-    write_framed(
-        writer,
-        &encode_body(&InternetWireMessage::Hello {
-            identity_key,
-            ephemeral_public,
-            listen_port,
-            signature,
-        }),
-    )
-    .await?;
+    let (mut driver, hello) = ChannelHandshakeDriver::start(identity, listen_port);
+    write_framed(writer, &hello).await?;
 
     let body = read_framed(reader, MAX_HANDSHAKE_FRAME).await?;
-    let peer =
-        match deserialize_wire_message(&body).map_err(|e| TransportError::Other(e.to_string()))? {
-            InternetWireMessage::Hello {
-                identity_key,
-                ephemeral_public,
-                listen_port,
-                signature,
-            } => (identity_key, ephemeral_public, listen_port, signature),
-            other => {
-                return Err(TransportError::Other(format!(
-                    "expected a hello, got {}",
-                    discriminant_name(&other)
-                )))
-            }
-        };
-    let (peer_identity_key, peer_ephemeral, peer_port, peer_signature) = peer;
-
-    verify_signature_bytes(
-        &peer_identity_key,
-        &channel_hello_payload(&peer_ephemeral, &peer_identity_key, peer_port),
-        &peer_signature,
-    )
-    .map_err(|_| TransportError::Other("hello signature did not verify".to_string()))?;
-
-    let mut keys = exchange
-        .complete(&peer_ephemeral, &identity_key, &peer_identity_key)
-        .map_err(|e| TransportError::Other(e.to_string()))?;
-
-    // Key confirmation. Without it a relay that forwarded someone else's
-    // hello would install itself as a peer that silently drops everything.
-    let confirm = InternetWireMessage::Confirm {
-        transcript: keys.transcript,
-    };
-    let sealed = keys
-        .send
-        .seal(&encode_body(&confirm))
-        .map_err(|e| TransportError::SendFailed(e.to_string()))?;
-    write_framed(writer, &sealed).await?;
+    let confirm = driver.accept_hello(&body)?;
+    write_framed(writer, &confirm).await?;
 
     // The peer has not yet proved it holds the channel key, so this frame gets
     // its own exact cap rather than the 1 MiB data-frame cap.
     let sealed = read_framed(reader, CONFIRM_FRAME_LEN).await?;
-    let opened = keys
-        .recv
-        .open(&sealed)
-        .map_err(|_| TransportError::Other("peer could not prove the channel key".to_string()))?;
-    match deserialize_wire_message(&opened).map_err(|e| TransportError::Other(e.to_string()))? {
-        InternetWireMessage::Confirm { transcript } if transcript == keys.transcript => {}
-        InternetWireMessage::Confirm { .. } => {
-            return Err(TransportError::Other(
-                "peer confirmed a different transcript".to_string(),
-            ))
-        }
-        other => {
-            return Err(TransportError::Other(format!(
-                "expected a confirmation, got {}",
-                discriminant_name(&other)
-            )))
-        }
-    }
-
-    Ok(Channel {
-        peer: AuthenticatedPeer {
-            node_id: node_id_from_public_key(&peer_identity_key),
-            identity_key: peer_identity_key,
-            listen_port: peer_port,
-        },
-        transcript: keys.transcript,
-        send: keys.send,
-        recv: keys.recv,
-    })
-}
-
-fn discriminant_name(msg: &InternetWireMessage) -> &'static str {
-    match msg {
-        InternetWireMessage::MeshData { .. } => "mesh data",
-        InternetWireMessage::Dht(_) => "dht request",
-        InternetWireMessage::DhtReply(_) => "dht reply",
-        InternetWireMessage::Hello { .. } => "hello",
-        InternetWireMessage::Confirm { .. } => "confirmation",
-    }
+    driver.accept_confirm(&sealed)
 }
 
 impl Shared {
@@ -767,7 +659,7 @@ impl Shared {
             return;
         }
         let record: DhtRecord = self.dht.self_record(self.listen_addr);
-        let msg = InternetWireMessage::Dht(DhtRequest {
+        let msg = ChannelWireMessage::Dht(DhtRequest {
             request_id: self.dht.next_request_id(),
             body: DhtRequestBody::Store { record },
         });
@@ -815,7 +707,7 @@ impl Shared {
                 _ = cancel.cancelled() => break,
                 result = reader.recv() => {
                     match result {
-                        Ok(InternetWireMessage::MeshData { data, .. }) => {
+                        Ok(ChannelWireMessage::MeshData { data, .. }) => {
                             // The sender id in the frame is ignored: the peer
                             // is whoever holds this channel's key.
                             let _ = self.event_tx.send(TransportEvent::DataReceived {
@@ -824,7 +716,7 @@ impl Shared {
                                 transport: TransportType::InternetTunnel,
                             });
                         }
-                        Ok(InternetWireMessage::Dht(request)) => {
+                        Ok(ChannelWireMessage::Dht(request)) => {
                             let reply = self
                                 .dht
                                 // Carries the address provenance, or
@@ -837,16 +729,16 @@ impl Shared {
                             // branch would sit outside the cancellation
                             // select and let a peer that stops reading hold
                             // its connection slot past `stop()`.
-                            if let Err(e) = conn.enqueue(InternetWireMessage::DhtReply(reply)) {
+                            if let Err(e) = conn.enqueue(ChannelWireMessage::DhtReply(reply)) {
                                 debug!("Internet: cannot answer {}: {}", peer_id, e);
                                 break;
                             }
                         }
-                        Ok(InternetWireMessage::DhtReply(reply)) => {
+                        Ok(ChannelWireMessage::DhtReply(reply)) => {
                             conn.resolve_pending(reply);
                         }
-                        Ok(InternetWireMessage::Hello { .. })
-                        | Ok(InternetWireMessage::Confirm { .. }) => {
+                        Ok(ChannelWireMessage::Hello { .. })
+                        | Ok(ChannelWireMessage::Confirm { .. }) => {
                             // The handshake is over; a repeat must never
                             // re-authenticate an established channel.
                             debug!("Internet: ignoring a late handshake frame from {}", peer_id);
@@ -1129,7 +1021,7 @@ impl DhtRpc for InternetTransport {
             request_id,
         };
 
-        if let Err(e) = conn.enqueue(InternetWireMessage::Dht(request)) {
+        if let Err(e) = conn.enqueue(ChannelWireMessage::Dht(request)) {
             debug!("Internet: cannot query {}: {}", peer.node_id, e);
             return None;
         }
@@ -1422,7 +1314,7 @@ impl Transport for InternetTransport {
         };
 
         conn.enqueue_with_priority(
-            InternetWireMessage::MeshData {
+            ChannelWireMessage::MeshData {
                 sender_id: self.shared.local_id,
                 data: data.to_vec(),
             },
@@ -1467,7 +1359,9 @@ impl Transport for InternetTransport {
 mod tests {
     use super::*;
     use crate::dht::rpc::MESH_DATA_OVERHEAD;
-    use mycelium_crypto::channel::{ChannelKeys, AEAD_TAG_LEN};
+    use mycelium_crypto::channel::{
+        channel_hello_payload, ChannelHandshake, ChannelKeys, AEAD_TAG_LEN,
+    };
     use tokio::time::{sleep, timeout};
 
     fn config_on(port: u16) -> InternetConfig {
@@ -1747,7 +1641,7 @@ mod tests {
         let (_, mut writer) = tokio::io::split(&mut stream);
         let sealed = keys
             .send
-            .seal(&encode_body(&InternetWireMessage::Dht(DhtRequest {
+            .seal(&encode_body(&ChannelWireMessage::Dht(DhtRequest {
                 request_id: 1,
                 body: DhtRequestBody::Ping,
             })))
@@ -1793,7 +1687,7 @@ mod tests {
                 .to_bytes();
             write_framed(
                 &mut writer,
-                &encode_body(&InternetWireMessage::Hello {
+                &encode_body(&ChannelWireMessage::Hello {
                     identity_key,
                     ephemeral_public: hello_ephemeral,
                     listen_port,
@@ -1808,7 +1702,7 @@ mod tests {
                 return None;
             };
             let (server_key, server_ephemeral) = match deserialize_wire_message(&body).unwrap() {
-                InternetWireMessage::Hello {
+                ChannelWireMessage::Hello {
                     identity_key,
                     ephemeral_public,
                     ..
@@ -1820,7 +1714,7 @@ mod tests {
                 .unwrap();
             let sealed = keys
                 .send
-                .seal(&encode_body(&InternetWireMessage::Confirm {
+                .seal(&encode_body(&ChannelWireMessage::Confirm {
                     transcript: keys.transcript,
                 }))
                 .unwrap();
@@ -1929,7 +1823,7 @@ mod tests {
             alerts: mpsc::channel(1).0,
             pending: std::sync::Mutex::new(HashMap::new()),
         };
-        let frame = || InternetWireMessage::Confirm {
+        let frame = || ChannelWireMessage::Confirm {
             transcript: [0u8; 32],
         };
         assert!(conn.enqueue(frame()).is_ok());
@@ -2097,7 +1991,7 @@ mod tests {
             if rx.await.is_ok() {
                 let sealed = channel
                     .send
-                    .seal(&encode_body(&InternetWireMessage::Dht(DhtRequest {
+                    .seal(&encode_body(&ChannelWireMessage::Dht(DhtRequest {
                         request_id: 7,
                         body: DhtRequestBody::Ping,
                     })))

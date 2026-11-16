@@ -956,8 +956,8 @@ than a seamless migration (ROADMAP T-03).
 
 | Transport | MTU | Throughput | Range | Status |
 |-----------|-----|-----------|-------|--------|
-| **BLE** | 512 B | ~100 kbps | 10–30 m | **Implemented** — dual-role GATT on Android + iOS |
-| **Wi-Fi Direct** | 65 KB | ~50 Mbps | 50–200 m | **Implemented** — Android only (iOS does not expose it) |
+| **BLE** | 4035 B message / 512 B frame | ~100 kbps | 10–30 m | **Implemented, untested on hardware** — dual-role GATT on Android + iOS, proved peer identity (ADR-021); the handshake has never run on a radio (T-15) |
+| **Wi-Fi Direct** | 65474 B message / 16 KB frame | ~50 Mbps | 50–200 m | **Implemented, untested on hardware** — Android only (iOS does not expose it), proved peer identity (ADR-021) |
 | **BT Classic (SPP)** | 16 KB | ~2 Mbps | 10–100 m | **Implemented, untested on hardware** — Android only |
 | **LoRa** | 2 KB message / 51–222 B frame | 0.25–37 kbps | 1–15 km | **Implemented, untested on hardware** — bridges on Android (BLE + USB) and iOS (BLE) |
 | **Internet tunnel** | 1 MiB − 53 B (see §8.4) | varies | global | **Implemented** — keyed authenticated channel, binary framed (ADR-011) |
@@ -971,52 +971,154 @@ than a seamless migration (ROADMAP T-03).
 
 ```
 Service UUID: a1b2c3d4-e5f6-7890-abcd-ef1234567890
-├─ Node ID  (…7891) Read   — the server's 32-byte NodeId
-├─ Data TX  (…7892) Write  — central writes to peripheral
-├─ Data RX  (…7893) Notify — peripheral notifies central
-└─ Identity (…7894) Write  — client writes its own NodeId to the server
+├─ Data TX  (…7892) Write  — central writes frames to peripheral
+└─ Data RX  (…7893) Notify — peripheral notifies central with frames
 ```
 
-The Identity characteristic solves BLE Random Private Addresses: the client
-reads the server's NodeId, then writes its own, so both ends have an
-address ↔ NodeId mapping despite the addresses differing per direction.
+**Peer identity is proved, not asserted** (ADR-021, ROADMAP T-34). The Node ID
+(`…7891`) and Identity (`…7894`) characteristics are gone: both carried a bare
+32-byte NodeId with no key, no signature and nothing bound to the connection,
+so anything in radio range could claim a neighbour's id and have its traffic
+delivered to it and dropped. What replaces them is the internet transport's
+handshake (ADR-011), run over this transport's own fragmentation layer — one
+proof format and one implementation across BLE, Wi-Fi Direct and internet.
 
-**Peer identity on BLE is asserted, not proved** — `Partial`, ROADMAP T-34.
-Both characteristics carry a bare 32-byte NodeId: no identity key, no
-signature, nothing bound to the connection. An attacker in radio range can
-therefore claim a neighbour's id, and `TransportManager` installs a route for
-it, so that node's traffic is delivered to the attacker and dropped and its
-AODV routes are poisoned. Payloads stay encrypted (§5.3) and no session can be
-established under a borrowed id (§14.3), so this is denial of delivery and
-route poisoning rather than impersonation. Wi-Fi Direct's `Hello` is the same
-bare id exchange. The internet transport proves identity instead (§8.4,
-ADR-011), and the fix here has the same shape.
+The platform layer no longer knows, or reports, who is on the other end. It
+reports **links**, named by an address it already holds and prefixed by the
+role carrying them (`c:` where we are the central, `s:` where we are the
+server — on Android both roles can be live with the same device, and they are
+two links with two channels), and relays opaque frames. A link is announced
+only once it can carry frames in both directions, which on the central side is
+after its subscription to Data RX completes and on the server side when a
+central subscribes; announcing it earlier leaves a handshake waiting for a
+reply that cannot arrive.
 
-**Two framing layers, independent of each other.** A *message* is split by the
-transport into frames of 512 bytes with the same 6-byte header LoRa uses
-(sender tag u16, fragment id u16, index u8, count u8), and the transport MTU is
-therefore the largest reassembled message (`BLE_MAX_MESSAGE = 4096`), not one
-frame: without this a co-signed critical alert (522 bytes) could not cross BLE
-at all, and an alert's text was capped at 295 bytes (ADR-022, ROADMAP T-39).
-Reassembly is keyed by (peer, sender tag, fragment id) — BLE knows who wrote a
-frame, so two peers cannot mix fragments by sharing a tag — and is shared with
-LoRa: bounded to 64 partials, expired after 120 s, refused past the message
-limit by accumulated bytes, with a duplicate fragment ignored rather than
-counted and a refused message kept marked so its later fragments cannot start
-it over.
+The Identity characteristic existed to map a BLE Random Private Address to a
+NodeId. That problem dissolves rather than moving: a link is keyed by whatever
+address the platform reports for it, identity is proved over the link, and an
+address nobody can correlate is exactly as usable as one anybody can.
 
-Below that, each frame is written to GATT by the platform layer with a 1-byte
-header of its own: `0x01` first, `0x02` last, `0x03` single, `0x00` middle.
-Fragment size is `max(negotiated_MTU - 4, 20)`. Android permits
-one outstanding GATT operation, so writes go through a sequential queue driven
-by `onCharacteristicWrite`/`onNotificationSent`. Connections stagger
-500–1500 ms with jitter and retry with exponential backoff (1 s, 2.5 s, 4 s,
-max 3).
+On the link:
+
+```
+→ Hello   { identity_key, ephemeral_public, listen_port = 0, signature }  (cleartext)
+← Hello   { identity_key, ephemeral_public, listen_port = 0, signature }
+→ Confirm { transcript }                                                 (sealed, frame 0)
+← Confirm { transcript }
+then: counter(8 LE) ‖ AES-256-GCM( MeshData { … } )                      (sealed, frame n)
+```
+
+The signed payload, the transcript and the key schedule are the internet
+transport's, below; `listen_port` is zero because a radio has no dialable
+address, and the ephemeral key is what makes a captured hello useless. The
+peer's NodeId is **derived** from the `identity_key` it signed, so §14.3's
+binding holds by construction, and nothing is installed until the peer has
+sealed a frame under the channel its key produced: no peer, no
+`NeighborDiscovered`, and therefore no route. A link that proves our own
+identity key is closed, which is what now catches a loopback the platform
+cannot see. A `Dht` frame is refused: the codec is shared with the internet
+transport, and a radio has no DHT.
+
+**Why frames carry their counter here.** The internet transport leaves the
+AEAD frame counter implicit, which is safe on TCP, where ordering is
+guaranteed and a loss ends the connection anyway. A sealed frame crossing BLE
+is split into 512-byte fragments that nothing above the ATT layer retries, so
+one lost fragment means the frame never reassembles, the receiver never opens
+it, and an implicit counter would stay a frame behind for good — every later
+frame failing under the wrong nonce. The counter therefore travels with the
+frame and the receiver keeps a *floor*: a counter at or above it is opened and
+moves the floor past itself. Loss is survivable, replay and reordering are
+refused, and altering the counter in flight only picks a nonce the frame
+cannot open under. A frame that fails to open is dropped and the link kept,
+because tearing it down would let anything in range kill an established link
+by injecting noise.
+
+The counter is taken as a frame **leaves**, not as it is queued: the outbox
+puts an emergency ahead of ordinary traffic (§9.5), so sealing on the way in
+would hand the peer counters in a different order from the frames and
+everything the alert overtook would be refused as stale. Handshake frames have
+their own queue, drained first and never evicted — two per link, a hello and a
+confirmation — because an emergency displacing another link's confirmation
+would leave that peer waiting for one that never comes. One frame's fragments
+are drained before the next frame is taken.
+
+**Two framing layers, independent of each other.** A *message* is sealed into
+one frame and that frame is split by the transport into fragments of 512 bytes
+with the same 6-byte header LoRa uses (sender tag u16, fragment id u16, index
+u8, count u8). The transport MTU is therefore the largest reassembled frame
+less what sealing costs — `BLE_MAX_MESSAGE` (4096) less 61 bytes of counter,
+`MeshData` header and AEAD tag, so **4035 bytes per message** — not one
+frame's worth: without fragmentation a co-signed critical alert (522 bytes)
+could not cross BLE at all, and an alert's text was capped at 295 bytes
+(ADR-022, ROADMAP T-39). Reassembly is keyed by (link, sender tag, fragment
+id) — by the link rather than the peer, because a frame arrives before the
+peer behind it is proved — and is shared with LoRa: bounded to 64 partials,
+expired after 120 s, refused past the limit by accumulated bytes, with a
+duplicate fragment ignored rather than counted and a refused message kept
+marked so its later fragments cannot start it over.
+
+Below that, each fragment is written to GATT by the platform layer with a
+1-byte header of its own: `0x01` first, `0x02` last, `0x03` single, `0x00`
+middle. Fragment size is `min(max(negotiated_MTU - 4, 19), 511)`: an ATT MTU
+of 23 carries 20 bytes of attribute value and one of those is this header, so
+19 are payload, and the upper cap exists because a negotiated MTU of 517 would
+otherwise produce a 513-byte value, which Android refuses outright — so every
+full fragment of a multi-fragment frame would be rejected. Android permits one outstanding GATT operation, so writes go through
+a sequential queue driven by `onCharacteristicWrite`/`onNotificationSent`,
+and a purge that leaves the connection alive quarantines that link for 5 s so
+that the completion it abandoned cannot be mistaken for a later operation's —
+the platform supplies no operation token, and on a closed connection the
+completion may never arrive at all. Each native queue is bounded in its own
+right — 128 operations on BLE, 32 per Wi-Fi Direct socket — because polling
+frees the Rust outbox's capacity as soon as a frame is handed across, and a
+handshake fragment is never what a full queue sacrifices. Which *ordinary*
+frame is lost differs: BLE drops the oldest, as the outbox above it does,
+while Wi-Fi Direct refuses the newest, because its backlog is a thread pool's
+queue of opaque tasks that cannot be inspected to tell a handshake write from
+a data write. Which fragments belong
+to a handshake is an out-parameter of the dequeue rather than something the
+platform layer infers: a link counts as established in Rust as soon as the
+peer's confirmation arrives, which can be before our own has left. Those
+fragments are written ahead of ordinary traffic and after any handshake
+already queued, so a link's hello and confirmation keep their order. The platform layer's own reassembly is capped
+at one Rust frame (512 bytes) and expires after 10 s, since the bounded
+reassembler above it never sees an incomplete frame. A connection that never
+becomes announceable — a central that does not subscribe, a discovery that
+stalls — is closed after 20 s, because nothing above this layer knows it
+exists. Connections stagger 500–1500 ms with jitter and retry with exponential
+backoff (1 s, 2.5 s, 4 s, max 3).
+
+**Bounds and directives.** A link has 10 s to finish its handshake, links are
+capped at 32, and a newcomer past the cap is refused rather than admitted by
+evicting a proved peer. There is no background task: the table is swept on
+every call, which the app's 50 ms outbox poll makes a reaper. Authentication
+is decided in Rust and sockets are the bridge's to close, so the bridge polls
+a directive queue beside the outbox: `established` (stop retrying) and `close`
+(drop it, and leave that link alone for 30 s), one entry per link; when it is
+full what goes is an entry for an address no longer held, never one for a live
+link — a lost `close` leaks a socket, and an `established` is what stops the
+bridge's own sweep closing a proved peer. The bridge does not rely on
+that queue for liveness: it closes a link itself once it has been announced
+for 20 s without becoming established. On Android a refused inbound link is
+disconnected with `BluetoothGattServer.cancelConnection`; iOS has no way for a
+peripheral to disconnect a central, so there the link is only forgotten
+(ADR-021 records it). A frame on a link the bridge never announced is dropped
+and answered with `close`, so a link just closed cannot reopen itself with
+what was still in flight — except for the first frame of a connection the
+bridge already holds, which announces its link rather than losing a handshake
+to the race with its own subscription callback. A peer may hold several links —
+BLE's two roles — and is reported lost only when its last one goes.
 
 **Wi-Fi Direct (ADR-003).** `WifiP2pManager` groups plus Bonjour service
 discovery and TCP sockets on port 9740. Wire protocol: 1-byte type
-(`Hello = 0x01`, `MeshData = 0x02`) + 4-byte big-endian length + payload. TCP
-handles segmentation, so no fragmentation layer.
+(`Frame = 0x02`) + 4-byte big-endian length + payload, where the payload is
+one opaque frame for the transport above. The `Hello = 0x01` that exchanged a
+bare NodeId is gone, and the mDNS TXT record no longer advertises a node id
+prefix: the same proof BLE runs now runs here (ADR-021, ROADMAP T-34), over
+the same fragmentation layer, with links named by the remote socket endpoint.
+TCP handles segmentation, so a 16 KB fragment is one TCP frame, and the
+transport MTU is `WIFI_MAX_MESSAGE` (65535) less the 61 bytes sealing costs —
+**65474 bytes per message**. Links are capped at 16.
 
 **LoRa (ADR-008).** Messages are fragmented into frames with a 6-byte header
 (sender tag u16, fragment id u16, index u8, count u8), sized for the peer's
@@ -1265,9 +1367,14 @@ authentication and integrity, not a forward secrecy claim; message
 confidentiality is the Double Ratchet's job (§5.3).
 
 **Outbox pattern.** BLE, Wi-Fi Direct, BT Classic and LoRa all follow the same
-Rust↔platform shape: `send()` pushes to a bounded `VecDeque` (512 packets;
-256 for LoRa), Dart polls it every 50 ms over FFI, and inbound data is injected
-back through FFI. A direct send callback is used where the platform supports it.
+Rust↔platform shape: `send()` pushes to a bounded queue, Dart polls it every
+50 ms over FFI, and inbound data is injected back through FFI. BT Classic and
+LoRa queue *frames* (512 packets; 256 for LoRa). BLE and Wi-Fi Direct queue
+whole *messages* — 128 and 64 — because a frame's AEAD counter is taken as it
+leaves rather than as it is queued (ADR-021, §8.4), and what they are
+addressed to is a link rather than a peer. The direct send callbacks are gone:
+nothing registered them, Dart cannot hand out a synchronous C callback, and a
+second send path into an authenticated link is the kind nobody looks at.
 
 ### 8.5 Transport plugin API
 
@@ -2111,9 +2218,10 @@ server down through `ApiServerHandle`; transports register via
 | Network | `network_status`, `update_battery` |
 | Transport registration | `register_{ble,wifi_direct,lora,lora_configured,bt_classic,internet,internet_configured}_transport` |
 | Internet | `internet_connect_to`, `internet_peer_count` |
-| Platform → Rust events | `ble_on_*` (3), `wifi_on_*` (3), `lora_on_*` + `lora_report_tx_{success,failure}` (5), `bt_classic_on_*` (3) |
-| Rust → platform outbox | `ble_dequeue_send`, `wifi_dequeue_send`, `lora_dequeue_send`, `bt_classic_dequeue_send` |
-| Direct send callbacks | `ble_set_send_callback`, `wifi_set_send_callback` |
+| Platform → Rust links | `ble_on_link_{up,down,data}`, `wifi_on_link_{up,down,data}` — an address and opaque frames, never a peer id (ADR-021) |
+| Platform → Rust events | `lora_on_*` + `lora_report_tx_{success,failure}` (5), `bt_classic_on_*` (3) |
+| Rust → platform outbox | `ble_dequeue_send`, `wifi_dequeue_send` (each yields the link to write on), `lora_dequeue_send`, `bt_classic_dequeue_send` |
+| Rust → platform link directives | `ble_dequeue_link_event`, `wifi_dequeue_link_event` — `MYCELIUM_LINK_ESTABLISHED` or `MYCELIUM_LINK_CLOSE` |
 
 The C header is `crates/mycelium-ffi/include/mycelium.h`; Dart bindings are
 generated from it by `ffigen`.
@@ -2126,6 +2234,13 @@ handle is not reference-counted, so `node_get_existing` can race
 `node_free`. See ROADMAP T-01.
 
 ### 17.3 Platform bridges
+
+The BLE and Wi-Fi Direct bridges carry **links**, not peers: they report an
+address they already hold, prefixed by the role carrying it, and relay opaque
+frames. Identity is settled by the handshake inside Rust (§8.4, ADR-021), so
+no FFI entry point takes a NodeId from the platform, and the bridges keep no
+identity bookkeeping of their own. LoRa and BT Classic still hand over an
+asserted id — ROADMAP T-47.
 
 **Android** — Kotlin. `MainActivity` hosts the platform channels
 (`com.mycelium.ble`, `…wifidirect`, `…daemon`, `…lora`, `…btclassic`) and the
@@ -2287,13 +2402,14 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 7.1 | AODV | **Implemented** | Supernode + direct-link preference, storm-free RERR, one shared discovery attempt per destination on a 1 s sweep |
 | 7.2 | DTN spray-and-wait | **Implemented** | Copies/TTL on the wire (ADR-005), quotas, origin-aware eviction, persisted origin + spray history |
 | 7.4 | Geographic hash overlay | **Planned** | v0.4 |
-| 8.1 | BLE | **Implemented** | Dual-role GATT, fragmentation, write queue, Android + iOS |
-| 8.1 | Wi-Fi Direct | **Implemented** | ADR-003, Android only |
+| 8.1 | BLE | **Implemented, untested** | Dual-role GATT, fragmentation, write queue, Android + iOS. Peer identity proved by ADR-011's handshake over the frame layer, NodeId derived from the proved key (ADR-021); never run on a radio (T-15) |
+| 8.1 | Wi-Fi Direct | **Implemented, untested** | ADR-003, Android only. Same proved identity as BLE; the bare-NodeId `Hello` is gone (ADR-021); never run on hardware (T-15) |
 | 8.1 | BT Classic | **Implemented, untested** | Rust + Kotlin SPP + Dart bridge; no hardware test (T-15) |
 | 8.1 | LoRa | **Implemented, untested** | Fragmentation, ADR, duty cycle, broadcast beacons (ADR-008); no hardware test (T-15) |
 | 8.1 | Internet tunnel | **Implemented** | Keyed mutually authenticated channel with per-frame AEAD, binary framing, enforced connection cap, signed and expiring DHT records, bounded iterative lookup (ADR-011) |
 | 8.4 | DHT rollback protection | **Implemented** | Persisted per-publisher high-water marks that outlive record eviction and the process, wildcard refusal in common admission, per-peer record share (ADR-016). Probationary marks are evicted inside the replay window — see §8.4 |
 | 8.2 | Transport handoff | **Partial** | First-available selection; no session migration (T-03) |
+| 8.4 | Local transport authentication | **Implemented, untested** | BLE and Wi-Fi Direct run ADR-011's handshake over their fragmentation layer; the NodeId is derived from the proved key and no path installs an asserted one (ADR-021). BT Classic and LoRa still do — T-47. Never run on a radio (T-15) |
 | 8.5 | Plugin API | **Implemented** | Trait, registry, config, distinct `TransportType` per adapter. Nothing instantiates plugins (T-13) |
 | 8.6 | iOS strategy | **Implemented** | Dual-role CoreBluetooth, background restoration, LoRa bridge |
 | 9.1 | Content types | **Implemented** | All seven |
@@ -2366,12 +2482,17 @@ deviation and why:
 - **A malicious relay dropping traffic.** Relays cannot read or forge messages,
   but nothing forces them to forward. DTN spray to `L` relays limits the damage
   probabilistically; there is no accountability mechanism.
-- **A nearby node claiming a neighbour's identity.** BLE and Wi-Fi Direct
-  exchange bare NodeIds, so identity on the local transports is asserted
-  rather than proved (§8.4). Messages stay unreadable and sessions cannot be
-  hijacked (§14.3), but traffic for the impersonated node can be swallowed and
-  its routes poisoned. The internet transport proves identity (ADR-011); the
-  local ones need the same treatment — ROADMAP T-34.
+- **A nearby node claiming a neighbour's identity on BT Classic or LoRa.**
+  BLE, Wi-Fi Direct and the internet transport now prove identity at the
+  transport layer: a peer appears only once it has signed a fresh ephemeral
+  key and sealed a frame under the channel that key produced, and its NodeId
+  is derived from the key it proved (§8.4, ADR-011, ADR-021). Two transports
+  were left behind. BT Classic installs whatever id its bridge reports, and
+  LoRa has no link layer at all, so a neighbour's id comes from the
+  envelope's own `source` field — an assertion by whoever sent the frame.
+  Messages stay unreadable and sessions cannot be hijacked (§14.3), but
+  traffic for an impersonated node can be swallowed and its routes poisoned
+  on those two links — ROADMAP T-47.
 - **Compromise of a vouched identity.** Trust is transitive with decay, so a
   compromised well-connected identity inherits standing. Threshold revocation
   (§6.3) is the planned answer and is not built.

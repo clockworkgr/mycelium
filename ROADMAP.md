@@ -1,6 +1,6 @@
 # Mycelium Roadmap
 
-**Last updated:** 2026-11-15 · **Current version:** 0.1 (pre-release)
+**Last updated:** 2026-11-16 · **Current version:** 0.1 (pre-release)
 
 The companion document is [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md), which
 specifies the protocol and describes what is built. This document tracks only
@@ -9,15 +9,17 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-15 against the working tree, after T-38's persisted DHT
-high-water marks:
+Verified on 2026-11-16 against the working tree, after T-34's proved local
+transport identity:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **548 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **581 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
+| `./gradlew :app:compileDebugKotlin` + `flutter build apk --debug` | **builds**, FFI packaged for all three ABIs |
+| `swiftc -typecheck` of the iOS `Runner` module | **clean** |
 
 10 Rust crates (~26.6k lines), 49 Dart files, 38 REST endpoints + 7 WebSocket
 event types, 64 FFI functions, 17 wire payload types, 13 database tables.
@@ -58,36 +60,45 @@ no longer depends on still holding the record; wildcard addresses refused in
 common admission; a per-peer share of the record store — ADR-016). What it left
 behind is T-44.
 
+**Landed 2026-11-16:** T-34 (BLE and Wi-Fi Direct prove peer identity instead
+of asserting it: ADR-011's handshake runs over their fragmentation layer, the
+NodeId is derived from the key the peer signed, and the two characteristics and
+the `Hello` that carried a bare id are gone from the wire — ADR-021. The
+platform bridges carry links and frames and no identity at all, which is the
+same commit by design). What it left behind is T-47 and T-48, and the marker
+stays "Implemented, untested on hardware" until T-15.
+
 **Landed 2026-11-12:** T-36 (emergency broadcasts are checked before they are
 remembered, keyed on their digest, bounded in time by a signed `signed_at`,
 and the flood-dedup set expires by age instead of clearing itself — ADR-013).
 T-35's bookkeeping half landed the day before (ADR-012); what remains of it is
 below.
 
-T-34, T-35, T-37 and T-38 came out of reviewing ADRs against the code: T-34 is
-the defect T-09 fixed, still open on the local transports; T-35 is a defect in
-the T-06 work; T-37 is what reviewing ADR-010 during T-36 turned up next — an
+T-34, T-35, T-37 and T-38 came out of reviewing ADRs against the code: T-34
+was the defect T-09 fixed, still open on the local transports; T-35 is a defect
+in the T-06 work; T-37 is what reviewing ADR-010 during T-36 turned up next — an
 emergency broadcast's origin is not authenticated at all; and T-38 is how
 capacity eviction undoes the rollback protection ADR-011 claims.
 
 **Decided 2026-11-12.** Every P0 below has its design on record: T-14's row
-identity (ADR-017), T-01 (ADR-018), T-04 (ADR-019), T-08 (ADR-020) and T-34
-(ADR-021). ADR-014, ADR-015 and ADR-016 have been implemented (T-37, T-35,
-T-38). Each ADR names the task that implements it and flips its own
+identity (ADR-017), T-01 (ADR-018), T-04 (ADR-019) and T-08 (ADR-020).
+ADR-014, ADR-015, ADR-016 and ADR-021 have been implemented (T-37, T-35, T-38,
+T-34). Each ADR names the task that implements it and flips its own
 status in that commit; the acceptance criteria below carry the decisions.
 
-T-37, T-35 and T-38 have landed in that order. T-14's migration is next by the
-same reasoning — severity — and the remaining four (T-01, T-04, T-08, T-34) are
-designed but unsequenced.
+T-37, T-35, T-38 and T-34 have landed in that order. T-14's migration is next
+by the same reasoning — severity — and the remaining three (T-01, T-04, T-08)
+are designed but unsequenced.
 
 Two standing rules from those decisions: constants are **shapes now, numbers
 later** — the DHT publisher quota, the level-1/2 reach limits and the dedup
 retention period are to be measured against the testbed (T-19) or hardware
 (T-15), not guessed — T-38 added four more to that list (`mark_capacity` 8192,
 `mark_first_seen_reserve` 512, `mark_retention_grace_secs` 86 400 and
-`max_records_per_peer` 256, each with its basis in ADR-016's 2026-11-15 note); and the radio features (T-04, T-34) keep "Implemented,
-untested on hardware" until T-15's report, however complete the software
-tests are.
+`max_records_per_peer` 256, each with its basis in ADR-016's 2026-11-15 note);
+and the radio features keep "Implemented, untested on hardware" until T-15's
+report, however complete the software tests are — which is why BLE and Wi-Fi
+Direct carry that marker now that T-34 has landed, rather than a better one.
 
 ### T-01 · FFI robustness
 
@@ -218,46 +229,6 @@ protects against nothing an attacker with filesystem access cannot bypass.
   Revisit when a node first runs on someone else's device.
 - The threat model says plainly that a keyring unlocked by the login session
   protects against a stolen disk, not against code running as that user.
-
-### T-34 · Local transport peer identity is asserted, not proved
-
-**Area:** `mycelium-core`, Android Kotlin, iOS Swift · **Spec:** §8.4, §22 ·
-**ADR-011**, **ADR-021** (design decided 2026-11-12)
-
-The BLE Node ID characteristic (`…7891`) serves a bare 32-byte NodeId and the
-Identity characteristic (`…7894`) takes one; Wi-Fi Direct's `Hello` exchanges
-the same. No identity key is carried, nothing proves possession of one, and
-nothing binds the claim to the connection — so `mycelium_ble_on_peer_discovered`
-installs whatever id the platform layer reports. An attacker in radio range can
-claim any node's id: `TransportManager` installs a route for it, AODV prefers
-the fake neighbour, and that node's traffic is delivered to the attacker and
-dropped. Payloads stay encrypted and no session can be established under a
-borrowed id (§14.3), so the damage is denial of delivery and route poisoning,
-not disclosure.
-
-This is the defect T-09 fixed for the internet transport, and the fix has the
-same shape (ADR-011): carry the identity key, prove possession of it against
-something fresh and connection-bound, and *derive* the NodeId instead of
-accepting one. The local transports need it in a form their platform layers can
-carry — the Identity characteristic becomes a key plus a signature over a
-channel-binding value rather than an id.
-
-**Acceptance** (designs per ADR-021):
-- ADR-011's authenticated-channel handshake runs over the local transports'
-  fragmentation layer, rather than a second BLE-shaped proof: one proof format
-  and one implementation across BLE, Wi-Fi Direct and internet.
-- A peer's NodeId is derived from the proved identity key; `…7891` stops being
-  an input and no code path installs a peer from an asserted id. Wi-Fi Direct's
-  `Hello` is removed rather than left as a weaker second path.
-- The Rust side and both platform bridges land in **one task**, so there is no
-  build where a peer is installed from an asserted id and no flag to remember
-  to flip. The bridges stop reporting a discovered peer by id and must rebuild
-  their address-to-peer bookkeeping around a handshake that completes later.
-- Test: a peer that replays a captured identity exchange installs no transport
-  peer and no route; one that holds the key succeeds.
-- Spec §8.4 and §22 updated. The marker stays "Implemented, untested on
-  hardware" until T-15's report — the handshake has to survive real
-  reassembly and reconnection churn before it can claim more.
 
 ### T-35 · Unconfirmed-handshake bookkeeping is not maintained
 
@@ -832,6 +803,89 @@ deletions that can land after the new engine has restored them.
   replacement, and a restart that still refuses the replay.
 - The notes in ADR-016, ADR-011 and §8.4 lose their pointers here, and the FFI
   return codes are documented without `-3`.
+
+---
+
+### T-47 · BT Classic and LoRa still install an asserted peer id
+
+**Area:** `mycelium-core`, Android Kotlin · **Spec:** §8.3, §8.4, §22 ·
+**ADR-021** (for the shape of the fix)
+
+T-34 proved peer identity on BLE and Wi-Fi Direct. Two transports were left
+behind, and after that change they are the only ones that still install a peer
+from an id nobody proved:
+
+1. **BT Classic** is the same defect in the same shape.
+   `mycelium_bt_classic_on_peer_connected` takes 32 bytes from the Kotlin
+   bridge and installs a peer and a route for them; `BtClassicService.kt`
+   exchanges them over RFCOMM. ADR-021's design applies unchanged — links
+   named by the socket, the shared handshake over the frame layer, the NodeId
+   derived from the proved key — and the work is the Rust transport plus one
+   Kotlin service and one Dart manager. The transport is "Implemented,
+   untested on hardware" (T-15), so nothing is deployed behind it.
+
+2. **LoRa is different and worse.** It has no link layer at all: the bridge
+   passes `NodeId::ZERO` and the peer is taken from the reassembled
+   envelope's `source` field (`lora.rs`), which is an assertion by whoever
+   sent the frame. A two-way channel handshake per peer does not fit a
+   broadcast medium with a 51-byte frame and a 1 % duty cycle, so this needs a
+   design of its own rather than ADR-021's: signing the beacon, or binding
+   neighbour state to the envelope's own signature chain, are the directions
+   to weigh. T-40 collects LoRa's other ADR-008 divergences; this is not one
+   of them.
+
+**Acceptance:**
+- BT Classic installs a peer only after the ADR-021 handshake, with the
+  replay-refused and honest-peer pair of tests the local transports have.
+- Either LoRa proves a neighbour's identity by a mechanism a broadcast
+  medium can carry, or spec §8.4 and §22 state plainly that a LoRa
+  neighbour's id is asserted, what that costs, and why the alternatives were
+  refused — with a new ADR for whichever way it goes.
+- §22's "a nearby node claiming a neighbour's identity" bullet shrinks to
+  whatever is still true.
+
+---
+
+### T-48 · A local link's name is not unique across its incarnations
+
+**Area:** `mycelium-core`, Android Kotlin, iOS Swift, Flutter · **Spec:** §8.4
+· **ADR-021** (residual 8)
+
+T-34 names a link by the address the platform layer holds for it, prefixed by
+the GATT role: `c:AA:BB:CC:DD:EE:FF`, or a Wi-Fi Direct endpoint. A
+reconnection reuses that name, and by then some of the previous incarnation's
+work has already been dispatched through the app — a frame, a `close`, an
+`established`. Rust purges its own queues when a link goes, and the bridges
+check identity where they hold an object to compare, but nothing can retract
+what has already crossed a layer boundary.
+
+Found by the ADR review on 2026-11-16. The consequences are bounded, which is
+why it is a task and not a fix in T-34: a stale frame on a live link fails to
+open and is dropped (the counter floor and the AEAD see to that), and a stale
+`close` costs a healthy link a reconnection and the 30-second backoff. One is
+worse than a lost frame: a stale `established` *is* accepted by a replacement
+of the same name, because the bridge checks only that it still holds the link,
+and that exempts the replacement's unfinished handshake from the bridge's own
+stale-link sweep — leaving only the Rust side's ten-second deadline to close
+it. Nothing is installed wrongly and no peer is impersonated; what is lost is
+time, and one layer of defence in depth.
+
+Closing the class properly means carrying a **connection instance** in the
+link name, end to end: Rust, the FFI, the app and both bridges. The one thing
+that must *not* follow the instance is the refusal backoff, which is about a
+device and a role and has to outlive an incarnation — so it needs its own key.
+
+**Acceptance:**
+- A link's name identifies one incarnation. A frame, a directive or an event
+  from a previous one names a link that no longer exists and is dropped by
+  the existing unknown-link path, rather than being checked for by each
+  layer separately.
+- The refusal backoff still holds across a reconnection, with a test that a
+  refused peer is not redialled inside the backoff even though its link name
+  has changed.
+- A test that a reconnection arriving before the previous incarnation's
+  cleanup has finished keeps the replacement, on both local transports.
+- ADR-021's residual 8 is retired and §8.4 states what a link name means.
 
 ---
 

@@ -62,3 +62,38 @@ The `TransportManager` automatically selects Wi-Fi Direct over BLE when both are
 2. **Hotspot mode**: Only one device can be AP, doesn't support true P2P
 3. **mDNS over existing Wi-Fi**: Requires infrastructure Wi-Fi, defeats the mesh purpose
 4. **UDP instead of TCP**: Would need application-level reliability; TCP is simpler for the payloads we send
+
+## Note (2026-11-16, T-34)
+
+ADR-021 replaced this transport's authentication and reshaped its wire
+protocol. The decisions above stand — `WifiP2pManager` groups, Bonjour service
+discovery, a group owner listening on TCP 9740, both roles sharing one
+`handleClient` flow — but three things it specifies are no longer what the code
+does.
+
+**The `Hello` is gone.** `Hello (0x01)` carried a bare 32-byte NodeId and the
+peer was believed; that is the defect ROADMAP T-34 was about. Identity is now
+proved by ADR-011's handshake, carried in the payload of ordinary frames, and
+the NodeId is derived from the key the peer signed. The TXT record no longer
+advertises a node id prefix either, because nothing unproved identifies a node
+any more.
+
+**`MeshData (0x02)` became `Frame (0x02)`**, an opaque frame for the transport
+above rather than a mesh payload. This layer does not know what is in it: the
+first frames on a socket are a handshake, and everything after them is sealed.
+
+**"TCP handles segmentation, so no fragmentation layer" is no longer true at
+the Rust level.** The transport fragments a sealed frame with the shared
+6-byte header (ADR-022) before handing the pieces over, so that one
+implementation serves BLE and Wi-Fi Direct; TCP still carries each piece whole,
+and with a 16 KB fragment that is one frame per message in practice.
+
+**The bridge reports links, not peers**, named by the remote socket endpoint,
+and the FFI functions it calls are the link events — `wifi_on_link_{up,down,
+data}`, `wifi_dequeue_send` and `wifi_dequeue_link_event` — in place of the
+peer events this ADR's design implied. One socket owns one writer thread, so
+frames leave a link in the order they were queued; a frame overtaken on a link
+is refused by the receiver's counter floor, which is ADR-021's reason for
+caring.
+
+Appended rather than edited in place, because these records are append-only.

@@ -1150,13 +1150,16 @@ impl Node {
         use mycelium_core::transport::wifi_direct::WifiDirectTransport;
 
         if self.config.transports.ble {
-            let ble = Arc::new(BleTransport::new(self.node_id));
+            // The identity, not just the id: the transport signs its own
+            // handshakes now, and a peer is installed only once it has
+            // proved the key behind its NodeId (ADR-021, T-34).
+            let ble = Arc::new(BleTransport::new(self.identity_handle()));
             self.transport_manager.add_transport(ble.clone()).await;
             *self.ble_transport.write().await = Some(ble);
             info!("Registered BLE transport");
         }
         if self.config.transports.wifi_direct {
-            let wifi = Arc::new(WifiDirectTransport::new(self.node_id));
+            let wifi = Arc::new(WifiDirectTransport::new(self.identity_handle()));
             self.transport_manager.add_transport(wifi.clone()).await;
             *self.wifi_transport.write().await = Some(wifi);
             info!("Registered Wi-Fi Direct transport");

@@ -72,13 +72,6 @@ typedef void (*MessageCallback)(
     uint64_t timestamp
 );
 
-/** BLE/WiFi send callback. Returns 0 on success. */
-typedef int32_t (*TransportSendCallback)(
-    const uint8_t peer_id[32],
-    const uint8_t *data,
-    uint32_t data_len
-);
-
 /* --- Error Retrieval --- */
 
 /** Get the last error message. Returns length written (0 if none). */
@@ -261,50 +254,83 @@ int32_t mycelium_register_ble_transport(MyceliumNode *handle);
 /** Register Wi-Fi Direct transport. Returns 0 on success. */
 int32_t mycelium_register_wifi_direct_transport(MyceliumNode *handle);
 
-/* --- Transport Event Injection (Platform → Rust) --- */
+/* --- Transport Link Injection (Platform → Rust) --- */
+/* Links, not peers: the bridge reports the address it already has for a
+ * connection and relays opaque frames. Who is on the other end is settled by
+ * the handshake in Rust, and nothing here installs an id the platform
+ * claimed (ADR-021). `addr` is a NUL-terminated UTF-8 string of at most 64
+ * bytes including the terminator.
+ * Return: 0 on success, -1 on a bad argument, -2 if the transport is not
+ * registered. */
 
-int32_t mycelium_ble_on_peer_discovered(MyceliumNode *handle, const uint8_t peer_id[32]);
-int32_t mycelium_ble_on_peer_lost(MyceliumNode *handle, const uint8_t peer_id[32]);
-int32_t mycelium_ble_on_data_received(
+int32_t mycelium_ble_on_link_up(MyceliumNode *handle, const char *addr);
+int32_t mycelium_ble_on_link_down(MyceliumNode *handle, const char *addr);
+int32_t mycelium_ble_on_link_data(
     MyceliumNode *handle,
-    const uint8_t peer_id[32],
+    const char *addr,
     const uint8_t *data, uint32_t data_len
 );
 
-int32_t mycelium_wifi_on_peer_connected(MyceliumNode *handle, const uint8_t peer_id[32]);
-int32_t mycelium_wifi_on_peer_disconnected(MyceliumNode *handle, const uint8_t peer_id[32]);
-int32_t mycelium_wifi_on_data_received(
+int32_t mycelium_wifi_on_link_up(MyceliumNode *handle, const char *addr);
+int32_t mycelium_wifi_on_link_down(MyceliumNode *handle, const char *addr);
+int32_t mycelium_wifi_on_link_data(
     MyceliumNode *handle,
-    const uint8_t peer_id[32],
+    const char *addr,
     const uint8_t *data, uint32_t data_len
 );
 
 /* --- BLE Outbox (Rust → Platform polling) --- */
 
-/** Dequeue one pending BLE send. Returns 1 if dequeued, 0 if empty, -1 on error,
- *  -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len). */
+/** Dequeue one pending BLE frame, with the link to write it on. Returns 1 if
+ *  dequeued, 0 if empty, -1 on error, -3 if the frame was larger than
+ *  data_capacity (frame dropped, required size in out_data_len), -5 if the
+ *  address did not fit addr_capacity (nothing written).
+ *
+ *  `out_is_handshake` is 1 when the fragment belongs to a handshake frame,
+ *  which the platform layer must neither delay behind ordinary traffic nor
+ *  evict from a full queue. It cannot work this out for itself: a link counts
+ *  as established in Rust as soon as the peer's confirmation arrives, which
+ *  can be before our own confirmation has left (ADR-021). */
 int32_t mycelium_ble_dequeue_send(
     MyceliumNode *handle,
-    uint8_t out_peer_id[32],
+    char *out_addr, uint32_t addr_capacity,
     uint8_t *out_data, uint32_t data_capacity,
-    uint32_t *out_data_len
+    uint32_t *out_data_len,
+    uint32_t *out_is_handshake
 );
 
 /* --- Wi-Fi Direct Outbox (Rust → Platform polling) --- */
 
-/** Dequeue one pending Wi-Fi Direct send. Returns 1 if dequeued, 0 if empty, -1 on error,
- *  -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len). */
+/** Dequeue one pending Wi-Fi Direct frame, with the link to write it on.
+ *  Codes and `out_is_handshake` are as for mycelium_ble_dequeue_send. */
 int32_t mycelium_wifi_dequeue_send(
     MyceliumNode *handle,
-    uint8_t out_peer_id[32],
+    char *out_addr, uint32_t addr_capacity,
     uint8_t *out_data, uint32_t data_capacity,
-    uint32_t *out_data_len
+    uint32_t *out_data_len,
+    uint32_t *out_is_handshake
 );
 
-/* --- Transport Send Callbacks (Rust → Platform) --- */
+/* --- Link Directives (Rust → Platform polling) --- */
 
-int32_t mycelium_ble_set_send_callback(MyceliumNode *handle, TransportSendCallback callback);
-int32_t mycelium_wifi_set_send_callback(MyceliumNode *handle, TransportSendCallback callback);
+/** What the platform layer must do with a link. */
+#define MYCELIUM_LINK_ESTABLISHED 1u
+/** Close it and do not immediately redial: the handshake failed, timed out,
+ *  named us, or there was no room for it. Nothing was installed. */
+#define MYCELIUM_LINK_CLOSE 2u
+
+/** Take the next link directive. Returns 1 if one was dequeued, 0 if none,
+ *  -1 on error, -5 if the address did not fit addr_capacity. */
+int32_t mycelium_ble_dequeue_link_event(
+    MyceliumNode *handle,
+    char *out_addr, uint32_t addr_capacity,
+    uint32_t *out_event
+);
+int32_t mycelium_wifi_dequeue_link_event(
+    MyceliumNode *handle,
+    char *out_addr, uint32_t addr_capacity,
+    uint32_t *out_event
+);
 
 /* --- Internet Transport --- */
 

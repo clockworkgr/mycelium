@@ -1115,8 +1115,10 @@ pub unsafe extern "C" fn mycelium_register_ble_transport(handle: *mut MyceliumNo
     }
 
     let node = &(*handle).node;
+    // The identity, not the id: this transport proves who it is now
+    // (ADR-021, ROADMAP T-34).
     let ble = Arc::new(mycelium_core::transport::ble::BleTransport::new(
-        node.node_id,
+        node.identity_handle(),
     ));
     runtime().block_on(async {
         node.transport_manager.replace_transport(ble.clone()).await;
@@ -1138,8 +1140,9 @@ pub unsafe extern "C" fn mycelium_register_wifi_direct_transport(handle: *mut My
     }
 
     let node = &(*handle).node;
-    let wifi =
-        Arc::new(mycelium_core::transport::wifi_direct::WifiDirectTransport::new(node.node_id));
+    let wifi = Arc::new(
+        mycelium_core::transport::wifi_direct::WifiDirectTransport::new(node.identity_handle()),
+    );
     runtime().block_on(async {
         node.transport_manager.replace_transport(wifi.clone()).await;
         *node.wifi_transport.write().await = Some(wifi);
@@ -1148,30 +1151,75 @@ pub unsafe extern "C" fn mycelium_register_wifi_direct_transport(handle: *mut My
 }
 
 // --- Transport Event Injection API ---
-// These functions let the Android/iOS platform layer feed BLE/WiFi Direct
-// events into the Rust transport layer.
+// These functions let the Android/iOS platform layer feed BLE/Wi-Fi Direct
+// links into the Rust transport layer.
+//
+// Links, not peers. The bridge reports the address it already has for a
+// connection and relays opaque frames; who is on the other end is settled by
+// the handshake in `mycelium_core::transport::link`, and nothing here can
+// install an id the platform claimed (ADR-021, ROADMAP T-34).
 
-/// Notify the BLE transport that a peer was discovered.
+/// Read a link address from the platform layer.
+///
+/// # Safety
+/// - `addr` must point to a NUL-terminated UTF-8 string.
+unsafe fn link_addr(addr: *const c_char) -> Option<String> {
+    let text = CStr::from_ptr(addr).to_str().ok()?;
+    // `MAX_LINK_ADDR` counts the NUL terminator, so an address this long
+    // always fits back into a caller's buffer of that size. Refusing the
+    // boundary case here is what stops an address being accepted inbound
+    // and then undeliverable outbound, which would strand the link.
+    if text.is_empty() || text.len() + 1 > mycelium_core::transport::link::MAX_LINK_ADDR {
+        return None;
+    }
+    Some(text.to_string())
+}
+
+/// Write a link address back to the platform layer, NUL-terminated.
+///
+/// Returns false when it does not fit, in which case nothing is written: a
+/// truncated address would name a different link.
+///
+/// # Safety
+/// - `out` must point to `capacity` writable bytes.
+unsafe fn write_link_addr(addr: &str, out: *mut c_char, capacity: u32) -> bool {
+    let needed = addr.len() + 1;
+    if needed > capacity as usize {
+        set_last_error(format!(
+            "link address of {} bytes exceeds caller buffer of {} bytes",
+            needed, capacity
+        ));
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(addr.as_ptr() as *const c_char, out, addr.len());
+    *out.add(addr.len()) = 0;
+    true
+}
+
+/// Notify the BLE transport that a link came up, in either GATT role.
+///
+/// Returns 0 on success, -1 on a bad argument, -2 if BLE is not registered.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `peer_id` must point to 32 bytes.
+/// - `addr` must point to a NUL-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_ble_on_peer_discovered(
+pub unsafe extern "C" fn mycelium_ble_on_link_up(
     handle: *mut MyceliumNode,
-    peer_id: *const [u8; 32],
+    addr: *const c_char,
 ) -> i32 {
-    if handle.is_null() || peer_id.is_null() {
+    if handle.is_null() || addr.is_null() {
         return -1;
     }
+    let Some(addr) = link_addr(addr) else {
+        return -1;
+    };
 
     let node = &(*handle).node;
-    let peer = NodeId::from_bytes(*peer_id);
-
     runtime().block_on(async {
         let guard = node.ble_transport.read().await;
         if let Some(ble) = guard.as_ref() {
-            ble.on_peer_discovered(peer).await;
+            ble.on_link_up(&addr);
             0
         } else {
             -2 // BLE transport not registered
@@ -1179,27 +1227,28 @@ pub unsafe extern "C" fn mycelium_ble_on_peer_discovered(
     })
 }
 
-/// Notify the BLE transport that a peer was lost.
+/// Notify the BLE transport that a link went away.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `peer_id` must point to 32 bytes.
+/// - `addr` must point to a NUL-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_ble_on_peer_lost(
+pub unsafe extern "C" fn mycelium_ble_on_link_down(
     handle: *mut MyceliumNode,
-    peer_id: *const [u8; 32],
+    addr: *const c_char,
 ) -> i32 {
-    if handle.is_null() || peer_id.is_null() {
+    if handle.is_null() || addr.is_null() {
         return -1;
     }
+    let Some(addr) = link_addr(addr) else {
+        return -1;
+    };
 
     let node = &(*handle).node;
-    let peer = NodeId::from_bytes(*peer_id);
-
     runtime().block_on(async {
         let guard = node.ble_transport.read().await;
         if let Some(ble) = guard.as_ref() {
-            ble.on_peer_lost(peer).await;
+            ble.on_link_down(&addr);
             0
         } else {
             -2
@@ -1207,31 +1256,32 @@ pub unsafe extern "C" fn mycelium_ble_on_peer_lost(
     })
 }
 
-/// Feed data received from BLE into the transport layer.
+/// Feed one frame received on a BLE link into the transport layer.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `peer_id` must point to 32 bytes.
+/// - `addr` must point to a NUL-terminated UTF-8 string.
 /// - `data` must point to `data_len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_ble_on_data_received(
+pub unsafe extern "C" fn mycelium_ble_on_link_data(
     handle: *mut MyceliumNode,
-    peer_id: *const [u8; 32],
+    addr: *const c_char,
     data: *const u8,
     data_len: u32,
 ) -> i32 {
-    if handle.is_null() || peer_id.is_null() || data.is_null() {
+    if handle.is_null() || addr.is_null() || data.is_null() {
         return -1;
     }
-
-    let node = &(*handle).node;
-    let peer = NodeId::from_bytes(*peer_id);
+    let Some(addr) = link_addr(addr) else {
+        return -1;
+    };
     let payload = std::slice::from_raw_parts(data, data_len as usize).to_vec();
 
+    let node = &(*handle).node;
     runtime().block_on(async {
         let guard = node.ble_transport.read().await;
         if let Some(ble) = guard.as_ref() {
-            ble.on_data_received(peer, payload).await;
+            ble.on_link_data(&addr, &payload);
             0
         } else {
             -2
@@ -1239,27 +1289,28 @@ pub unsafe extern "C" fn mycelium_ble_on_data_received(
     })
 }
 
-/// Notify the Wi-Fi Direct transport that a peer connected.
+/// Notify the Wi-Fi Direct transport that a socket came up.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `peer_id` must point to 32 bytes.
+/// - `addr` must point to a NUL-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_wifi_on_peer_connected(
+pub unsafe extern "C" fn mycelium_wifi_on_link_up(
     handle: *mut MyceliumNode,
-    peer_id: *const [u8; 32],
+    addr: *const c_char,
 ) -> i32 {
-    if handle.is_null() || peer_id.is_null() {
+    if handle.is_null() || addr.is_null() {
         return -1;
     }
+    let Some(addr) = link_addr(addr) else {
+        return -1;
+    };
 
     let node = &(*handle).node;
-    let peer = NodeId::from_bytes(*peer_id);
-
     runtime().block_on(async {
         let guard = node.wifi_transport.read().await;
         if let Some(wifi) = guard.as_ref() {
-            wifi.on_peer_connected(peer).await;
+            wifi.on_link_up(&addr);
             0
         } else {
             -2
@@ -1267,27 +1318,28 @@ pub unsafe extern "C" fn mycelium_wifi_on_peer_connected(
     })
 }
 
-/// Notify the Wi-Fi Direct transport that a peer disconnected.
+/// Notify the Wi-Fi Direct transport that a socket went away.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `peer_id` must point to 32 bytes.
+/// - `addr` must point to a NUL-terminated UTF-8 string.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_wifi_on_peer_disconnected(
+pub unsafe extern "C" fn mycelium_wifi_on_link_down(
     handle: *mut MyceliumNode,
-    peer_id: *const [u8; 32],
+    addr: *const c_char,
 ) -> i32 {
-    if handle.is_null() || peer_id.is_null() {
+    if handle.is_null() || addr.is_null() {
         return -1;
     }
+    let Some(addr) = link_addr(addr) else {
+        return -1;
+    };
 
     let node = &(*handle).node;
-    let peer = NodeId::from_bytes(*peer_id);
-
     runtime().block_on(async {
         let guard = node.wifi_transport.read().await;
         if let Some(wifi) = guard.as_ref() {
-            wifi.on_peer_disconnected(peer).await;
+            wifi.on_link_down(&addr);
             0
         } else {
             -2
@@ -1295,31 +1347,32 @@ pub unsafe extern "C" fn mycelium_wifi_on_peer_disconnected(
     })
 }
 
-/// Feed data received from Wi-Fi Direct into the transport layer.
+/// Feed one frame received on a Wi-Fi Direct link into the transport layer.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `peer_id` must point to 32 bytes.
+/// - `addr` must point to a NUL-terminated UTF-8 string.
 /// - `data` must point to `data_len` bytes.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_wifi_on_data_received(
+pub unsafe extern "C" fn mycelium_wifi_on_link_data(
     handle: *mut MyceliumNode,
-    peer_id: *const [u8; 32],
+    addr: *const c_char,
     data: *const u8,
     data_len: u32,
 ) -> i32 {
-    if handle.is_null() || peer_id.is_null() || data.is_null() {
+    if handle.is_null() || addr.is_null() || data.is_null() {
         return -1;
     }
-
-    let node = &(*handle).node;
-    let peer = NodeId::from_bytes(*peer_id);
+    let Some(addr) = link_addr(addr) else {
+        return -1;
+    };
     let payload = std::slice::from_raw_parts(data, data_len as usize).to_vec();
 
+    let node = &(*handle).node;
     runtime().block_on(async {
         let guard = node.wifi_transport.read().await;
         if let Some(wifi) = guard.as_ref() {
-            wifi.on_data_received(peer, payload).await;
+            wifi.on_link_data(&addr, &payload);
             0
         } else {
             -2
@@ -1327,164 +1380,229 @@ pub unsafe extern "C" fn mycelium_wifi_on_data_received(
     })
 }
 
-// --- Transport Send Callback API ---
+// --- Transport Outbox API ---
 
-/// Dequeue one pending BLE send from the outbox.
+/// Dequeue one pending BLE frame, with the link to write it on.
 ///
-/// Returns 1 if a packet was dequeued (fills out params), 0 if empty, -1 on error.
+/// Returns 1 if a frame was dequeued (fills out params), 0 if empty,
+/// -1 on error, -3 if the frame does not fit `out_data`, -5 if the address
+/// does not fit `out_addr`.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `out_peer_id` must point to 32 bytes.
-/// - `out_data` must point to `data_capacity` bytes.
+/// - `out_addr` must point to `addr_capacity` writable bytes.
+/// - `out_data` must point to `data_capacity` writable bytes.
 /// - `out_data_len` must point to a valid u32.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_ble_dequeue_send(
     handle: *mut MyceliumNode,
-    out_peer_id: *mut [u8; 32],
+    out_addr: *mut c_char,
+    addr_capacity: u32,
     out_data: *mut u8,
     data_capacity: u32,
     out_data_len: *mut u32,
+    out_is_handshake: *mut u32,
 ) -> i32 {
-    if handle.is_null() || out_peer_id.is_null() || out_data.is_null() || out_data_len.is_null() {
+    if handle.is_null()
+        || out_addr.is_null()
+        || out_data.is_null()
+        || out_data_len.is_null()
+        || out_is_handshake.is_null()
+    {
         return -1;
     }
 
     let node = &(*handle).node;
-
     let result = runtime().block_on(async {
         let guard = node.ble_transport.read().await;
         guard.as_ref().and_then(|ble| ble.dequeue_send())
     });
 
     match result {
-        Some((peer, data)) => {
+        Some((addr, data, handshake)) => {
             if data.len() > data_capacity as usize {
-                // A truncated frame would corrupt the peer's reassembly; drop it
-                // and report the problem instead of handing out garbage.
+                // A truncated frame would corrupt the peer's reassembly; drop
+                // it and report the problem instead of handing out garbage.
                 set_last_error(format!(
-                    "outbox packet of {} bytes exceeds caller buffer of {} bytes; dropped",
+                    "outbox frame of {} bytes exceeds caller buffer of {} bytes; dropped",
                     data.len(),
                     data_capacity
                 ));
                 (*out_data_len) = data.len() as u32;
                 return -3;
             }
-            (*out_peer_id) = *peer.as_bytes();
+            // The frame has already left the outbox, so a buffer too small
+            // for the address drops it. The peer tolerates the gap: a local
+            // link's frames carry their counter precisely so a lost one is
+            // survivable (ADR-021).
+            if !write_link_addr(&addr, out_addr, addr_capacity) {
+                return -5;
+            }
             std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, data.len());
             (*out_data_len) = data.len() as u32;
+            // The platform layer must neither delay nor evict a handshake
+            // frame, and cannot work out which one is: a link is established
+            // in Rust as soon as the peer's confirmation arrives, which can
+            // be before our own confirmation has left (ADR-021).
+            (*out_is_handshake) = u32::from(handshake);
             1
         }
         None => 0,
     }
 }
 
-/// Dequeue one pending Wi-Fi Direct send from the outbox.
+/// Dequeue one pending Wi-Fi Direct frame, with the link to write it on.
 ///
-/// Returns 1 if a packet was dequeued (fills out params), 0 if empty, -1 on error.
+/// Returns 1 if a frame was dequeued (fills out params), 0 if empty,
+/// -1 on error, -3 if the frame does not fit `out_data`, -5 if the address
+/// does not fit `out_addr`.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
-/// - `out_peer_id` must point to 32 bytes.
-/// - `out_data` must point to `data_capacity` bytes.
+/// - `out_addr` must point to `addr_capacity` writable bytes.
+/// - `out_data` must point to `data_capacity` writable bytes.
 /// - `out_data_len` must point to a valid u32.
 #[no_mangle]
 pub unsafe extern "C" fn mycelium_wifi_dequeue_send(
     handle: *mut MyceliumNode,
-    out_peer_id: *mut [u8; 32],
+    out_addr: *mut c_char,
+    addr_capacity: u32,
     out_data: *mut u8,
     data_capacity: u32,
     out_data_len: *mut u32,
+    out_is_handshake: *mut u32,
 ) -> i32 {
-    if handle.is_null() || out_peer_id.is_null() || out_data.is_null() || out_data_len.is_null() {
+    if handle.is_null()
+        || out_addr.is_null()
+        || out_data.is_null()
+        || out_data_len.is_null()
+        || out_is_handshake.is_null()
+    {
         return -1;
     }
 
     let node = &(*handle).node;
-
     let result = runtime().block_on(async {
         let guard = node.wifi_transport.read().await;
         guard.as_ref().and_then(|wifi| wifi.dequeue_send())
     });
 
     match result {
-        Some((peer, data)) => {
+        Some((addr, data, handshake)) => {
             if data.len() > data_capacity as usize {
-                // A truncated frame would corrupt the peer's reassembly; drop it
-                // and report the problem instead of handing out garbage.
                 set_last_error(format!(
-                    "outbox packet of {} bytes exceeds caller buffer of {} bytes; dropped",
+                    "outbox frame of {} bytes exceeds caller buffer of {} bytes; dropped",
                     data.len(),
                     data_capacity
                 ));
                 (*out_data_len) = data.len() as u32;
                 return -3;
             }
-            (*out_peer_id) = *peer.as_bytes();
+            if !write_link_addr(&addr, out_addr, addr_capacity) {
+                return -5;
+            }
             std::ptr::copy_nonoverlapping(data.as_ptr(), out_data, data.len());
             (*out_data_len) = data.len() as u32;
+            // The platform layer must neither delay nor evict a handshake
+            // frame, and cannot work out which one is: a link is established
+            // in Rust as soon as the peer's confirmation arrives, which can
+            // be before our own confirmation has left (ADR-021).
+            (*out_is_handshake) = u32::from(handshake);
             1
         }
         None => 0,
     }
 }
 
-/// Register a callback for sending data via BLE.
-///
-/// When the Rust layer needs to send data to a BLE peer, this callback is invoked.
-/// The platform layer should implement the actual BLE write operation.
-///
-/// Callback signature: `fn(peer_id: *const [u8; 32], data: *const u8, data_len: u32) -> i32`
-/// Returns 0 on success, non-zero on failure.
-///
-/// # Safety
-/// - `handle` must be a valid pointer.
-#[no_mangle]
-pub unsafe extern "C" fn mycelium_ble_set_send_callback(
-    handle: *mut MyceliumNode,
-    callback: mycelium_core::transport::ble::BleSendCallback,
-) -> i32 {
-    if handle.is_null() {
-        return -1;
-    }
+/// What the platform layer must do with a link.
+pub const MYCELIUM_LINK_ESTABLISHED: u32 = 1;
+pub const MYCELIUM_LINK_CLOSE: u32 = 2;
 
-    let node = &(*handle).node;
-    runtime().block_on(async {
-        let guard = node.ble_transport.read().await;
-        if let Some(ble) = guard.as_ref() {
-            ble.set_send_callback(callback).await;
-            0
-        } else {
-            -2
-        }
-    })
+fn link_event_code(directive: mycelium_core::transport::link::LinkDirective) -> u32 {
+    match directive {
+        mycelium_core::transport::link::LinkDirective::Established => MYCELIUM_LINK_ESTABLISHED,
+        mycelium_core::transport::link::LinkDirective::Close => MYCELIUM_LINK_CLOSE,
+    }
 }
 
-/// Register a callback for sending data via Wi-Fi Direct.
+/// Take the next thing the platform layer must do with a BLE link.
 ///
-/// Callback signature: `fn(peer_id: *const [u8; 32], data: *const u8, data_len: u32) -> i32`
+/// `MYCELIUM_LINK_ESTABLISHED` (1) means the handshake completed and the
+/// bridge can stop retrying that address. `MYCELIUM_LINK_CLOSE` (2) means
+/// close it and do not immediately redial: the handshake failed, timed out,
+/// named us, or there was no room for it. Nothing was installed.
+///
+/// Returns 1 if an event was dequeued, 0 if none, -1 on error, -5 if the
+/// address does not fit `out_addr`.
 ///
 /// # Safety
 /// - `handle` must be a valid pointer.
+/// - `out_addr` must point to `addr_capacity` writable bytes.
+/// - `out_event` must point to a valid u32.
 #[no_mangle]
-pub unsafe extern "C" fn mycelium_wifi_set_send_callback(
+pub unsafe extern "C" fn mycelium_ble_dequeue_link_event(
     handle: *mut MyceliumNode,
-    callback: mycelium_core::transport::wifi_direct::WifiSendCallback,
+    out_addr: *mut c_char,
+    addr_capacity: u32,
+    out_event: *mut u32,
 ) -> i32 {
-    if handle.is_null() {
+    if handle.is_null() || out_addr.is_null() || out_event.is_null() {
         return -1;
     }
 
     let node = &(*handle).node;
-    runtime().block_on(async {
-        let guard = node.wifi_transport.read().await;
-        if let Some(wifi) = guard.as_ref() {
-            wifi.set_send_callback(callback).await;
-            0
-        } else {
-            -2
+    let result = runtime().block_on(async {
+        let guard = node.ble_transport.read().await;
+        guard.as_ref().and_then(|ble| ble.next_directive())
+    });
+
+    match result {
+        Some((addr, directive)) => {
+            if !write_link_addr(&addr, out_addr, addr_capacity) {
+                return -5;
+            }
+            (*out_event) = link_event_code(directive);
+            1
         }
-    })
+        None => 0,
+    }
+}
+
+/// Take the next thing the platform layer must do with a Wi-Fi Direct link.
+///
+/// Codes are as in `mycelium_ble_dequeue_link_event`.
+///
+/// # Safety
+/// - `handle` must be a valid pointer.
+/// - `out_addr` must point to `addr_capacity` writable bytes.
+/// - `out_event` must point to a valid u32.
+#[no_mangle]
+pub unsafe extern "C" fn mycelium_wifi_dequeue_link_event(
+    handle: *mut MyceliumNode,
+    out_addr: *mut c_char,
+    addr_capacity: u32,
+    out_event: *mut u32,
+) -> i32 {
+    if handle.is_null() || out_addr.is_null() || out_event.is_null() {
+        return -1;
+    }
+
+    let node = &(*handle).node;
+    let result = runtime().block_on(async {
+        let guard = node.wifi_transport.read().await;
+        guard.as_ref().and_then(|wifi| wifi.next_directive())
+    });
+
+    match result {
+        Some((addr, directive)) => {
+            if !write_link_addr(&addr, out_addr, addr_capacity) {
+                return -5;
+            }
+            (*out_event) = link_event_code(directive);
+            1
+        }
+        None => 0,
+    }
 }
 
 // --- Message Deletion API ---

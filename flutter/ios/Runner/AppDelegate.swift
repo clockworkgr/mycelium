@@ -58,29 +58,42 @@ import UIKit
             }
             switch call.method {
             case "start":
-                guard let args = call.arguments as? [String: Any],
-                      let nodeIdList = args["nodeId"] as? [Int],
-                      nodeIdList.count == 32 else {
-                    result(FlutterError(code: "INVALID_ARG", message: "nodeId must be 32 bytes", details: nil))
-                    return
-                }
-                let nodeId = Data(nodeIdList.map { UInt8($0 & 0xFF) })
-                self.bleService?.start(nodeId: nodeId)
+                // No node id: this layer carries frames and never names a
+                // peer (ADR-021, T-34).
+                self.bleService?.start()
                 result(true)
             case "stop":
                 self.bleService?.stop()
                 result(true)
             case "sendData":
                 guard let args = call.arguments as? [String: Any],
-                      let peerIdList = args["peerId"] as? [Int],
+                      let linkId = args["linkId"] as? String, !linkId.isEmpty,
                       let dataList = args["data"] as? [Int] else {
-                    result(FlutterError(code: "INVALID_ARG", message: "peerId and data required", details: nil))
+                    result(FlutterError(code: "INVALID_ARG", message: "linkId and data required", details: nil))
                     return
                 }
-                let peerId = Data(peerIdList.map { UInt8($0 & 0xFF) })
                 let data = Data(dataList.map { UInt8($0 & 0xFF) })
-                let ok = self.bleService?.sendData(peerId: peerId, data: data) ?? false
+                let isHandshake = (args["isHandshake"] as? Bool) ?? false
+                let ok = self.bleService?.sendData(
+                    linkId: linkId, data: data, isHandshake: isHandshake
+                ) ?? false
                 result(ok)
+            case "closeLink":
+                guard let args = call.arguments as? [String: Any],
+                      let linkId = args["linkId"] as? String, !linkId.isEmpty else {
+                    result(FlutterError(code: "INVALID_ARG", message: "linkId required", details: nil))
+                    return
+                }
+                self.bleService?.closeLink(linkId)
+                result(true)
+            case "linkEstablished":
+                guard let args = call.arguments as? [String: Any],
+                      let linkId = args["linkId"] as? String, !linkId.isEmpty else {
+                    result(FlutterError(code: "INVALID_ARG", message: "linkId required", details: nil))
+                    return
+                }
+                self.bleService?.onLinkEstablished(linkId)
+                result(true)
             default:
                 result(FlutterMethodNotImplemented)
             }
@@ -157,29 +170,29 @@ import UIKit
 // MARK: - BleServiceDelegate
 
 extension AppDelegate: BleServiceDelegate {
-    func bleService(_ service: BleService, didDiscoverPeer peerId: Data) {
+    func bleService(_ service: BleService, didOpenLink linkId: String) {
         DispatchQueue.main.async { [weak self] in
             self?.bleEventSink?([
-                "type": "peerDiscovered",
-                "peerId": Array(peerId),
+                "type": "linkUp",
+                "linkId": linkId,
             ])
         }
     }
 
-    func bleService(_ service: BleService, didLosePeer peerId: Data) {
+    func bleService(_ service: BleService, didCloseLink linkId: String) {
         DispatchQueue.main.async { [weak self] in
             self?.bleEventSink?([
-                "type": "peerLost",
-                "peerId": Array(peerId),
+                "type": "linkDown",
+                "linkId": linkId,
             ])
         }
     }
 
-    func bleService(_ service: BleService, didReceiveData data: Data, fromPeer peerId: Data) {
+    func bleService(_ service: BleService, didReceiveFrame data: Data, onLink linkId: String) {
         DispatchQueue.main.async { [weak self] in
             self?.bleEventSink?([
-                "type": "dataReceived",
-                "peerId": Array(peerId),
+                "type": "linkData",
+                "linkId": linkId,
                 "data": Array(data),
             ])
         }

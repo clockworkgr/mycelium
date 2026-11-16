@@ -629,3 +629,29 @@ no storage error to show for it. Admission also restores the marks itself if
 nobody has, since `connect_to` does not require `start()`.
 
 Appended rather than edited in place, because these records are append-only.
+
+## Note (2026-11-16, T-34)
+
+ADR-021 took this handshake to BLE and Wi-Fi Direct, running it over their
+fragmentation layer, so it is now the one transport-layer proof in the system
+rather than the first of several. Two things about *this* ADR are worth reading
+back from that work.
+
+**The implementation moved, and nothing above changed.** The handshake is a
+state machine in `transport/channel.rs` that both transports drive;
+`internet::handshake` is the framed reads and writes around it. The bytes, the
+order, the signed payload and the key schedule are unchanged, and this ADR's
+tests are what proved the extraction.
+
+**"Counters are per direction and advance only on success, so a replayed or
+reordered frame simply fails to open — TCP already guarantees ordering, so
+strictness costs nothing" is a claim about TCP, not about the cipher.** On a
+link that splits a frame into fragments and retransmits none of them, one lost
+fragment means the frame never reassembles, so the receiver never opens it and
+its counter stays a frame behind the sender's for good: every later frame would
+fail under the wrong nonce, and a single dropped BLE notification would kill
+the link. Local links therefore send the counter with the frame and keep a
+*floor* rather than an exact position — loss survivable, replay and reordering
+still refused. The internet transport keeps the implicit counter, where a loss
+is the connection's death anyway. ADR-021's implementation note has the full
+reasoning.

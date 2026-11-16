@@ -1,7 +1,9 @@
 pub mod ble;
 pub mod bt_classic;
+pub mod channel;
 pub mod fragment;
 pub mod internet;
+pub mod link;
 pub mod lora;
 pub mod manager;
 pub mod mock;
@@ -128,9 +130,18 @@ pub enum SendPriority {
 /// Getting that last rule wrong is easy and silent: a single deque with
 /// alerts pushed to the front and the oldest entry evicted drops the alert
 /// first, which is the opposite of the intent.
-pub struct PriorityOutbox {
-    alerts: VecDeque<(NodeId, Vec<u8>)>,
-    normal: VecDeque<(NodeId, Vec<u8>)>,
+///
+/// `D` is what an entry is addressed to. Most transports queue per peer; BLE
+/// and Wi-Fi Direct queue per *link*, because a frame leaves before the peer
+/// behind the link has been proved (ADR-021).
+///
+/// `P` is what is queued. It is a frame for the transports that have one
+/// ready; on an authenticated link it is the message still to be sealed,
+/// because the counter a frame is sealed under has to match the order frames
+/// actually leave in, and that order is this queue's to decide.
+pub struct PriorityOutbox<D = NodeId, P = Vec<u8>> {
+    alerts: VecDeque<(D, P)>,
+    normal: VecDeque<(D, P)>,
     capacity: usize,
 }
 
@@ -138,7 +149,7 @@ pub struct PriorityOutbox {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutboxFull;
 
-impl PriorityOutbox {
+impl<D: Clone, P> PriorityOutbox<D, P> {
     pub fn new(capacity: usize) -> Self {
         Self {
             alerts: VecDeque::new(),
@@ -156,13 +167,8 @@ impl PriorityOutbox {
     }
 
     /// Queue a frame, evicting as described on the type.
-    pub fn push(
-        &mut self,
-        peer: NodeId,
-        data: Vec<u8>,
-        priority: SendPriority,
-    ) -> Result<(), OutboxFull> {
-        self.push_batch(peer, vec![data], priority)
+    pub fn push(&mut self, dest: D, data: P, priority: SendPriority) -> Result<(), OutboxFull> {
+        self.push_batch(dest, vec![data], priority)
     }
 
     /// Queue the fragments of one message, **all or none**.
@@ -175,8 +181,8 @@ impl PriorityOutbox {
     /// can try another transport.
     pub fn push_batch(
         &mut self,
-        peer: NodeId,
-        frames: Vec<Vec<u8>>,
+        dest: D,
+        frames: Vec<P>,
         priority: SendPriority,
     ) -> Result<(), OutboxFull> {
         if frames.is_empty() {
@@ -211,15 +217,31 @@ impl PriorityOutbox {
 
         for data in frames {
             match priority {
-                SendPriority::Alert => self.alerts.push_back((peer, data)),
-                SendPriority::Normal => self.normal.push_back((peer, data)),
+                SendPriority::Alert => self.alerts.push_back((dest.clone(), data)),
+                SendPriority::Normal => self.normal.push_back((dest.clone(), data)),
             }
         }
         Ok(())
     }
 
+    /// Drop queued frames for a destination that has gone away.
+    ///
+    /// Frames for a dead link are not just wasted writes: on a transport
+    /// whose addresses are reused, they would be written to whoever holds
+    /// the address next, under a channel key that no longer exists.
+    pub fn retain<F: FnMut(&D) -> bool>(&mut self, mut keep: F) {
+        self.alerts.retain(|(dest, _)| keep(dest));
+        self.normal.retain(|(dest, _)| keep(dest));
+    }
+
+    /// Drop everything queued.
+    pub fn clear(&mut self) {
+        self.alerts.clear();
+        self.normal.clear();
+    }
+
     /// Take the next frame: alerts first, each class in its own order.
-    pub fn pop(&mut self) -> Option<(NodeId, Vec<u8>)> {
+    pub fn pop(&mut self) -> Option<(D, P)> {
         self.alerts.pop_front().or_else(|| self.normal.pop_front())
     }
 }

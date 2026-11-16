@@ -1062,18 +1062,19 @@ async fn test_an_oversized_approval_list_still_produces_a_verifiable_alert() {
 /// message past the reassembly bound, not past one frame.
 #[tokio::test]
 async fn test_an_alert_too_large_for_the_narrowest_transport_is_refused() {
-    use mycelium_core::transport::ble::{BleTransport, BLE_MAX_MESSAGE};
+    use mycelium_core::transport::ble::BleTransport;
 
     let identity = Identity::generate();
-    let node_id = identity.node_id();
     let node = Node::new(
         NodeConfig::default(),
         Database::open_in_memory().expect("in-memory DB"),
         identity,
     );
-    node.transport_manager
-        .add_transport(Arc::new(BleTransport::new(node_id)))
-        .await;
+    let ble = Arc::new(BleTransport::new(node.identity_handle()));
+    // What a message may be is the transport's MTU, which is the reassembly
+    // bound less what sealing a frame costs (ADR-021, T-34).
+    let ble_mtu = ble.mtu();
+    node.transport_manager.add_transport(ble).await;
 
     // The alert T-39 is about: three approvals and a sentence of text, 522
     // bytes on the wire, which one BLE frame cannot carry.
@@ -1086,11 +1087,11 @@ async fn test_an_alert_too_large_for_the_narrowest_transport_is_refused() {
 
     // Past what reassembly will hold, it is refused at the source rather than
     // flooded to the transports that happen to be wider.
-    let huge = "x".repeat(BLE_MAX_MESSAGE);
+    let huge = "x".repeat(ble_mtu);
     let draft = node.draft_emergency(EmergencyLevel::Urgent, huge.as_bytes());
     match node.raise_emergency(draft, &[]).await {
         Err(mycelium_node::node::NodeError::AlertTooLarge { size, limit }) => {
-            assert_eq!(limit, BLE_MAX_MESSAGE);
+            assert_eq!(limit, ble_mtu);
             assert!(size > limit);
         }
         other => panic!("expected a refusal past the reassembly bound, got {other:?}"),

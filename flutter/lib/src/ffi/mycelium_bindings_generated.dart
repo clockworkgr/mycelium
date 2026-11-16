@@ -51,6 +51,27 @@ class MyceliumBindings {
   late final _mycelium_clear_error =
       _mycelium_clear_errorPtr.asFunction<void Function()>();
 
+  /// Check if the API server TCP port is reachable. Returns 1 if OK, 0 if not.
+  int mycelium_api_check() {
+    return _mycelium_api_check();
+  }
+
+  late final _mycelium_api_checkPtr =
+      _lookup<ffi.NativeFunction<ffi.Int32 Function()>>('mycelium_api_check');
+  late final _mycelium_api_check =
+      _mycelium_api_checkPtr.asFunction<int Function()>();
+
+  /// Get the API handle status. 0=no node, 1=no handle, 2=running, 3=finished, -1=error.
+  int mycelium_api_handle_status() {
+    return _mycelium_api_handle_status();
+  }
+
+  late final _mycelium_api_handle_statusPtr =
+      _lookup<ffi.NativeFunction<ffi.Int32 Function()>>(
+          'mycelium_api_handle_status');
+  late final _mycelium_api_handle_status =
+      _mycelium_api_handle_statusPtr.asFunction<int Function()>();
+
   /// Create a new Mycelium node. Returns NULL on failure.
   ffi.Pointer<MyceliumNode> mycelium_node_new(
     ffi.Pointer<ffi.Char> data_dir,
@@ -720,144 +741,156 @@ class MyceliumBindings {
       _mycelium_register_wifi_direct_transportPtr
           .asFunction<int Function(ffi.Pointer<MyceliumNode>)>();
 
-  int mycelium_ble_on_peer_discovered(
+  int mycelium_ble_on_link_up(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Char> addr,
   ) {
-    return _mycelium_ble_on_peer_discovered(
+    return _mycelium_ble_on_link_up(
       handle,
-      peer_id,
+      addr,
     );
   }
 
-  late final _mycelium_ble_on_peer_discoveredPtr = _lookup<
+  late final _mycelium_ble_on_link_upPtr = _lookup<
       ffi.NativeFunction<
           ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
-              ffi.Pointer<ffi.Uint8>)>>('mycelium_ble_on_peer_discovered');
-  late final _mycelium_ble_on_peer_discovered =
-      _mycelium_ble_on_peer_discoveredPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+              ffi.Pointer<ffi.Char>)>>('mycelium_ble_on_link_up');
+  late final _mycelium_ble_on_link_up = _mycelium_ble_on_link_upPtr.asFunction<
+      int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>)>();
 
-  int mycelium_ble_on_peer_lost(
+  int mycelium_ble_on_link_down(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Char> addr,
   ) {
-    return _mycelium_ble_on_peer_lost(
+    return _mycelium_ble_on_link_down(
       handle,
-      peer_id,
+      addr,
     );
   }
 
-  late final _mycelium_ble_on_peer_lostPtr = _lookup<
+  late final _mycelium_ble_on_link_downPtr = _lookup<
       ffi.NativeFunction<
           ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
-              ffi.Pointer<ffi.Uint8>)>>('mycelium_ble_on_peer_lost');
-  late final _mycelium_ble_on_peer_lost =
-      _mycelium_ble_on_peer_lostPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+              ffi.Pointer<ffi.Char>)>>('mycelium_ble_on_link_down');
+  late final _mycelium_ble_on_link_down =
+      _mycelium_ble_on_link_downPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>)>();
 
-  int mycelium_ble_on_data_received(
+  int mycelium_ble_on_link_data(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Char> addr,
     ffi.Pointer<ffi.Uint8> data,
     int data_len,
   ) {
-    return _mycelium_ble_on_data_received(
+    return _mycelium_ble_on_link_data(
       handle,
-      peer_id,
+      addr,
       data,
       data_len,
     );
   }
 
-  late final _mycelium_ble_on_data_receivedPtr = _lookup<
+  late final _mycelium_ble_on_link_dataPtr = _lookup<
       ffi.NativeFunction<
           ffi.Int32 Function(
               ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Char>,
               ffi.Pointer<ffi.Uint8>,
-              ffi.Pointer<ffi.Uint8>,
-              ffi.Uint32)>>('mycelium_ble_on_data_received');
-  late final _mycelium_ble_on_data_received =
-      _mycelium_ble_on_data_receivedPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
+              ffi.Uint32)>>('mycelium_ble_on_link_data');
+  late final _mycelium_ble_on_link_data =
+      _mycelium_ble_on_link_dataPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>,
               ffi.Pointer<ffi.Uint8>, int)>();
 
-  int mycelium_wifi_on_peer_connected(
+  int mycelium_wifi_on_link_up(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Char> addr,
   ) {
-    return _mycelium_wifi_on_peer_connected(
+    return _mycelium_wifi_on_link_up(
       handle,
-      peer_id,
+      addr,
     );
   }
 
-  late final _mycelium_wifi_on_peer_connectedPtr = _lookup<
+  late final _mycelium_wifi_on_link_upPtr = _lookup<
       ffi.NativeFunction<
           ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
-              ffi.Pointer<ffi.Uint8>)>>('mycelium_wifi_on_peer_connected');
-  late final _mycelium_wifi_on_peer_connected =
-      _mycelium_wifi_on_peer_connectedPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+              ffi.Pointer<ffi.Char>)>>('mycelium_wifi_on_link_up');
+  late final _mycelium_wifi_on_link_up =
+      _mycelium_wifi_on_link_upPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>)>();
 
-  int mycelium_wifi_on_peer_disconnected(
+  int mycelium_wifi_on_link_down(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Char> addr,
   ) {
-    return _mycelium_wifi_on_peer_disconnected(
+    return _mycelium_wifi_on_link_down(
       handle,
-      peer_id,
+      addr,
     );
   }
 
-  late final _mycelium_wifi_on_peer_disconnectedPtr = _lookup<
+  late final _mycelium_wifi_on_link_downPtr = _lookup<
       ffi.NativeFunction<
           ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
-              ffi.Pointer<ffi.Uint8>)>>('mycelium_wifi_on_peer_disconnected');
-  late final _mycelium_wifi_on_peer_disconnected =
-      _mycelium_wifi_on_peer_disconnectedPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
+              ffi.Pointer<ffi.Char>)>>('mycelium_wifi_on_link_down');
+  late final _mycelium_wifi_on_link_down =
+      _mycelium_wifi_on_link_downPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>)>();
 
-  int mycelium_wifi_on_data_received(
+  int mycelium_wifi_on_link_data(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> peer_id,
+    ffi.Pointer<ffi.Char> addr,
     ffi.Pointer<ffi.Uint8> data,
     int data_len,
   ) {
-    return _mycelium_wifi_on_data_received(
+    return _mycelium_wifi_on_link_data(
       handle,
-      peer_id,
+      addr,
       data,
       data_len,
     );
   }
 
-  late final _mycelium_wifi_on_data_receivedPtr = _lookup<
+  late final _mycelium_wifi_on_link_dataPtr = _lookup<
       ffi.NativeFunction<
           ffi.Int32 Function(
               ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Char>,
               ffi.Pointer<ffi.Uint8>,
-              ffi.Pointer<ffi.Uint8>,
-              ffi.Uint32)>>('mycelium_wifi_on_data_received');
-  late final _mycelium_wifi_on_data_received =
-      _mycelium_wifi_on_data_receivedPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
+              ffi.Uint32)>>('mycelium_wifi_on_link_data');
+  late final _mycelium_wifi_on_link_data =
+      _mycelium_wifi_on_link_dataPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>,
               ffi.Pointer<ffi.Uint8>, int)>();
 
-  /// Dequeue one pending BLE send. Returns 1 if dequeued, 0 if empty, -1 on error.
+  /// Dequeue one pending BLE frame, with the link to write it on. Returns 1 if
+  /// dequeued, 0 if empty, -1 on error, -3 if the frame was larger than
+  /// data_capacity (frame dropped, required size in out_data_len), -5 if the
+  /// address did not fit addr_capacity (nothing written).
+  ///
+  /// `out_is_handshake` is 1 when the fragment belongs to a handshake frame,
+  /// which the platform layer must neither delay behind ordinary traffic nor
+  /// evict from a full queue. It cannot work this out for itself: a link counts
+  /// as established in Rust as soon as the peer's confirmation arrives, which
+  /// can be before our own confirmation has left (ADR-021).
   int mycelium_ble_dequeue_send(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> out_peer_id,
+    ffi.Pointer<ffi.Char> out_addr,
+    int addr_capacity,
     ffi.Pointer<ffi.Uint8> out_data,
     int data_capacity,
     ffi.Pointer<ffi.Uint32> out_data_len,
+    ffi.Pointer<ffi.Uint32> out_is_handshake,
   ) {
     return _mycelium_ble_dequeue_send(
       handle,
-      out_peer_id,
+      out_addr,
+      addr_capacity,
       out_data,
       data_capacity,
       out_data_len,
+      out_is_handshake,
     );
   }
 
@@ -865,29 +898,42 @@ class MyceliumBindings {
       ffi.NativeFunction<
           ffi.Int32 Function(
               ffi.Pointer<MyceliumNode>,
-              ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Char>,
+              ffi.Uint32,
               ffi.Pointer<ffi.Uint8>,
               ffi.Uint32,
+              ffi.Pointer<ffi.Uint32>,
               ffi.Pointer<ffi.Uint32>)>>('mycelium_ble_dequeue_send');
   late final _mycelium_ble_dequeue_send =
       _mycelium_ble_dequeue_sendPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
-              ffi.Pointer<ffi.Uint8>, int, ffi.Pointer<ffi.Uint32>)>();
+          int Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Char>,
+              int,
+              ffi.Pointer<ffi.Uint8>,
+              int,
+              ffi.Pointer<ffi.Uint32>,
+              ffi.Pointer<ffi.Uint32>)>();
 
-  /// Dequeue one pending Wi-Fi Direct send. Returns 1 if dequeued, 0 if empty, -1 on error.
+  /// Dequeue one pending Wi-Fi Direct frame, with the link to write it on.
+  /// Codes and `out_is_handshake` are as for mycelium_ble_dequeue_send.
   int mycelium_wifi_dequeue_send(
     ffi.Pointer<MyceliumNode> handle,
-    ffi.Pointer<ffi.Uint8> out_peer_id,
+    ffi.Pointer<ffi.Char> out_addr,
+    int addr_capacity,
     ffi.Pointer<ffi.Uint8> out_data,
     int data_capacity,
     ffi.Pointer<ffi.Uint32> out_data_len,
+    ffi.Pointer<ffi.Uint32> out_is_handshake,
   ) {
     return _mycelium_wifi_dequeue_send(
       handle,
-      out_peer_id,
+      out_addr,
+      addr_capacity,
       out_data,
       data_capacity,
       out_data_len,
+      out_is_handshake,
     );
   }
 
@@ -895,50 +941,76 @@ class MyceliumBindings {
       ffi.NativeFunction<
           ffi.Int32 Function(
               ffi.Pointer<MyceliumNode>,
-              ffi.Pointer<ffi.Uint8>,
+              ffi.Pointer<ffi.Char>,
+              ffi.Uint32,
               ffi.Pointer<ffi.Uint8>,
               ffi.Uint32,
+              ffi.Pointer<ffi.Uint32>,
               ffi.Pointer<ffi.Uint32>)>>('mycelium_wifi_dequeue_send');
   late final _mycelium_wifi_dequeue_send =
       _mycelium_wifi_dequeue_sendPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
-              ffi.Pointer<ffi.Uint8>, int, ffi.Pointer<ffi.Uint32>)>();
+          int Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Char>,
+              int,
+              ffi.Pointer<ffi.Uint8>,
+              int,
+              ffi.Pointer<ffi.Uint32>,
+              ffi.Pointer<ffi.Uint32>)>();
 
-  int mycelium_ble_set_send_callback(
+  /// Take the next link directive. Returns 1 if one was dequeued, 0 if none,
+  /// -1 on error, -5 if the address did not fit addr_capacity.
+  int mycelium_ble_dequeue_link_event(
     ffi.Pointer<MyceliumNode> handle,
-    TransportSendCallback callback,
+    ffi.Pointer<ffi.Char> out_addr,
+    int addr_capacity,
+    ffi.Pointer<ffi.Uint32> out_event,
   ) {
-    return _mycelium_ble_set_send_callback(
+    return _mycelium_ble_dequeue_link_event(
       handle,
-      callback,
+      out_addr,
+      addr_capacity,
+      out_event,
     );
   }
 
-  late final _mycelium_ble_set_send_callbackPtr = _lookup<
+  late final _mycelium_ble_dequeue_link_eventPtr = _lookup<
       ffi.NativeFunction<
-          ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
-              TransportSendCallback)>>('mycelium_ble_set_send_callback');
-  late final _mycelium_ble_set_send_callback =
-      _mycelium_ble_set_send_callbackPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, TransportSendCallback)>();
+          ffi.Int32 Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Char>,
+              ffi.Uint32,
+              ffi.Pointer<ffi.Uint32>)>>('mycelium_ble_dequeue_link_event');
+  late final _mycelium_ble_dequeue_link_event =
+      _mycelium_ble_dequeue_link_eventPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>, int,
+              ffi.Pointer<ffi.Uint32>)>();
 
-  int mycelium_wifi_set_send_callback(
+  int mycelium_wifi_dequeue_link_event(
     ffi.Pointer<MyceliumNode> handle,
-    TransportSendCallback callback,
+    ffi.Pointer<ffi.Char> out_addr,
+    int addr_capacity,
+    ffi.Pointer<ffi.Uint32> out_event,
   ) {
-    return _mycelium_wifi_set_send_callback(
+    return _mycelium_wifi_dequeue_link_event(
       handle,
-      callback,
+      out_addr,
+      addr_capacity,
+      out_event,
     );
   }
 
-  late final _mycelium_wifi_set_send_callbackPtr = _lookup<
+  late final _mycelium_wifi_dequeue_link_eventPtr = _lookup<
       ffi.NativeFunction<
-          ffi.Int32 Function(ffi.Pointer<MyceliumNode>,
-              TransportSendCallback)>>('mycelium_wifi_set_send_callback');
-  late final _mycelium_wifi_set_send_callback =
-      _mycelium_wifi_set_send_callbackPtr.asFunction<
-          int Function(ffi.Pointer<MyceliumNode>, TransportSendCallback)>();
+          ffi.Int32 Function(
+              ffi.Pointer<MyceliumNode>,
+              ffi.Pointer<ffi.Char>,
+              ffi.Uint32,
+              ffi.Pointer<ffi.Uint32>)>>('mycelium_wifi_dequeue_link_event');
+  late final _mycelium_wifi_dequeue_link_event =
+      _mycelium_wifi_dequeue_link_eventPtr.asFunction<
+          int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Char>, int,
+              ffi.Pointer<ffi.Uint32>)>();
 
   /// Register Internet (TCP) transport with defaults (port 9736). Returns 0 on success.
   int mycelium_register_internet_transport(
@@ -1133,7 +1205,8 @@ class MyceliumBindings {
           int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
               ffi.Pointer<ffi.Uint8>, int)>();
 
-  /// Dequeue one pending LoRa send. Returns 1 if dequeued, 0 if empty, -1 on error.
+  /// Dequeue one pending LoRa send. Returns 1 if dequeued, 0 if empty, -1 on error,
+  /// -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len).
   int mycelium_lora_dequeue_send(
     ffi.Pointer<MyceliumNode> handle,
     ffi.Pointer<ffi.Uint8> out_peer_id,
@@ -1281,7 +1354,8 @@ class MyceliumBindings {
           int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
               ffi.Pointer<ffi.Uint8>, int)>();
 
-  /// Dequeue one pending BT Classic send. Returns 1 if dequeued, 0 if empty, -1 on error.
+  /// Dequeue one pending BT Classic send. Returns 1 if dequeued, 0 if empty, -1 on error,
+  /// -3 if the packet was larger than data_capacity (packet dropped, required size in out_data_len).
   int mycelium_bt_classic_dequeue_send(
     ffi.Pointer<MyceliumNode> handle,
     ffi.Pointer<ffi.Uint8> out_peer_id,
@@ -1412,13 +1486,7 @@ typedef DartMessageCallbackFunction = void Function(
 /// Incoming message notification callback.
 typedef MessageCallback
     = ffi.Pointer<ffi.NativeFunction<MessageCallbackFunction>>;
-typedef TransportSendCallbackFunction = ffi.Int32 Function(
-    ffi.Pointer<ffi.Uint8> peer_id,
-    ffi.Pointer<ffi.Uint8> data,
-    ffi.Uint32 data_len);
-typedef DartTransportSendCallbackFunction = int Function(
-    ffi.Pointer<ffi.Uint8> peer_id, ffi.Pointer<ffi.Uint8> data, int data_len);
 
-/// BLE/WiFi send callback. Returns 0 on success.
-typedef TransportSendCallback
-    = ffi.Pointer<ffi.NativeFunction<TransportSendCallbackFunction>>;
+const int MYCELIUM_LINK_ESTABLISHED = 1;
+
+const int MYCELIUM_LINK_CLOSE = 2;

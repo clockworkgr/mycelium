@@ -54,6 +54,11 @@ pub enum ChannelError {
     /// The peer's key-confirmation frame did not match our transcript.
     #[error("channel confirmation did not match")]
     ConfirmationMismatch,
+    /// The frame's counter is below the floor this direction still accepts: a
+    /// replay, or a frame overtaken by one already opened. Only a link that
+    /// carries its counter explicitly can see this.
+    #[error("frame counter is below the accepted floor")]
+    StaleFrame,
 }
 
 /// The exact bytes a channel hello signature covers.
@@ -259,9 +264,118 @@ impl FrameCipher {
             .ok_or(ChannelError::CounterExhausted)?;
         Ok(plaintext)
     }
+
+    /// Continue this direction on a link whose frames carry their counter.
+    ///
+    /// The counter carries over, so the handshake's sealed `Confirm` is frame
+    /// 0 and the first data frame is frame 1 under the same key: one key
+    /// stream, counted once, however the frames are labelled.
+    pub fn into_datagram(mut self) -> DatagramCipher {
+        // Moved out rather than copied: this cipher is dropped at the end of
+        // the call and its `Drop` would zeroize a key the datagram cipher is
+        // now using. What it zeroizes instead is the zeroed array left here.
+        let key = std::mem::take(&mut self.key);
+        DatagramCipher {
+            key,
+            next_send: self.counter,
+            recv_floor: self.counter,
+        }
+    }
 }
 
 impl Drop for FrameCipher {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
+/// One direction of a channel on a link that loses frames.
+///
+/// [`FrameCipher`] keeps the counter implicit, which is right on TCP: the
+/// ordering is guaranteed and a loss is the connection's death anyway. It is
+/// wrong on a link that fragments without retransmitting. A sealed frame
+/// crossing BLE is split into 512-byte frames (ADR-022) that nothing above
+/// the ATT layer retries, so one lost fragment means the frame never
+/// reassembles, the receiver never opens it, and its implicit counter stays a
+/// frame behind the sender's **for good** — every later frame would fail to
+/// open under the wrong nonce. A single dropped notification would kill the
+/// link.
+///
+/// So the counter travels with the frame and the receiver keeps a *floor*
+/// rather than an exact position: a gap is tolerated, a replay or a
+/// reordering is refused. The counter is still the nonce and nothing else, so
+/// altering it in flight only picks a nonce the frame cannot open under.
+pub struct DatagramCipher {
+    key: [u8; 32],
+    next_send: u64,
+    /// The lowest counter still acceptable. Opening a frame moves the floor
+    /// past it, so each counter is accepted at most once.
+    recv_floor: u64,
+}
+
+impl DatagramCipher {
+    /// Seal the next frame, returning the counter it must be sent with.
+    ///
+    /// The counter is spent whether or not the frame reaches the peer: it is
+    /// the nonce, so reusing it under this key is what must never happen.
+    pub fn seal(&mut self, plaintext: &[u8]) -> Result<(u64, Vec<u8>), ChannelError> {
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| ChannelError::FrameAuthFailed)?;
+        let counter = self.next_send;
+        let nonce = FrameCipher::nonce(counter);
+        let sealed = cipher
+            .encrypt(
+                aes_gcm::Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| ChannelError::FrameAuthFailed)?;
+        self.next_send = counter
+            .checked_add(1)
+            .ok_or(ChannelError::CounterExhausted)?;
+        Ok((counter, sealed))
+    }
+
+    /// Open a frame that arrived labelled `counter`.
+    ///
+    /// The floor moves only on success, so a forged frame costs the peer
+    /// nothing: it cannot make a later genuine frame unopenable.
+    pub fn open(&mut self, counter: u64, sealed: &[u8]) -> Result<Vec<u8>, ChannelError> {
+        if counter < self.recv_floor {
+            return Err(ChannelError::StaleFrame);
+        }
+        let cipher =
+            Aes256Gcm::new_from_slice(&self.key).map_err(|_| ChannelError::FrameAuthFailed)?;
+        let nonce = FrameCipher::nonce(counter);
+        let plaintext = cipher
+            .decrypt(
+                aes_gcm::Nonce::from_slice(&nonce),
+                Payload {
+                    msg: sealed,
+                    aad: &[],
+                },
+            )
+            .map_err(|_| ChannelError::FrameAuthFailed)?;
+        self.recv_floor = counter
+            .checked_add(1)
+            .ok_or(ChannelError::CounterExhausted)?;
+        Ok(plaintext)
+    }
+
+    /// The counter the next sealed frame will carry.
+    pub fn next_send(&self) -> u64 {
+        self.next_send
+    }
+
+    /// The lowest counter this direction still accepts.
+    pub fn recv_floor(&self) -> u64 {
+        self.recv_floor
+    }
+}
+
+impl Drop for DatagramCipher {
     fn drop(&mut self) {
         self.key.zeroize();
     }
@@ -475,5 +589,121 @@ mod tests {
         assert_ne!(base, channel_hello_payload(&[1u8; 32], &[9u8; 32], 9736));
         assert_ne!(base, channel_hello_payload(&[1u8; 32], &[2u8; 32], 9737));
         assert!(base.starts_with(CHANNEL_HELLO_CONTEXT));
+    }
+
+    /// Two directions of a link that carries its counters, derived from one
+    /// handshake exactly as the local transports do it.
+    fn datagram_pair() -> (
+        DatagramCipher,
+        DatagramCipher,
+        DatagramCipher,
+        DatagramCipher,
+    ) {
+        let (a, b) = pair();
+        (
+            a.send.into_datagram(),
+            a.recv.into_datagram(),
+            b.send.into_datagram(),
+            b.recv.into_datagram(),
+        )
+    }
+
+    #[test]
+    fn test_a_datagram_continues_the_handshake_counter() {
+        let (mut keys, _) = pair();
+        // The handshake seals one frame, the `Confirm`.
+        keys.send.seal(b"confirm").expect("sealed");
+        let send = keys.send.into_datagram();
+        assert_eq!(send.next_send(), 1, "the first data frame is frame 1");
+        assert_eq!(
+            send.recv_floor(),
+            1,
+            "and the key stream is never counted from zero twice"
+        );
+    }
+
+    #[test]
+    fn test_datagram_frames_round_trip_in_both_directions() {
+        let (mut a_send, mut a_recv, mut b_send, mut b_recv) = datagram_pair();
+        let (counter, sealed) = a_send.seal(b"from a").expect("sealed");
+        assert_eq!(b_recv.open(counter, &sealed).expect("opened"), b"from a");
+        let (counter, sealed) = b_send.seal(b"from b").expect("sealed");
+        assert_eq!(a_recv.open(counter, &sealed).expect("opened"), b"from b");
+    }
+
+    /// The reason this cipher exists: a lost frame on a fragmenting link must
+    /// not wedge the direction. With an implicit counter the receiver would
+    /// stay a frame behind for good and nothing later would ever open.
+    #[test]
+    fn test_a_gap_left_by_a_lost_frame_is_tolerated() {
+        let (mut a_send, _, _, mut b_recv) = datagram_pair();
+        let (_, lost) = a_send.seal(b"never arrives").expect("sealed");
+        let (counter, sealed) = a_send.seal(b"arrives").expect("sealed");
+
+        assert_eq!(
+            b_recv.open(counter, &sealed).expect("opened"),
+            b"arrives",
+            "the frame after a loss still opens"
+        );
+        assert_eq!(
+            b_recv.open(counter - 1, &lost),
+            Err(ChannelError::StaleFrame),
+            "and the lost frame cannot arrive late and be accepted"
+        );
+    }
+
+    #[test]
+    fn test_a_replayed_datagram_is_refused() {
+        let (mut a_send, _, _, mut b_recv) = datagram_pair();
+        let (counter, sealed) = a_send.seal(b"once").expect("sealed");
+        assert_eq!(b_recv.open(counter, &sealed).expect("opened"), b"once");
+        assert_eq!(
+            b_recv.open(counter, &sealed),
+            Err(ChannelError::StaleFrame),
+            "the same counter is accepted at most once"
+        );
+    }
+
+    #[test]
+    fn test_a_relabelled_datagram_does_not_open() {
+        let (mut a_send, _, _, mut b_recv) = datagram_pair();
+        let (counter, sealed) = a_send.seal(b"payload").expect("sealed");
+        assert_eq!(
+            b_recv.open(counter + 5, &sealed),
+            Err(ChannelError::FrameAuthFailed),
+            "the counter is the nonce, so moving it only picks one that cannot open"
+        );
+        assert_eq!(
+            b_recv.open(counter, &sealed).expect("opened"),
+            b"payload",
+            "and the attempt left the floor where it was"
+        );
+    }
+
+    #[test]
+    fn test_an_altered_datagram_does_not_open() {
+        let (mut a_send, _, _, mut b_recv) = datagram_pair();
+        let (counter, mut sealed) = a_send.seal(b"payload").expect("sealed");
+        sealed[0] ^= 0xff;
+        assert_eq!(
+            b_recv.open(counter, &sealed),
+            Err(ChannelError::FrameAuthFailed)
+        );
+        assert_eq!(
+            b_recv.recv_floor(),
+            counter,
+            "a forged frame cannot push the floor past a genuine one"
+        );
+    }
+
+    #[test]
+    fn test_the_two_datagram_directions_use_different_keys() {
+        let (mut a_send, mut a_recv, _, _) = datagram_pair();
+        let (counter, sealed) = a_send.seal(b"ours").expect("sealed");
+        assert_eq!(
+            a_recv.open(counter, &sealed),
+            Err(ChannelError::FrameAuthFailed),
+            "our own frame does not open under our receive key"
+        );
     }
 }
