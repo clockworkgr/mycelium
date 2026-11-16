@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart' show calloc, StringUtf8Pointer;
 
+import '../ffi/mycelium_bindings_generated.dart';
 import '../ffi/native_library.dart';
 
 /// Get the last error message from the native library.
@@ -15,6 +16,29 @@ String getLastError() {
     return utf8.decode(buf.asTypedList(len), allowMalformed: true);
   } finally {
     calloc.free(buf);
+  }
+}
+
+/// Describe what `mycelium_api_handle_status` returned.
+///
+/// Shared by the two diagnostics that read it, so they cannot drift, and it
+/// covers the two codes every guarded function can return (T-01).
+String apiHandleStatusLabel(int status) {
+  switch (status) {
+    case 0:
+      return 'no node';
+    case 1:
+      return 'node exists, no API handle';
+    case 2:
+      return 'API handle exists (running)';
+    case 3:
+      return 'API handle exists (FINISHED)';
+    case MYCELIUM_ERR_PANIC:
+      return 'panic caught in the native library';
+    case MYCELIUM_ERR_REENTRANT:
+      return 'refused: called from a native runtime thread';
+    default:
+      return 'unknown($status)';
   }
 }
 

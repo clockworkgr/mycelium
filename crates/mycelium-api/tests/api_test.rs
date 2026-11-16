@@ -48,6 +48,71 @@ async fn test_node_status() {
     assert!(json["version"].is_string());
 }
 
+/// A failed bind must leave nothing behind. The event bridge and the status
+/// broadcaster can only be stopped through the handle `start_server` returns,
+/// and on the error path it returns none — so spawning them before the bind
+/// leaked both, and the broadcaster's `Arc<Node>` with them, on every attempt.
+/// The FFI retries a failed API start (ROADMAP T-01), which turned one leak
+/// into one per attempt.
+#[tokio::test]
+async fn test_a_failed_api_bind_leaves_nothing_running() {
+    // A port that was free a moment ago, so the first bind is the one that
+    // takes it and the second is the one under test.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+    let port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let node = create_test_node();
+    let config = mycelium_node::config::ApiConfig {
+        enabled: true,
+        bind_address: "127.0.0.1".to_string(),
+        port,
+        auth_token: Some("test-token".to_string()),
+    };
+
+    let first = mycelium_api::start_server(Arc::clone(&node), &config)
+        .await
+        .expect("the first server binds");
+    let holders = Arc::strong_count(&node);
+
+    let second = mycelium_api::start_server(Arc::clone(&node), &config).await;
+    assert!(second.is_err(), "the port is already bound");
+    assert_eq!(
+        Arc::strong_count(&node),
+        holders,
+        "a failed bind spawned something that is still holding the node"
+    );
+
+    first.shutdown();
+}
+
+/// The route reports the live name, so a node renamed through the FFI does not
+/// keep answering with the one it started with (ROADMAP T-01).
+#[tokio::test]
+async fn test_node_status_reports_a_renamed_node() {
+    let node = create_test_node();
+    node.set_display_name("Renamed".to_string());
+    let state = AppState::new(Arc::clone(&node));
+    let app = build_router(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/node/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["display_name"], "Renamed");
+}
+
 #[tokio::test]
 async fn test_node_identity() {
     let node = create_test_node();

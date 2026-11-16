@@ -66,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 581 tests).
+- `cargo test` runs the whole workspace (currently 612 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -228,6 +228,30 @@ detail matters.
   toolchain bin must be on `PATH` for OpenSSL's Makefile.
 - NDK pinned to `27.0.12077973`.
 
+### FFI boundary (spec §17.4)
+
+- Every `extern "C"` body opens with `ffi_guard!("name", { .. })`, or
+  `ffi_guard_blocking!` when it calls `runtime().block_on` —
+  `test_every_exported_function_is_guarded` reads the crate's own source and
+  fails on a function that forgets, names itself wrongly, or picks the wrong
+  flavour (ADR-018).
+- A caught panic returns the failure value for the signature's shape
+  (`MYCELIUM_ERR_PANIC` = -99 for `i32`, NULL, `false`, `-1.0`) and stores the
+  message with its location. A blocking call from a runtime thread is refused
+  before the body runs, reported the same way: -98 from an `i32`, and otherwise
+  the shape's own failure value, which only the stored message distinguishes
+  from a panic (ADR-023). A refused `mycelium_node_free` has **not** released
+  its reference.
+- Anything in the guard's recovery path must be panic-free: a second panic
+  unwinds across the boundary and aborts. Locks in this crate recover from
+  poisoning for the same reason.
+- The handle is `Arc::into_raw`. Every handle handed out is one reference and
+  needs exactly one `mycelium_node_free`, including each one from
+  `mycelium_node_get_existing`.
+- Changing the exported set means four files: `src/lib.rs`, `include/mycelium.h`
+  (then `dart run ffigen`), `flutter/ios/Runner/mycelium_exported_symbols.txt`
+  and the `-u` lists in all three `flutter/ios/Flutter/*.xcconfig`.
+
 ### BLE transport (spec §8.4)
 
 - Dual-role GATT (server + client), 2 characteristics: Data TX (`…7892`) and
@@ -272,7 +296,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-16: 581 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-16: 612 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
@@ -284,10 +308,10 @@ clean, `flutter analyze` clean.
   prioritised P0/P1/P2. T-06, T-07, T-09, T-10 and T-11 landed on 2026-11-10.
   Do not re-derive the list from the code; update it as tasks land.
 
-The highest-priority open items (all P0, all defects in shipped features): FFI
-panic guards (`T-01`), group-discovery proof of possession (`T-04`), emergency
-co-signer signatures (`T-05`, wire format and verification landed; collecting
-co-signatures is not built), identity key at rest (`T-08`).
+The highest-priority open items (all P0, all defects in shipped features):
+group-discovery proof of possession (`T-04`), emergency co-signer signatures
+(`T-05`, wire format and verification landed; collecting co-signatures is not
+built), identity key at rest (`T-08`).
 
 Landed: T-36 on 2026-11-12 (ADR-013); T-37, T-39 and T-35 on 2026-11-14
 (ADR-014, ADR-022, ADR-015); T-38 on 2026-11-15 (ADR-016) — persisted DHT
@@ -296,7 +320,11 @@ newer one has been evicted, with `T-44` for what it left behind; T-34 on
 2026-11-16 (ADR-021) — BLE and Wi-Fi Direct prove peer identity instead of
 asserting it, in Rust and both platform bridges at once, with `T-47` for the
 two transports (BT Classic, LoRa) that still assert one and `T-48` for link
-names that are not unique across a reconnection.
+names that are not unique across a reconnection; T-01 on 2026-11-16
+(ADR-018, ADR-023) — every FFI function is panic-guarded, blocking calls refuse
+re-entrancy, the node handle is reference-counted and
+`mycelium_set_node_display_name` renames the running node, with `T-49` for the
+rename not surviving a restart.
 `T-40` collects four LoRa defects found reviewing
 ADR-008 against the code. `T-41` and `T-42` are what T-35 left behind — the
 unconfirmed-handshake record is in memory, so a restart loses both the sweep

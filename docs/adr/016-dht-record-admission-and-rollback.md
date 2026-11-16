@@ -485,3 +485,36 @@ Closing it means remembering the record as well as the timestamp: a digest
 beside the watermark, with an equal timestamp admissible only for the same
 record. That is a column, a migration and a wider `Mark`, which is why it is
 ROADMAP T-45 rather than part of this change.
+
+---
+
+## Note, 2026-11-16 (two corrections, from T-01)
+
+**Freeing an FFI node handle no longer takes the engine with it.** This record
+says that "freeing an FFI node handle drains the mark writer before the engine
+goes with it, so the ordinary free-then-recreate sequence starts clean". The
+drain still happens on every free, but the engine does not necessarily go:
+T-01 made the handle reference-counted (ADR-023), so a handle recovered through
+`mycelium_node_get_existing` keeps the node — and its DHT engine — alive after
+another handle is freed. The engine was never only as live as the handle in any
+case: the API server task holds its own `Arc<Node>`, so it outlives
+`mycelium_node_free` until `mycelium_node_stop` shuts the server down.
+
+What that means for the claim: a drain proves that what the writer had queued
+at that moment has been *processed* — applied, or, where the backend refused
+it, logged and dropped, which is this record's best-effort durability residual
+and not something `Flush` distinguishes. It does not prove the old engine has
+stopped admitting records, so free-then-recreate is clean only when the old
+node is stopped and every handle to it released first. The hazard class is unchanged
+and still ROADMAP T-46; what changes is that "free the handle" is no longer
+even approximately a way to quiesce an engine, and the task's wording has been
+corrected to match.
+
+**Retention is exclusive at the horizon, not inclusive.** Section 3 above says
+a mark is kept while `now <= published_at + record_ttl_secs +
+mark_retention_grace_secs`. `MarkTable::retains` keeps it while
+`published_at + horizon > now`, so a mark at exactly the horizon is swept, and
+its boundary test asserts that. The code's behaviour is the intended one — the
+mark dies with the last instant the record could still be fresh — and the
+prose should read `<`. Nothing else depends on the difference: one second at
+the end of a window that is `record_ttl + 86 400` long.

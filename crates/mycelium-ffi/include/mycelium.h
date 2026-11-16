@@ -64,13 +64,46 @@ typedef struct {
 
 /* --- Callback Types --- */
 
-/** Incoming message notification callback. */
+/** Incoming message notification callback.
+ *  Runs on a thread driving the async runtime: do not block in it, and do not
+ *  call a Mycelium function that blocks from inside it — that is refused, with
+ *  MYCELIUM_ERR_REENTRANT from an int32_t function and the failure value of
+ *  whatever shape the function returns otherwise. */
 typedef void (*MessageCallback)(
     const uint8_t source[32],
     const uint8_t message_id[16],
     uint8_t content_type,
     uint64_t timestamp
 );
+
+/* --- Failure Values (ADR-018, T-01) --- */
+
+/* Every function below runs inside a panic guard. A panic is caught, its
+ * message and location are stored for mycelium_last_error, and the function
+ * returns the failure value for its own shape: a negative code for int32_t,
+ * NULL for a pointer, false for bool, -1.0f for float. A void function can
+ * only leave the message. The process is **not** aborted (ADR-018).
+ *
+ * When a function returns its failure value, any out-parameter it was given is
+ * unspecified: a panic may have landed part-way through filling one.
+ *
+ * A caught panic is a defect in this library, not a condition to handle: the
+ * invariant it broke is still broken. Report it with the stored message. */
+
+/** A panic was caught inside the called function. */
+#define MYCELIUM_ERR_PANIC (-99)
+
+/** Refused before running: the function blocks on the async runtime, and the
+ *  calling thread is already driving that runtime. Call it from another
+ *  thread — for example, do not call back into this library from inside the
+ *  MessageCallback. No side effect took place.
+ *
+ *  Only int32_t functions can carry this code. A refused bool function returns
+ *  false, a refused float returns -1.0f, and a refused void function reports
+ *  nothing but the message; a refused mycelium_node_free has **not** released
+ *  its reference, so the handle is still the caller's to free from a thread
+ *  outside the runtime. */
+#define MYCELIUM_ERR_REENTRANT (-98)
 
 /* --- Error Retrieval --- */
 
@@ -85,15 +118,28 @@ void mycelium_clear_error(void);
 /** Check if the API server TCP port is reachable. Returns 1 if OK, 0 if not. */
 int32_t mycelium_api_check(void);
 
-/** Get the API handle status. 0=no node, 1=no handle, 2=running, 3=finished, -1=error. */
+/** Get the API handle status. 0=no node, 1=no handle, 2=running, 3=finished.
+ *  A poisoned lock is recovered, not reported. */
 int32_t mycelium_api_handle_status(void);
 
 /* --- Node Lifecycle --- */
 
-/** Create a new Mycelium node. Returns NULL on failure. */
+/* The node handle is reference-counted. Every handle this library returns —
+ * from mycelium_node_new and from every mycelium_node_get_existing — is one
+ * reference, and each must be passed to mycelium_node_free exactly once.
+ * Freeing one handle no longer invalidates another; the node is destroyed when
+ * the last reference goes. All handles to one node share the same address, so
+ * comparing them still identifies the node (T-01). */
+
+/** Create a new Mycelium node. Returns NULL on failure, with the reason in
+ *  mycelium_last_error. The returned handle is an owning reference. */
 MyceliumNode *mycelium_node_new(const char *data_dir, const char *display_name);
 
-/** Start the node event loop. Returns true on success. */
+/** Start the node event loop and the local API server. Returns true on
+ *  success, false if the node has already been stopped — a stopped node cannot
+ *  be restarted; create a new handle. A start that fails part-way leaves the
+ *  node startable, and a later start retries the API server if nothing holds
+ *  its handle. */
 bool mycelium_node_start(MyceliumNode *handle);
 
 /** Stop the node. */
@@ -102,10 +148,14 @@ void mycelium_node_stop(MyceliumNode *handle);
 /** Get the 32-byte node ID. */
 void mycelium_node_id(const MyceliumNode *handle, uint8_t out[32]);
 
-/** Free the node handle. Call exactly once. */
+/** Release one reference to the node, draining the DHT mark writer first.
+ *  Call exactly once per handle. Also unregisters the node, so
+ *  mycelium_node_get_existing stops handing out new references to it. */
 void mycelium_node_free(MyceliumNode *handle);
 
-/** Get the existing node handle (if still alive). Returns NULL if none. */
+/** Get another handle to the existing node, or NULL if none is registered.
+ *  The returned handle is an owning reference and needs its own
+ *  mycelium_node_free. */
 MyceliumNode *mycelium_node_get_existing(void);
 
 /* --- Messaging --- */
@@ -235,7 +285,13 @@ int32_t mycelium_safety_number(
 
 /* --- Node Display Name --- */
 
-/** Set the node's display name (used in beacons). Call before mycelium_node_start(). */
+/** Rename the running node: the name it announces in beacons and reports from
+ *  GET /v1/node/status. Takes effect on the next beacon. Returns 0 on success,
+ *  -1 on invalid arguments, including an empty name: a beacon's empty name
+ *  field means "unchanged" to a peer, so emptying a name would only change
+ *  what the API reports. Longer than 255 bytes is truncated on the wire, at a
+ *  character boundary. Not persisted — the name comes from mycelium_node_new
+ *  on every start. */
 int32_t mycelium_set_node_display_name(MyceliumNode *handle, const char *name);
 
 /* --- Network Status --- */

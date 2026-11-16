@@ -1990,7 +1990,8 @@ removing rotates our key and names the member in `removed` (§5.4, ADR-007).
 ```rust
 pub struct NodeConfig {
     pub data_dir: String,                  // "./mycelium-data"
-    pub display_name: String,
+    pub display_name: String,              // the *initial* name; the live one
+                                           // is on the node (§17.4, T-49)
     pub node_type: NodeTypeConfig,         // Phone | Supernode
     pub transports: TransportConfig,       // per-transport enable flags
     pub dtn: DtnStorageConfig,             // 256 MB / 10 MB / 72 h / 8 copies
@@ -2183,8 +2184,9 @@ is the design intent, not the current behaviour.
 
 ## 17. FFI and mobile platform bridges
 
-**Status: Implemented** (64 functions); **robustness is Partial** — see ROADMAP
-T-01.
+**Status: Implemented** (64 functions), including the robustness work of
+ADR-018 and T-01: every exported function runs inside a panic guard, blocking
+calls refuse re-entrancy, and the node handle is reference-counted.
 
 ### 17.1 Shape
 
@@ -2198,7 +2200,12 @@ behind `MessageInfo.plaintext` — those pointers are valid only until the next
 Conventions: `0` success, `-1` invalid pointers, `-2` operation failed (check
 `last_error`). The `*_dequeue_send` functions return `1`/`0`/`-1`, and `-3`
 when a packet exceeds the caller's buffer (the packet is dropped and the
-required size returned in `out_data_len`). Every lifecycle function null-checks;
+required size returned in `out_data_len`). Two more codes come from the guards
+described in §17.4: `MYCELIUM_ERR_PANIC` (`-99`) from any `i32` function, and
+`MYCELIUM_ERR_REENTRANT` (`-98`) from one that blocks on the runtime. Functions
+returning a pointer, `bool`, `f32` or nothing report both conditions as their
+own failure value instead, which only the stored message distinguishes. Every lifecycle function
+null-checks;
 a second `mycelium_node_start` is a no-op; `mycelium_node_stop` shuts the API
 server down through `ApiServerHandle`; transports register via
 `replace_transport` so re-registration after a restart never orphans an outbox.
@@ -2226,12 +2233,10 @@ server down through `ApiServerHandle`; transports register via
 The C header is `crates/mycelium-ffi/include/mycelium.h`; Dart bindings are
 generated from it by `ffigen`.
 
-**Known gaps:** no `extern "C"` function is wrapped in `catch_unwind`, so a
-panic unwinds across the FFI boundary and aborts the app; `block_on` is
-unguarded against re-entrancy from a runtime thread;
-`mycelium_set_node_display_name` is a no-op that returns success; the node
-handle is not reference-counted, so `node_get_existing` can race
-`node_free`. See ROADMAP T-01.
+`mycelium_set_node_display_name` renames the running node: the name reaches
+the next beacon and `GET /v1/node/status`, because both read the live value
+rather than the configured one. It is not persisted — the name comes from
+`mycelium_node_new` (or the daemon's config) on every start.
 
 ### 17.3 Platform bridges
 
@@ -2283,6 +2288,104 @@ verify), 10 services (`ApiClient`, `WsService`, `MyceliumService`,
 providers, 7 models, 6 widgets, GoRouter with a 6-tab shell and an onboarding
 redirect. The REST API is the primary data interface and the WebSocket carries
 real-time events; FFI is used only for node lifecycle and radio bridging.
+
+### 17.4 Failure at the boundary
+
+**Status: Implemented** (T-01, ADR-018, ADR-023).
+
+Every exported function's body runs inside one of two guard macros, and a test
+over this crate's own source refuses a function that does not use one — or that
+uses the non-blocking flavour while its body blocks on the runtime.
+
+- **A panic is caught**, its message and location are stored for
+  `mycelium_last_error`, and the function returns the failure value for its own
+  return shape: a negative code (`MYCELIUM_ERR_PANIC`, `-99`) for `i32`, NULL
+  for a pointer, `false` for `bool`, `-1.0` for `f32`. A `void` function leaves
+  only the message. **The process is not aborted** (ADR-018): on current
+  compilers an unguarded unwind out of an `extern "C"` function is a defined
+  abort rather than undefined behaviour, but the app still vanishes with no
+  diagnostic, which is what the guard removes.
+- **A blocking call from a thread that is already driving the runtime is
+  refused**, before the body runs and so before any side effect. Tokio answers
+  such a `block_on` with a panic, not a deadlock. The check is
+  `Handle::try_current()`, which is also true in `spawn_blocking` and
+  `block_in_place` contexts where blocking is in fact legal; tokio exposes
+  nothing that separates them, so the refusal is deliberately conservative
+  (ADR-023). The refusal is reported as the shape's failure value:
+  `MYCELIUM_ERR_REENTRANT` (`-98`) from an `i32`, `false` from
+  `mycelium_node_start`, `-1.0` from `mycelium_trust_score`, and only the
+  stored message from the two `void` ones.
+- **Out-parameters are unspecified when a function returns its failure value**:
+  a panic may have landed part-way through filling one.
+- A caught panic is a defect, not a handled condition — the invariant it broke
+  is still broken, and the stored message is what makes it reportable.
+- **A poisoned lock is recovered, not propagated.** Poisoning only became a
+  reachable state once panics stopped ending the process, and every lock in
+  this crate guards something a panic cannot leave half-written. Reporting it
+  instead would turn one caught panic into an FFI that can never create a node
+  again, or into a running API server that `mycelium_node_stop` can no longer
+  reach. `mycelium_api_handle_status` therefore reports the server's state
+  either way.
+- **An unrecognised panic payload is leaked rather than dropped.** Disposing of
+  it happens after `catch_unwind` has returned, so a `Drop` implementation that
+  panicked there would unwind across the boundary. `panic!`'s own `&str` and
+  `String` payloads cannot, and are dropped normally.
+- **A rename longer than the beacon field is truncated, not refused.** A
+  beacon carries at most 255 bytes of display name (§10.1), and truncation
+  lands on a character boundary so no peer shows a replacement character. The
+  API reports the full name, so a name over the
+  limit means the mesh shows a truncated name while `GET /v1/node/status`
+  reports the whole one; that is accepted rather than validated, because
+  `mycelium_node_new` and the config file accept the same names and a setter
+  stricter than them would be the surprising one. The FFI has no getter for the
+  node's own name — `mycelium_get_display_name` reads a *contact's* stored
+  name — so the API is where the full value is observable. An **empty** rename
+  is refused with `-1`: a beacon's empty name field means "no information" to a
+  receiver, which keeps the name it already holds (§10.1), so accepting it
+  would change only what the API reports. `mycelium_node_new` still accepts an
+  empty name, because then no peer has a previous one to keep.
+- **A start and a stop do not interleave.** Both hold one lock for their whole
+  duration, so the `started` flag, the node's tasks and the API server's handle
+  cannot be left disagreeing by an interleaving — and two concurrent starts
+  cannot both bind the API port (ADR-023).
+- **The start path commits each piece of state as it becomes true.** A panic
+  gives `mycelium_node_start` a third way out, so the "started" flag it takes
+  on the way in needs an owner on that exit. The flag is restored if the panic
+  lands *before* `Node::start` returns, and kept if it lands after — by then
+  the event loop, the beacon and the transports are live, and a retry calling
+  `Node::start` again would duplicate all three. Starting the local API server
+  is a separate state for the same reason: a panic can leave the node live with
+  the server unstarted, so every start attempt, including the "already
+  started" one, tries the server if nothing holds its handle. The residual is
+  that `Node::start` is not itself transactional — a panic *inside* it leaves
+  some tasks spawned and the flag restored, so a retry duplicates them, which
+  is ROADMAP T-50.
+- **A stop that panics leaves the flag describing the node.** `Node::stop`
+  cancels every task part-way through its work, so the two halves of a stop
+  need opposite answers; the FFI asks the node whether its tasks are cancelled
+  rather than tracking the transition. A stop can only clear the flag, never
+  set it, so an unwinding stop that had not yet cancelled anything leaves the
+  handle as it found it — startable if it was never started. Once the
+  cancellation has happened the node is finished either way, and a later start
+  is refused (below).
+- **A stopped node cannot be restarted, and says so.** `Node::stop` cancels a
+  token nothing resets, so `Node::start` on a stopped node would spawn tasks
+  that exit immediately and report success. `mycelium_node_start` refuses with
+  `false` instead, before touching the flag or the API server; the way back is
+  a new handle, which is a second engine over the same database and therefore
+  ROADMAP T-46.
+
+The node handle is reference-counted. Every handle returned by
+`mycelium_node_new` and by each `mycelium_node_get_existing` is one reference
+that must reach `mycelium_node_free` exactly once; the node is destroyed when
+the last one goes, so freeing one handle no longer invalidates another. All
+handles to one node share the same address. `mycelium_node_free` also
+unregisters the node, so `mycelium_node_get_existing` hands out no further
+references to it, and the ADR-016 mark drain runs on every free rather than on
+a "last reference" test that two concurrent frees could both lose. Because it
+drains, `mycelium_node_free` blocks, so a call from a thread inside the runtime
+is refused like any other blocking call — which leaks that reference rather
+than dropping a node whose marks were never drained.
 
 ## 18. Protocol adapters
 
@@ -2427,7 +2530,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 12 | Rate limiting | **Implemented** | Per-tier limits, auto-blacklist, wired to the trust graph |
 | 13 | Protocol versioning | **Partial** | Version in the envelope; no negotiation (T-20) |
 | 16 | Local API | **Implemented** | 38 endpoints, 7 WS event types, bearer auth (ADR-006). Per-app tokens open (T-18) |
-| 17 | FFI | **Implemented** | 64 functions. Panic guards, callback rework, handle refcount open (T-01) |
+| 17 | FFI | **Implemented** | 64 functions, panic-guarded, re-entrancy refused, handle reference-counted (T-01) |
 | 18.1 | Meshtastic adapter | **Partial** | Framing + ID bridge; no protobuf, no channel crypto (T-16) |
 | 18.2 | Reticulum adapter | **Partial** | Packet/HDLC/announce layout; no I/O, no encryption (T-17) |
 | 19 | Docker testbed | **Partial** | Images and compose exist; no runner, no inter-container transport (T-19) |

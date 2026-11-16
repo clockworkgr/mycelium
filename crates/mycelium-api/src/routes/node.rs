@@ -10,7 +10,9 @@ use crate::types::{NodeIdentityResponse, NodeStatusResponse, TrustStatsResponse}
 pub async fn get_status(State(state): State<AppState>) -> Json<NodeStatusResponse> {
     let uptime = state.started_at.elapsed().as_secs();
     let node_id = hex::encode(state.node.node_id.as_bytes());
-    let display_name = state.node.config.display_name.clone();
+    // The live name, not the configured one: `mycelium_set_node_display_name`
+    // can have renamed the node since it started (ROADMAP T-01).
+    let display_name = state.node.display_name();
 
     let session_count = state
         .node

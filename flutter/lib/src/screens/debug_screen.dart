@@ -1,7 +1,6 @@
 import 'dart:async';
-import 'dart:ffi';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import '../ffi/native_library.dart';
 import '../service/api_client.dart';
 import '../service/ffi_helpers.dart';
 import '../service/mycelium_service.dart';
@@ -598,25 +597,9 @@ class _DebugScreenState extends State<DebugScreen> {
 
   String _liveRustDiagnostic() {
     try {
-      final lib = defaultTargetPlatform == TargetPlatform.android
-          ? DynamicLibrary.open('libmycelium_ffi.so')
-          : DynamicLibrary.process();
-
-      final apiHandleStatus = lib.lookupFunction<
-          Int32 Function(), int Function()>('mycelium_api_handle_status');
-      final handleStatus = apiHandleStatus();
-      final handleLabels = {
-        0: 'no node',
-        1: 'node exists, no API handle',
-        2: 'API running',
-        3: 'API task FINISHED/CRASHED',
-        -1: 'mutex poisoned',
-      };
-      final handleLabel = handleLabels[handleStatus] ?? 'unknown($handleStatus)';
-
-      final apiCheck = lib.lookupFunction<
-          Int32 Function(), int Function()>('mycelium_api_check');
-      final checkResult = apiCheck();
+      final handleLabel =
+          apiHandleStatusLabel(bindings.mycelium_api_handle_status());
+      final checkResult = bindings.mycelium_api_check();
       final tcpLabel = checkResult == 1
           ? 'TCP OK'
           : 'TCP FAIL: ${getLastError()}';

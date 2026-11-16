@@ -1,5 +1,9 @@
 use mycelium_protocol::types::{NodeId, NodeType, ProtocolVersion};
 
+/// How much of a display name a beacon can carry: the field is
+/// length-prefixed with one byte (spec §10.1).
+pub const MAX_BEACON_DISPLAY_NAME: usize = 255;
+
 /// Beacon message broadcast to neighbors for discovery.
 #[derive(Debug, Clone)]
 pub struct Beacon {
@@ -30,10 +34,18 @@ impl Beacon {
             NodeType::ExternalRadio => 2,
         });
 
-        // Display name (length-prefixed)
-        let name_bytes = self.display_name.as_bytes();
-        buf.push(name_bytes.len().min(255) as u8);
-        buf.extend_from_slice(&name_bytes[..name_bytes.len().min(255)]);
+        // Display name (length-prefixed), never cut through a multi-byte UTF-8
+        // sequence: the receiver decodes lossily, so a split sequence would
+        // put a replacement character on the end of the name every peer shows
+        // for this node. Truncation itself is unavoidable — one length byte —
+        // and `mycelium_set_node_display_name` accepts longer names on purpose,
+        // since the API reports the full one (spec §17.4).
+        let mut name_len = self.display_name.len().min(MAX_BEACON_DISPLAY_NAME);
+        while name_len > 0 && !self.display_name.is_char_boundary(name_len) {
+            name_len -= 1;
+        }
+        buf.push(name_len as u8);
+        buf.extend_from_slice(&self.display_name.as_bytes()[..name_len]);
 
         buf.extend_from_slice(&self.protocol_version.0.to_le_bytes());
         buf.push(self.battery_level);
@@ -203,6 +215,35 @@ mod tests {
         let decoded = Beacon::deserialize(&data).unwrap();
         // Display name should be truncated to 255 bytes
         assert_eq!(decoded.display_name.len(), 255);
+    }
+
+    /// Truncation must land on a character boundary. A name of multi-byte
+    /// characters longer than the field would otherwise be cut mid-sequence,
+    /// and the receiver decodes lossily — so every peer would show this node
+    /// with a replacement character on the end.
+    #[test]
+    fn test_beacon_truncates_a_display_name_on_a_character_boundary() {
+        let beacon = Beacon {
+            node_id: NodeId::from_bytes([7u8; 32]),
+            node_type: NodeType::Phone,
+            display_name: "é".repeat(200),
+            protocol_version: ProtocolVersion::CURRENT,
+            battery_level: 50,
+            neighbor_count: 1,
+            lamport_clock: 1,
+            group_discovery_hash: None,
+        };
+
+        let decoded = Beacon::deserialize(&beacon.serialize()).expect("round trip");
+        assert_eq!(
+            decoded.display_name,
+            "é".repeat(127),
+            "254 bytes, because the 128th character would not fit whole"
+        );
+        assert!(
+            !decoded.display_name.contains('\u{fffd}'),
+            "a replacement character means the name was cut mid-sequence"
+        );
     }
 
     #[test]

@@ -61,7 +61,8 @@ class MyceliumBindings {
   late final _mycelium_api_check =
       _mycelium_api_checkPtr.asFunction<int Function()>();
 
-  /// Get the API handle status. 0=no node, 1=no handle, 2=running, 3=finished, -1=error.
+  /// Get the API handle status. 0=no node, 1=no handle, 2=running, 3=finished.
+  /// A poisoned lock is recovered, not reported.
   int mycelium_api_handle_status() {
     return _mycelium_api_handle_status();
   }
@@ -72,7 +73,8 @@ class MyceliumBindings {
   late final _mycelium_api_handle_status =
       _mycelium_api_handle_statusPtr.asFunction<int Function()>();
 
-  /// Create a new Mycelium node. Returns NULL on failure.
+  /// Create a new Mycelium node. Returns NULL on failure, with the reason in
+  /// mycelium_last_error. The returned handle is an owning reference.
   ffi.Pointer<MyceliumNode> mycelium_node_new(
     ffi.Pointer<ffi.Char> data_dir,
     ffi.Pointer<ffi.Char> display_name,
@@ -91,7 +93,11 @@ class MyceliumBindings {
       ffi.Pointer<MyceliumNode> Function(
           ffi.Pointer<ffi.Char>, ffi.Pointer<ffi.Char>)>();
 
-  /// Start the node event loop. Returns true on success.
+  /// Start the node event loop and the local API server. Returns true on
+  /// success, false if the node has already been stopped — a stopped node cannot
+  /// be restarted; create a new handle. A start that fails part-way leaves the
+  /// node startable, and a later start retries the API server if nothing holds
+  /// its handle.
   bool mycelium_node_start(
     ffi.Pointer<MyceliumNode> handle,
   ) {
@@ -139,7 +145,9 @@ class MyceliumBindings {
   late final _mycelium_node_id = _mycelium_node_idPtr.asFunction<
       void Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>)>();
 
-  /// Free the node handle. Call exactly once.
+  /// Release one reference to the node, draining the DHT mark writer first.
+  /// Call exactly once per handle. Also unregisters the node, so
+  /// mycelium_node_get_existing stops handing out new references to it.
   void mycelium_node_free(
     ffi.Pointer<MyceliumNode> handle,
   ) {
@@ -154,7 +162,9 @@ class MyceliumBindings {
   late final _mycelium_node_free = _mycelium_node_freePtr
       .asFunction<void Function(ffi.Pointer<MyceliumNode>)>();
 
-  /// Get the existing node handle (if still alive). Returns NULL if none.
+  /// Get another handle to the existing node, or NULL if none is registered.
+  /// The returned handle is an owning reference and needs its own
+  /// mycelium_node_free.
   ffi.Pointer<MyceliumNode> mycelium_node_get_existing() {
     return _mycelium_node_get_existing();
   }
@@ -652,7 +662,13 @@ class MyceliumBindings {
       int Function(ffi.Pointer<MyceliumNode>, ffi.Pointer<ffi.Uint8>,
           ffi.Pointer<ffi.Uint8>, int)>();
 
-  /// Set the node's display name (used in beacons). Call before mycelium_node_start().
+  /// Rename the running node: the name it announces in beacons and reports from
+  /// GET /v1/node/status. Takes effect on the next beacon. Returns 0 on success,
+  /// -1 on invalid arguments, including an empty name: a beacon's empty name
+  /// field means "unchanged" to a peer, so emptying a name would only change
+  /// what the API reports. Longer than 255 bytes is truncated on the wire, at a
+  /// character boundary. Not persisted — the name comes from mycelium_node_new
+  /// on every start.
   int mycelium_set_node_display_name(
     ffi.Pointer<MyceliumNode> handle,
     ffi.Pointer<ffi.Char> name,
@@ -1484,8 +1500,16 @@ typedef DartMessageCallbackFunction = void Function(
     int timestamp);
 
 /// Incoming message notification callback.
+/// Runs on a thread driving the async runtime: do not block in it, and do not
+/// call a Mycelium function that blocks from inside it — that is refused, with
+/// MYCELIUM_ERR_REENTRANT from an int32_t function and the failure value of
+/// whatever shape the function returns otherwise.
 typedef MessageCallback
     = ffi.Pointer<ffi.NativeFunction<MessageCallbackFunction>>;
+
+const int MYCELIUM_ERR_PANIC = -99;
+
+const int MYCELIUM_ERR_REENTRANT = -98;
 
 const int MYCELIUM_LINK_ESTABLISHED = 1;
 

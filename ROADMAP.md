@@ -9,12 +9,12 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-16 against the working tree, after T-34's proved local
-transport identity:
+Verified on 2026-11-16 against the working tree, after T-01's guarded FFI
+boundary:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **581 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **612 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -25,9 +25,9 @@ transport identity:
 event types, 64 FFI functions, 17 wire payload types, 13 database tables.
 
 Everything specified for v0.1 is implemented except the items below. The
-remaining work is concentrated in four places: **FFI robustness**, **protocol
-hardening of features that already work**, **validation against real
-hardware**, and **adapter interoperability**.
+remaining work is concentrated in three places: **protocol hardening of
+features that already work**, **validation against real hardware**, and
+**adapter interoperability**.
 
 ## How to read this
 
@@ -81,14 +81,15 @@ emergency broadcast's origin is not authenticated at all; and T-38 is how
 capacity eviction undoes the rollback protection ADR-011 claims.
 
 **Decided 2026-11-12.** Every P0 below has its design on record: T-14's row
-identity (ADR-017), T-01 (ADR-018), T-04 (ADR-019) and T-08 (ADR-020).
-ADR-014, ADR-015, ADR-016 and ADR-021 have been implemented (T-37, T-35, T-38,
-T-34). Each ADR names the task that implements it and flips its own
-status in that commit; the acceptance criteria below carry the decisions.
+identity (ADR-017), T-04 (ADR-019) and T-08 (ADR-020). ADR-014, ADR-015,
+ADR-016, ADR-018 and ADR-021 have been implemented (T-37, T-35, T-38, T-01,
+T-34), the last of them alongside ADR-023. Each ADR names the task that
+implements it and flips its own status in that commit; the acceptance criteria
+below carry the decisions.
 
-T-37, T-35, T-38 and T-34 have landed in that order. T-14's migration is next
-by the same reasoning — severity — and the remaining three (T-01, T-04, T-08)
-are designed but unsequenced.
+T-37, T-35, T-38, T-34 and T-01 have landed in that order. T-14's migration is
+next by the same reasoning — severity — and the remaining two (T-04, T-08) are
+designed but unsequenced.
 
 Two standing rules from those decisions: constants are **shapes now, numbers
 later** — the DHT publisher quota, the level-1/2 reach limits and the dedup
@@ -99,47 +100,6 @@ retention period are to be measured against the testbed (T-19) or hardware
 and the radio features keep "Implemented, untested on hardware" until T-15's
 report, however complete the software tests are — which is why BLE and Wi-Fi
 Direct carry that marker now that T-34 has landed, rather than a better one.
-
-### T-01 · FFI robustness
-
-**Area:** `mycelium-ffi` · **Spec:** §17.2 · **ADR-018** (design decided
-2026-11-12)
-
-Four distinct problems in the FFI layer, all of which can crash or hang the
-mobile app:
-
-1. No `extern "C"` function is wrapped in `catch_unwind`. A panic in Rust
-   unwinds across the FFI boundary, which is undefined behaviour and aborts the
-   process — users see the app vanish with no error.
-2. `block_on` is called in 48 places with no guard against re-entrancy. Calling
-   an FFI function from a thread already inside the runtime deadlocks.
-3. `mycelium_set_node_display_name` validates its arguments, logs, and returns
-   `0` without doing anything. Callers believe the name was set.
-4. The node handle is a raw `Box::into_raw` pointer with no reference count, so
-   `mycelium_node_get_existing` can hand out a pointer that
-   `mycelium_node_free` then invalidates.
-
-Also: `mycelium_api_check` and `mycelium_api_handle_status` are resolved by hand
-in Dart rather than through generated bindings, so a signature change will fail
-at runtime instead of at build time.
-
-**Acceptance:**
-- Every `extern "C"` function body is inside `catch_unwind`, applied by one
-  macro rather than hand-written per function; a panic stores its message in
-  the existing `LAST_ERROR` channel and returns the failure value for that
-  signature — negative for `i32`, null for a pointer, false for a bool. The
-  process is **not** aborted (ADR-018).
-- A re-entrancy guard makes an FFI call from a runtime thread return an error
-  rather than deadlock.
-- `mycelium_set_node_display_name` either updates the running node's display
-  name (requires interior mutability on the config the beacon task reads) or
-  returns a distinct "unsupported at runtime" code.
-- The handle is reference-counted; `node_free` on an outstanding reference is
-  safe.
-- `dart run ffigen` regenerated; no hand-written FFI lookups remain.
-- A test per return shape asserts that a deliberately panicking path returns
-  that shape's sentinel and leaves a readable message: a guard that is never
-  exercised is not a guard.
 
 ### T-04 · Group-discovery proof of possession
 
@@ -784,8 +744,12 @@ closes the class rather than narrowing it.
 Handle recreation is the same defect one level out: two node handles over one
 database file are two engines, `mycelium_node_new` does not refuse the second,
 and nothing could stop a second process opening the same file. Freeing a handle
-now drains the mark writer first, so the ordinary free-then-recreate sequence
-starts clean, but a drain that times out still leaves a detached writer holding
+now drains the mark writer first, but that is less than it reads as: T-01 made
+the handle reference-counted, so freeing one handle need not end the engine at
+all, and the API server task holds its own `Arc<Node>` regardless — and the
+drain proves only that what the writer had queued was *processed*, since a
+failed write is logged and dropped before `Flush` is acknowledged (ADR-016's
+2026-11-16 note). A drain that times out still leaves a detached writer holding
 deletions that can land after the new engine has restored them.
 
 **Acceptance:**
@@ -1175,6 +1139,55 @@ any commit.
 ---
 
 ## P2 — v0.2
+
+### T-50 · A panic inside `Node::start` leaves it half-started
+
+**Area:** `mycelium-node`, `mycelium-ffi` · **Spec:** §17.4 · **ADR-018**
+
+`Node::start` spawns the event loop, the beacon timer, the DTN sweeper and the
+transport pollers in sequence, and is not transactional: a panic part-way
+leaves some of them running and the rest not. That cost nothing while a panic
+ended the process. Since T-01 it survives, `mycelium_node_start` reports the
+failure, and the `started` flag is correctly left false — so a retry calls
+`Node::start` again and duplicates whatever the first attempt had already
+spawned: two beacon timers announcing the same node, two event loops competing
+for the same inbound queue.
+
+This is the one hazard T-01 introduced rather than removed, and it is narrow: a
+panic inside `Node::start` is itself a defect, and the window is the handful of
+statements before the last task is spawned. It is a task because the FFI layer
+cannot fix it — the flag can only describe what `Node::start` reports, and what
+it reports today is all-or-nothing about something that is neither.
+
+**Acceptance:** `Node::start` either completes or leaves nothing spawned — a
+cancellation token cancelled on the way out of a failed start, or a guard that
+aborts the tasks it has already created; a test that panics part-way through a
+start asserts that a second start spawns exactly one of each task, counted
+rather than inferred.
+
+### T-49 · A renamed node reverts on restart
+
+**Area:** `mycelium-node`, `mycelium-ffi`, `mycelium-storage` · **Spec:** §17.4
+· **ADR-023**
+
+T-01 made `mycelium_set_node_display_name` work: the name reaches the next
+beacon and `GET /v1/node/status`. It reaches nothing durable. The name is held
+in memory on the node, and every start takes it from `mycelium_node_new`'s
+argument or the daemon's config, so a rename made in the app is silently lost
+the next time the process starts — and the app has no way to make it stick
+short of remembering the name itself and passing it in.
+
+Left out of T-01 deliberately (ADR-023): persisting it means deciding what
+takes precedence between a stored name, a config file and a constructor
+argument, and that precedence belongs in its own decision rather than being
+settled by whichever code path happens to write last.
+
+**Acceptance:** a renamed node reports the new name after a restart; the
+precedence between the stored name, `NodeConfig::display_name` and
+`mycelium_node_new`'s argument is written down in the spec (§14.5 and §17.4)
+and asserted by a test for each of the three; the daemon's
+`MYCELIUM_DISPLAY_NAME` override still wins where it is set, or the spec says
+why not.
 
 ### T-03 · Transport session migration
 

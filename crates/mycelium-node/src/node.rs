@@ -339,6 +339,27 @@ pub struct Node {
     key_sent_to: Arc<RwLock<HashMap<[u8; 32], HashSet<NodeId>>>>,
     /// Truncated hash of local group discovery key for beacon matching.
     pub local_group_hash: Option<[u8; 8]>,
+    /// The display name this node announces, which can change while it runs.
+    ///
+    /// `NodeConfig::display_name` is the configured *initial* value and nothing
+    /// reads it after construction: the beacon task and `/v1/node/status` both
+    /// read this, so a rename reaches the mesh and the API together rather than
+    /// one of them. A `std::sync::RwLock` on purpose — the setter is reached
+    /// from the FFI, which must not need the async runtime to rename a node,
+    /// and no reader holds the guard across an await (ROADMAP T-01).
+    display_name: Arc<std::sync::RwLock<String>>,
+}
+
+/// Read a live display name, recovering from a poisoned lock.
+///
+/// A free function because the beacon task holds the name alone, not the whole
+/// node, and must read it through exactly what `Node::display_name` reads it
+/// through.
+fn read_display_name(name: &std::sync::RwLock<String>) -> String {
+    match name.read() {
+        Ok(slot) => slot.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
 }
 
 /// An emergency broadcast whose id and date are fixed, so co-signatures can
@@ -415,6 +436,8 @@ impl Node {
             }
         });
 
+        let display_name = config.display_name.clone();
+
         let battery = if matches!(config.node_type, crate::config::NodeTypeConfig::Supernode) {
             BatteryManager::always_on()
         } else {
@@ -457,6 +480,28 @@ impl Node {
             ))),
             key_sent_to: Arc::new(RwLock::new(HashMap::new())),
             local_group_hash,
+            display_name: Arc::new(std::sync::RwLock::new(display_name)),
+        }
+    }
+
+    /// The name this node announces in beacons and reports over the API.
+    pub fn display_name(&self) -> String {
+        read_display_name(&self.display_name)
+    }
+
+    /// Rename the running node.
+    ///
+    /// Takes effect on the next beacon — the beacon task reads the name each
+    /// tick — and on the next `/v1/node/status`. Not persisted: the name comes
+    /// from the config (or from `mycelium_node_new`) on every start, so a
+    /// rename that should outlive the process has to be made there.
+    pub fn set_display_name(&self, name: String) {
+        match self.display_name.write() {
+            Ok(mut slot) => *slot = name,
+            // The guarded value is one `String` that no panic can leave
+            // half-written, and refusing to rename for the life of the process
+            // would be the worse failure.
+            Err(poisoned) => *poisoned.into_inner() = name,
         }
     }
 
@@ -1071,7 +1116,7 @@ impl Node {
         let battery_b = self.battery.clone();
         let cancel_b = self.cancel.clone();
         let node_id_b = self.node_id;
-        let display_name_b = self.config.display_name.clone();
+        let display_name_b = Arc::clone(&self.display_name);
         let node_type_b = match self.config.node_type {
             crate::config::NodeTypeConfig::Phone => NodeType::Phone,
             crate::config::NodeTypeConfig::Supernode => NodeType::Supernode,
@@ -1099,7 +1144,7 @@ impl Node {
                         let beacon = crate::beacon::Beacon {
                             node_id: node_id_b,
                             node_type: node_type_b,
-                            display_name: display_name_b.clone(),
+                            display_name: read_display_name(&display_name_b),
                             protocol_version: ProtocolVersion::CURRENT,
                             battery_level,
                             neighbor_count,
@@ -5437,6 +5482,17 @@ impl Node {
         self.cancel.clone()
     }
 
+    /// Whether this node's tasks have been cancelled.
+    ///
+    /// The exact answer to "is this node still running", for a caller that
+    /// has to reconcile its own view with the node's — the FFI does, because
+    /// a caught panic can leave a stop half-finished (ADR-018). A stopped node
+    /// cannot be restarted: the token is not reset, so tasks spawned after it
+    /// is cancelled exit immediately.
+    pub fn is_stopped(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
     /// Count of pending messages waiting for session establishment.
     pub async fn pending_messages_count(&self) -> usize {
         let pm = self.pending_messages.read().await;
@@ -5596,6 +5652,31 @@ fn identity_clone_for_prekeys(identity: &Identity) -> Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A rename reaches everything that announces the node, because the
+    /// beacon task and `/v1/node/status` both read the live name rather than
+    /// the configured one (ROADMAP T-01). Before this, the FFI setter logged
+    /// the new name and returned success without changing anything.
+    #[test]
+    fn test_a_running_node_can_be_renamed() {
+        let config = NodeConfig {
+            display_name: "Before".to_string(),
+            ..NodeConfig::default()
+        };
+        let node = Node::new(
+            config,
+            Database::open_in_memory().expect("in-memory DB"),
+            Identity::generate(),
+        );
+
+        assert_eq!(node.display_name(), "Before");
+        node.set_display_name("After".to_string());
+        assert_eq!(node.display_name(), "After");
+        assert_eq!(
+            node.config.display_name, "Before",
+            "the configured value is the initial name, not the live one"
+        );
+    }
 
     /// The content type is inside the associated data, so retyping a message
     /// in flight breaks its decryption (T-35, ADR-012).

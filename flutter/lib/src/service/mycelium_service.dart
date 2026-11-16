@@ -184,16 +184,17 @@ class MyceliumService {
   }
 
   /// Try to recover the FFI node handle from the native library.
-  /// The Rust static ACTIVE_NODE holds the pointer even after Flutter restarts.
+  /// Rust keeps a reference to the node even after the Flutter engine
+  /// restarts, so the daemon's node can be picked up again.
+  ///
+  /// The returned handle is a *reference*: [dispose] frees it, exactly as it
+  /// frees the one from `mycelium_node_new` (T-01).
   void _recoverFfiHandle() {
+    // Each call returns another reference, and [dispose] frees one, so asking
+    // again while already holding one would leak the node (T-01).
+    if (_handle != null) return;
     try {
-      final lib = defaultTargetPlatform == TargetPlatform.android
-          ? DynamicLibrary.open('libmycelium_ffi.so')
-          : DynamicLibrary.process();
-      final getExisting = lib.lookupFunction<
-          Pointer<ffi.MyceliumNode> Function(),
-          Pointer<ffi.MyceliumNode> Function()>('mycelium_node_get_existing');
-      final handle = getExisting();
+      final handle = bindings.mycelium_node_get_existing();
       if (handle != nullptr) {
         _handle = handle;
       }
@@ -514,28 +515,12 @@ class MyceliumService {
   /// Run API server diagnostics from Rust side.
   void _runApiDiagnostics() {
     try {
-      final lib = defaultTargetPlatform == TargetPlatform.android
-          ? DynamicLibrary.open('libmycelium_ffi.so')
-          : DynamicLibrary.process();
-
-      // Check handle status
-      final apiHandleStatus = lib.lookupFunction<
-          Int32 Function(), int Function()>('mycelium_api_handle_status');
-      final handleStatus = apiHandleStatus();
-      final handleLabels = {
-        0: 'no node',
-        1: 'node exists, no API handle',
-        2: 'API handle exists (running)',
-        3: 'API handle exists (FINISHED)',
-        -1: 'mutex poisoned',
-      };
-      final handleLabel = handleLabels[handleStatus] ?? 'unknown($handleStatus)';
+      final handleStatus = bindings.mycelium_api_handle_status();
+      final handleLabel = apiHandleStatusLabel(handleStatus);
       debugPrint('Mycelium: API handle status: $handleLabel');
 
       // TCP connect check from Rust
-      final apiCheck = lib.lookupFunction<
-          Int32 Function(), int Function()>('mycelium_api_check');
-      final checkResult = apiCheck();
+      final checkResult = bindings.mycelium_api_check();
       if (checkResult == 1) {
         debugPrint('Mycelium: API TCP check: OK (reachable from Rust)');
       } else {

@@ -163,6 +163,27 @@ pub async fn start_server(
     }
     let shutdown = state.shutdown.clone();
 
+    // Bind before spawning anything. Both tasks below hold the cancellation
+    // token and one holds the node, and the only way to cancel them is the
+    // handle this function returns — which it does not, on the error path. So
+    // spawning first made a failed bind leak two tasks and keep the node
+    // alive, every time it was attempted (found reviewing ROADMAP T-01, where
+    // the FFI began retrying a failed API start).
+    let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port)
+        .parse()
+        .map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid API bind address {}:{}: {}",
+                    config.bind_address, config.port, e
+                ),
+            )
+        })?;
+
+    let listener = bind_reuseaddr(addr).await?;
+    info!("API server listening on {}", addr);
+
     // Spawn bridge task: NodeEvent → WsServerMessage
     let ws_tx = state.event_tx.clone();
     let bridge_log = state.event_log.clone();
@@ -231,21 +252,6 @@ pub async fn start_server(
             });
         }
     });
-
-    let addr: SocketAddr = format!("{}:{}", config.bind_address, config.port)
-        .parse()
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "invalid API bind address {}:{}: {}",
-                    config.bind_address, config.port, e
-                ),
-            )
-        })?;
-
-    let listener = bind_reuseaddr(addr).await?;
-    info!("API server listening on {}", addr);
 
     let serve_cancel = shutdown.clone();
     let task = tokio::spawn(async move {
