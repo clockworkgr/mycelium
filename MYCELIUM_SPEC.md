@@ -260,7 +260,7 @@ who observes the radio. Content is always encrypted and opaque to relays.
 
 ### 4.2 Payload types
 
-Each payload begins with a 1-byte type discriminator. Eighteen types are
+Each payload begins with a 1-byte type discriminator. Twenty types are
 defined.
 
 | Byte | Name | Min body | Purpose |
@@ -275,6 +275,8 @@ defined.
 | `0x32` | `AodvRerr` | 68 | Route error |
 | `0x40` | `DtnRelay` | 25 | `message_id` + `copies_remaining` + `ttl_secs` + opaque inner envelope (ADR-005) |
 | `0x50` | `Beacon` | var | Node heartbeat (§10.1) |
+| `0x51` | `GroupProofChallenge` | 40 | Group discovery hint + nonce: prove you hold the key behind the hint (§10.2, ADR-019) |
+| `0x52` | `GroupProofResponse` | 32 | The MAC that answers it (§10.2, ADR-019) |
 | `0x60` | `Receipt` | 17 | Delivery/read confirmation |
 | `0x70` | `GroupMessage` | 37 | Sender-key-encrypted group message |
 | `0x71` | `SenderKeyDistribution` | 68 | Sender key + roster + explicit removals (ADR-007) |
@@ -292,6 +294,12 @@ a group (ADR-007).
 `DtnRelay` carries `copies_remaining` and `ttl_secs` on the wire so a relay can
 spray further and honour the originator's end-to-end TTL instead of resetting
 it (ADR-005).
+
+`GroupProofChallenge` (`0x51`) and `GroupProofResponse` (`0x52`) are
+link-local: `ttl = 1`, never forwarded, and refused unless the envelope's
+source is the transport peer that delivered it and the destination is the
+receiving node. Both bodies are a fixed length, and a body with bytes to spare
+is refused rather than parsed (§10.2).
 
 ### 4.3 Compact LoRa frame
 
@@ -719,7 +727,7 @@ and confirm; verified status is local and surfaced in the UI.
 
 ### 5.6 HKDF info strings
 
-Nine info strings provide domain separation. Reusing one across contexts would
+Ten info strings provide domain separation. Reusing one across contexts would
 let a key derived for one purpose be substituted for another.
 
 | Info string | Purpose |
@@ -732,6 +740,7 @@ let a key derived for one purpose be substituted for another.
 | `b"MyceliumGroupCK"` | Group chain key advancement |
 | `b"MyceliumGroupAEAD"` | Group AEAD key + nonce |
 | `b"MyceliumGroupDiscovery"` | Group discovery key from a passphrase (§10.2) |
+| `b"MyceliumGroupProof"` | The MAC key behind a group key, separated from the hint its beacon publishes (§10.2, ADR-019) |
 | `b"frame:" ‖ ephemeral_public` | Internet channel frame keys, one per direction. Separated additionally by the HKDF salt, which is the channel transcript and carries its own context tag (§8.4, ADR-011) |
 
 ### 5.7 Security properties
@@ -753,14 +762,21 @@ let a key derived for one purpose be substituted for another.
 
 ### 6.1 Web of Trust
 
-**Status: Implemented.**
+**Status: Partial** (the graph and the scoring; the vouch signature is defined
+and unused — see below).
 
 There is no certificate authority and no key server. Trust comes from
 in-person attestation.
 
 - Users **vouch** for each other by scanning a QR code containing the public
-  key. A vouch is an Ed25519 signature over
-  `b"mycelium-vouch-v1:" ‖ voucher_id ‖ vouchee_id ‖ display_name ‖ timestamp`.
+  key. A vouch is defined as an Ed25519 signature over
+  `b"mycelium-vouch-v1:" ‖ voucher_id ‖ vouchee_id ‖ display_name ‖ timestamp`
+  — defined, and implemented in `wot::Vouch`, but **not used**: every path
+  that writes a vouch stores an empty signature, nothing verifies one on
+  load, and `Vouch::create`/`Vouch::verify` have no caller outside their own
+  tests. Harmless while a vouch never leaves the node that made it, which is
+  true today; it is what a vouch has to carry before trust can be transitive
+  across nodes (ROADMAP T-53).
 - Trust propagates transitively with exponential decay, computed by BFS over
   the vouch graph: 1 hop = 1.0, 2 hops = 0.5, 3 hops = 0.25, 4 hops = 0.125.
   `max_hops` defaults to 4.
@@ -775,7 +791,13 @@ The primary defence is the cost of in-person attestation. A new identity has
 zero trust until someone vouches for it face to face, so manufacturing
 thousands of identities means meeting thousands of people. Unvouched nodes can
 still send and receive, but are throttled hard (5 messages/hour) and get no
-relay priority. Vouching for a misbehaving node is intended to damage the
+relay priority.
+
+The one way to be vouched without meeting anyone is a seed-phrase group, and
+that path costs the group key: a beacon hint grants nothing until the holder
+answers a challenge over it (§10.2, ADR-019). Copying eight bytes out of a
+beacon used to be enough, which made the defence above free to bypass for
+exactly the population onboarding exists to serve. Vouching for a misbehaving node is intended to damage the
 voucher's score — reputation staking — which is not yet implemented.
 
 ### 6.3 Threshold key revocation
@@ -830,6 +852,18 @@ failure:
   `node_type` (§10.1).
 - **Bounded state.** Hop counts saturate; the table is capped at 4096 entries;
   long-invalid entries are pruned.
+
+**What a route can be learned from.** Not only AODV messages: *every* received
+envelope whose `source` is neither the sending peer nor this node, and whose
+`hop_count` is above zero, installs a reverse route to that source via that
+peer. `envelope.source` is cleartext and nothing authenticates it (§14.3), so
+a neighbour can name any id and have a route to it installed pointing at
+itself, then attract unicast traffic for that id and drop it. The hop count it
+can claim is at least 2, so a live direct link is never displaced — but an id
+with no valid route, or one reachable only through a longer learned path, is
+taken over. The route is installed before the payload type is parsed, so no
+rate limit has been charged at that point, whatever the type. Content stays end-to-end encrypted, so this is a denial of service
+rather than a disclosure. See ROADMAP T-55.
 
 Route entries live for 300 s by default and are refreshed for active
 neighbours; the RREQ dedup window is 10 s. `AodvAction` is the router's output
@@ -1636,8 +1670,12 @@ Wi-Fi Direct, LoRa and Bluetooth Classic share one bounded outbox with three
 rules: an alert queues after the alerts already waiting and ahead of all
 ordinary traffic, so alerts keep their own order; a full outbox makes room for
 an alert by dropping the **oldest ordinary** frame, and sacrifices the oldest
-alert only when nothing ordinary is left; and a full outbox **refuses**
-ordinary traffic rather than evicting an alert to fit it. A fragmented message
+alert only when nothing ordinary is left; and **nothing but a larger alert
+batch ever evicts an alert**. Ordinary traffic makes room only from ordinary
+traffic: arriving at an outbox that holds enough of it, it displaces the
+oldest of it; arriving at one that does not, it is refused outright rather
+than taking an alert's place. A batch larger than the whole outbox is refused
+whatever its priority, since nothing it could evict would make it fit. A fragmented message
 is admitted whole or not at all, so it cannot evict its own fragments, and
 LoRa charges duty-cycle airtime only once frames are admitted. The internet
 transport has a second channel its writer drains first.
@@ -1654,10 +1692,12 @@ unlimited. See ROADMAP T-37.
 **Size.** An alert is `217 + message_bytes + 96 × approvals` bytes on the
 wire, so a critical alert with three approvals is 522 — more than one 512-byte
 BLE frame. The BLE transport fragments at the message level (ADR-022), so what
-bounds an alert is the reassembly limit (4096 bytes) rather than a frame, and a
-node still refuses to raise one larger than its narrowest registered
-transport's message bound rather than flooding only the links that can carry
-it.
+bounds an alert is a whole message rather than a frame — and on BLE that is
+**4035 bytes**, not the 4096-byte reassembly limit: sealing a local link costs
+61 bytes of counter, header and AEAD tag (§8.4, ADR-021). A node refuses to
+raise an alert larger than its narrowest registered transport's message bound
+rather than flooding only the links that can carry it, so with BLE registered
+the refusal is at 4035.
 
 ### 9.6 Multi-device support
 
@@ -1700,24 +1740,95 @@ contacts and supernode registrations on other nodes' behalf.
 
 ### 10.2 Seed phrase groups
 
-**Status: Implemented** (discovery and auto-vouch; proof of possession is a gap).
+**Status: Implemented** (hint, challenge, vouch; nothing wires a passphrase to
+a node — see the gaps below).
 
-A community publishes a shared passphrase. A new user enters it, and
-`derive_group_discovery_key(passphrase)` — HKDF-SHA256 with info
-`b"MyceliumGroupDiscovery"` — produces a 32-byte key. Its first 8 bytes ride in
-the beacon as `group_discovery_hash`. When an incoming beacon's hash matches
-the local key, the sender is auto-trusted with an initial vouch, giving the
-newcomer a trust foothold without a prior in-person meeting.
+A community agrees a passphrase. `derive_group_discovery_key(passphrase)` —
+HKDF-SHA256 with info `b"MyceliumGroupDiscovery"` — turns it into a 32-byte
+group key, and that key, hex-encoded, is what a node's `group_seed` carries
+(§14.5). Two values are derived from it at startup, and the node works from
+those — the decoded key is wiped, though the hex form stays in the config, and
+on the daemon path in the config file (ROADMAP T-08):
 
-**Known gap:** the 8-byte hash is cleartext and replayable, so anyone who
-observes one beacon can claim group membership. It needs a challenge/response
-proof of possession. See ROADMAP T-04.
+| Value | Derivation | Where it goes |
+|-------|------------|---------------|
+| discovery hint | `SHA-256(key)[..8]` | `group_discovery_hash` in every beacon (§10.1) |
+| proof key | HKDF-SHA256 over the key, info `b"MyceliumGroupProof"` | never leaves the node |
+
+The hint is public by construction — eight static bytes in the clear in every
+beacon, which anyone in radio range can copy. So a hint matching the local one
+is a **hint, not a credential**: it earns a challenge, and the vouch waits for
+the answer.
+
+```
+verifier  → responder   GroupProofChallenge (0x51)   hint(8) ‖ nonce(32)
+responder → verifier    GroupProofResponse  (0x52)   mac(32)
+
+mac = HMAC-SHA256(proof_key, nonce ‖ verifier_node_id ‖ responder_node_id)
+```
+
+A correct MAC vouches for the peer at 1 hop, which is the trust foothold
+onboarding needs without a prior in-person meeting. Everything else about the
+exchange is there to keep that foothold earned (ADR-019):
+
+- **Both ids come from each side's own view, never from the payload.** The
+  responder MACs the peer that asked and itself; the verifier checks itself and
+  the peer it asked. An answer therefore belongs to one pairing in one
+  direction — which is what makes answering a stranger's challenge safe, since
+  a MAC collected by challenging a real member carries the collector's id in
+  the verifier's place and cannot be moved to the responder's.
+- **Both messages are link-local** (§4.2), so the two ids in the MAC are the
+  ones the link itself proved (§8.4, ADR-021). A challenge addressed to the
+  broadcast id is refused: it would make every member in earshot answer one
+  packet.
+- **One guess per nonce.** The first response spends it, right or wrong. A
+  nonce is valid for 30 s.
+- **One attempt per peer per 120 s.** Beacons arrive every 10–30 s; without the
+  cooldown an unvouched peer in range would be challenged twice a minute.
+- **A per-peer budget of 30 messages an hour** for the exchange, in a book of
+  its own (§12). The trust tiers cannot price this path — it runs before any
+  trust exists, and the unknown-peer tier of five an hour would be spent on a
+  real member before it could answer.
+- **Failure is silent and local.** A wrong or missing answer means no vouch and
+  nothing on the wire, so a prober learns nothing about how close it was.
+- A peer this node already vouches for is not challenged again, and a node in
+  no group neither challenges nor answers.
+
+A node that does not implement these payload types never becomes vouched,
+which is the correct outcome: it cannot prove possession.
+
+**Known gaps:**
+
+- **No node is ever in a group through the app.** The onboarding screen writes
+  the phrase to `SharedPreferences` and `mycelium_node_new` has no parameter
+  for it, so `group_seed` is `None`, no hint is advertised and the exchange
+  never runs. It is reachable only from a daemon TOML that sets `group_seed`,
+  and the passphrase → key step above has no caller in the tree at all
+  (ROADMAP T-51).
+- **The passphrase is not stretched.** One HKDF pass, no salt, no iterations,
+  with eight bytes of the key's hash in every beacon: a guessable passphrase
+  can be recovered offline, and a recovered key answers challenges correctly.
+  No challenge can close that — the passphrase has to carry real entropy
+  (ROADMAP T-52).
+- A vouch earned here is stored unsigned, as every local vouch is
+  (ROADMAP T-53).
+- **A vouch granted before this existed is still granted.** Vouches are
+  persisted and reloaded into the trust graph, and a row written by the old
+  hash-match path is indistinguishable from one the user made by hand — both
+  are unsigned, both name this node as voucher. So an upgrade does not undo an
+  unearned vouch, and the holder is not challenged again, because this node
+  already vouches for it. Nothing in the tree ever sets `group_seed`, so only
+  a hand-configured daemon can have such a row (ROADMAP T-54).
 
 ### 10.3 First-launch flow
 
-**Status: Implemented.** Generate identity → set display name → enter a seed
+**Status: Partial.** Generate identity → set display name → enter a seed
 phrase **or** scan a contact's QR code → scan for peers on all transports → key
 exchange on first match → ready. Four onboarding screens plus the QR scanner.
+
+The seed-phrase branch is a screen, not a feature: the phrase it collects is
+stored locally and never reaches the node, so the group it names is never
+joined (§10.2, ROADMAP T-51).
 
 ## 11. Node roles and power management
 
@@ -1789,11 +1900,17 @@ Enforcement details:
 - A violation drops the message. No error is returned — a spammer gets no
   feedback and no oracle.
 - Auto-blacklist after 10 violations in a window; blacklist lasts 1 hour.
-  Violation counters reset hourly.
+  Violation counters reset hourly. Two of the books below do not do it: the
+  alert book, for the reason given there, and the group-proof book, because
+  the peer it would blacklist is the one that may be trying to join — and the
+  blacklist is consulted by the *other* books, so an hour of silence for
+  exceeding a 30-an-hour onboarding budget would be a punishment out of all
+  proportion to work that refusing already bounds.
 - A direct neighbour is charged **once** for user data (the previous-hop
-  gate), not once per check. Three books are kept apart, because they answer
-  different questions and one of them is charged for claims nothing has
-  verified:
+  gate), not once per check. Four books are kept apart, because they answer
+  different questions — one of them is charged for claims nothing has
+  verified, and one prices work asked for before there is any trust to price
+  it by:
   - **per peer** — what this link delivered, charged on every message;
   - **per claimed origin** — relayed user data attributed to an
     `envelope.source` that is still unchecked at that point;
@@ -1802,6 +1919,13 @@ Enforcement details:
     arrived. This book does not auto-blacklist: the id it would blacklist is
     the one that might be raising a real alert, and refusing the alert already
     bounds the work (ADR-014).
+  - **per peer, for the group-proof exchange** — a flat 30 messages an hour,
+    independent of trust, because this is the one ingress path whose whole
+    purpose is to run *before* any trust exists: on the unknown-peer tier a
+    real member would spend its five an hour on beacons and routing and have
+    nothing left to prove itself with (§10.2, ADR-019). Keyed on the transport
+    peer rather than on `envelope.source`, so nobody can spend another node's
+    allowance and keep it from ever being vouched.
 
   A sender close enough to deliver directly therefore spends a different
   allowance from one relaying through others. Merging the first two books
@@ -2000,7 +2124,10 @@ pub struct NodeConfig {
                                            // 2 × 72 h (§5.2)
     pub beacon_interval_secs: u64,         // 30 phones, 10 supernodes
     pub api: ApiConfig,                    // bind, port, enabled, auth_token
-    pub group_seed: Option<String>,        // group discovery key (hex)
+    pub group_seed: Option<String>,        // group discovery key, 32 bytes
+                                           // hex — not the passphrase
+                                           // (§10.2, T-51). Anything else
+                                           // is logged and ignored
     pub plugins: Vec<PluginConfigEntry>,   // not yet read — ROADMAP T-13
 }
 
@@ -2492,15 +2619,15 @@ point into [`ROADMAP.md`](ROADMAP.md).
 |---|---------|--------|-------|
 | 2 | Rust core + mobile client | **Implemented** | Flutter, not native UI toolkits |
 | 2.3 | Standalone daemon + local API | **Implemented** | ADR-001, ADR-002, ADR-004 |
-| 4 | Envelope + 17 payload types | **Implemented** | Custom binary codec |
+| 4 | Envelope + 20 payload types | **Implemented** | Custom binary codec |
 | 4.3 | Compact LoRa frame | **Implemented** | Defined and tested; not yet used by the transport (T-12) |
 | 5.1 | Ed25519/X25519 identity | **Implemented** | Device-bound, NodeId ↔ key binding enforced |
 | 5.2 | X3DH | **Implemented** | SPK + OTP issued once, signature verified, rotated SPKs retained, stale bundles rejected and recovered (ADR-009). The init's own bytes are in the derivation, a handshake is answered once, and a prekey is retired only on authentication (ADR-015) |
 | 5.3 | Double Ratchet | **Implemented** | Transactional decrypt, bounded skips, ratchet state durable before transmit, key material zeroized |
 | 5.4 | Group encryption | **Implemented** | Sender keys over pairwise sessions (ADR-007), not an MLS tree. No admin model, and any member can forge messages attributed to another (T-24) |
 | 5.5 | Safety numbers | **Implemented** | 60-digit, symmetric, verify flow in the app |
-| 6.1 | Web of Trust | **Implemented** | BFS with decay, signed vouches |
-| 6.2 | Sybil resistance | **Implemented** | Trust-gated rate limits + blacklisting |
+| 6.1 | Web of Trust | **Partial** | BFS with decay; the vouch signature is defined and implemented but no path writes or checks one (T-53) |
+| 6.2 | Sybil resistance | **Implemented** | Trust-gated rate limits + blacklisting; the one vouch that needs no meeting is earned by proof of possession (§10.2, ADR-019) |
 | 6.3 | Threshold revocation | **Planned** | v0.4 |
 | 7.1 | AODV | **Implemented** | Supernode + direct-link preference, storm-free RERR, one shared discovery attempt per destination on a 1 s sweep |
 | 7.2 | DTN spray-and-wait | **Implemented** | Copies/TTL on the wire (ADR-005), quotas, origin-aware eviction, persisted origin + spray history |
@@ -2523,8 +2650,8 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 9.5 | Emergency broadcast | **Partial** | Thresholds enforced, co-signatures verified, origin authenticated over the alert and its approvals, `signed_at` freshness bound, dedup after verification keyed on the digest, reach and rate limiting per level, and alerts ordered ahead of ordinary traffic in every transport's send queue (ADR-010, ADR-013, ADR-014). Nothing collects co-signatures, so level 3 is refused everywhere (T-05) |
 | 9.6 | Multi-device / CRDT sync | **Planned** | v0.3 |
 | 10.1 | Beacon | **Implemented** | Node type, battery, neighbour count, group hash; LoRa broadcast |
-| 10.2 | Seed phrase groups | **Partial** | Derivation + beacon match + auto-vouch; no proof of possession (T-04) |
-| 10.3 | First-launch flow | **Implemented** | 4 onboarding screens + QR |
+| 10.2 | Seed phrase groups | **Implemented** | Beacon hint, HMAC challenge over a fresh nonce and both node ids, vouch only on a correct answer, link-local, one guess per nonce, own rate-limit book (ADR-019). Nothing wires a passphrase to a node: the app never joins a group (T-51), and the derivation is unstretched (T-52) |
+| 10.3 | First-launch flow | **Partial** | 4 onboarding screens + QR; the seed-phrase branch collects a phrase that never reaches the node (T-51) |
 | 11.1 | Supernode | **Partial** | CLI, auto-config, prekey cache, `.ipk`, LuCI app. No router hardware test (T-15) |
 | 11.2 | Battery management | **Partial** | 5 modes computed and reported, but Moderate/Light share one relay flag and Hibernate does not disconnect (T-30) |
 | 12 | Rate limiting | **Implemented** | Per-tier limits, auto-blacklist, wired to the trust graph |

@@ -124,6 +124,37 @@ impl RateLimiter {
         true
     }
 
+    /// Check a fixed per-hour budget for one peer, independent of trust.
+    ///
+    /// For a path that runs *before* any trust exists and must still bound
+    /// what a stranger can ask for — the group-discovery proof exchange
+    /// (ADR-019). `check_message` cannot serve it: the unknown-peer tier is
+    /// five messages an hour, which a beacon-driven exchange would spend on a
+    /// real member in its first minutes in range, leaving it nothing to answer
+    /// the challenge with.
+    ///
+    /// The blacklist still applies, and the window is the same hour as every
+    /// other count in this book — a book these callers keep to themselves, so
+    /// the budget is not shared with user data.
+    pub fn check_budget(&mut self, node: &NodeId, max_per_hour: u32) -> bool {
+        if let Some(until) = self.blacklist.get(node) {
+            if Instant::now() < *until {
+                return false;
+            }
+            self.blacklist.remove(node);
+        }
+
+        let state = self.states.entry(*node).or_insert_with(NodeRateState::new);
+        state.reset_if_expired();
+
+        if state.message_times.len() as u32 >= max_per_hour {
+            return false;
+        }
+
+        state.message_times.push(Instant::now());
+        true
+    }
+
     /// Check if DTN relay storage for a node is within quota.
     pub fn check_dtn_relay(
         &mut self,
@@ -262,5 +293,32 @@ mod tests {
         rl.blacklist_node(n);
         assert!(rl.is_blacklisted(&n));
         assert!(!rl.check_message(&n, 1)); // Even direct trust blocked
+    }
+
+    /// The budget an unknown peer gets for the group-proof exchange is its
+    /// own, not the five-an-hour tier that stranger would otherwise get.
+    #[test]
+    fn test_a_budget_is_not_the_trust_tier() {
+        let mut rl = RateLimiter::new();
+        let n = node(1);
+
+        for i in 0..10 {
+            assert!(rl.check_budget(&n, 10), "message {} refused", i);
+        }
+        assert!(!rl.check_budget(&n, 10));
+    }
+
+    #[test]
+    fn test_a_budget_is_per_peer_and_honours_the_blacklist() {
+        let mut rl = RateLimiter::new();
+        let (a, b) = (node(1), node(2));
+
+        assert!(rl.check_budget(&a, 1));
+        assert!(!rl.check_budget(&a, 1));
+        // Spending one peer's budget does not spend another's.
+        assert!(rl.check_budget(&b, 1));
+
+        rl.blacklist_node(b);
+        assert!(!rl.check_budget(&b, 100));
     }
 }

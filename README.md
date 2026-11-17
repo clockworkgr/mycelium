@@ -39,15 +39,18 @@ Every message is end-to-end encrypted using the Signal Protocol (X3DH key exchan
 - X25519 Diffie-Hellman key exchange
 - AES-256-GCM authenticated encryption
 - Forward secrecy via DH ratchet
-- Web of Trust with signed vouches and BFS trust scoring
+- Web of Trust with BFS trust scoring; a group vouch is earned by proving
+  possession of the group key (ADR-019), and vouches are local and unsigned
+  (ROADMAP T-53)
 - Trust-based rate limiting and auto-blacklisting
 - SQLCipher encrypted database
 
 **Platform**
-- Rust core (10 crates, 612 tests)
+- Rust core (10 crates, 649 tests)
 - Local REST API (38 endpoints) + WebSocket server, bearer-token authenticated (ADR-006)
 - Flutter mobile app for Android and iOS (14 screens, 49 Dart files)
-- Onboarding with seed phrase groups or QR code scanning
+- Onboarding by QR code scan; the seed-phrase group screen does not yet reach
+  the node (ROADMAP T-51)
 - Emergency broadcast system (3 trust-gated tiers)
 - Battery-adaptive power modes (5 levels)
 
@@ -87,7 +90,7 @@ The Rust daemon exposes a local API on `127.0.0.1:9735`. The Flutter app (and an
 ```bash
 # Rust workspace
 make build    # Debug build
-make test     # Run all 612 tests
+make test     # Run all 649 tests
 make lint     # cargo fmt --check + cargo clippy
 
 # Flutter app
@@ -189,15 +192,15 @@ mycelium/
 
 ## Wire Format
 
-106-byte envelope header + variable payload. 17 payload types:
+106-byte envelope header + variable payload. 20 payload types:
 
 | Category | Types |
 |----------|-------|
 | Messaging | EncryptedMessage, SessionInit |
-| Key Exchange | PrekeyRequest, PrekeyResponse |
+| Key Exchange | PrekeyRequest, PrekeyResponse, SessionReject |
 | Routing | AODV RREQ, RREP, RERR |
 | DTN | DtnRelay |
-| Discovery | Beacon |
+| Discovery | Beacon, GroupProofChallenge, GroupProofResponse |
 | Receipts | Receipt |
 | Groups | GroupMessage, SenderKeyDist |
 | Channels | ChannelMessage, ChannelSubscribe, ChannelUnsubscribe, ChannelModeration |
@@ -236,7 +239,7 @@ The `TransportPlugin` trait allows third-party transports to integrate as plugin
 | [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md) | The spec: wire protocol, cryptography, architecture as built, compliance matrix |
 | [`ROADMAP.md`](ROADMAP.md) | The plan: everything still open, prioritised, with acceptance criteria |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) | Build setup, test commands, conventions |
-| [`docs/adr/`](docs/adr/) | Architecture Decision Records (ADR-001 … ADR-011) |
+| [`docs/adr/`](docs/adr/) | Architecture Decision Records (ADR-001 … ADR-023) |
 | [`docs/plugin-api.md`](docs/plugin-api.md) | Transport plugin development guide |
 | `CLAUDE.md` | AI assistant instructions |
 

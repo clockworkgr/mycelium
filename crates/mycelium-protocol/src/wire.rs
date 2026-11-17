@@ -20,6 +20,8 @@ pub enum WirePayloadType {
     AodvRerr = 0x32,
     DtnRelay = 0x40,
     Beacon = 0x50,
+    GroupProofChallenge = 0x51,
+    GroupProofResponse = 0x52,
     Receipt = 0x60,
     GroupMessage = 0x70,
     SenderKeyDistribution = 0x71,
@@ -43,6 +45,8 @@ impl WirePayloadType {
             0x32 => Some(Self::AodvRerr),
             0x40 => Some(Self::DtnRelay),
             0x50 => Some(Self::Beacon),
+            0x51 => Some(Self::GroupProofChallenge),
+            0x52 => Some(Self::GroupProofResponse),
             0x60 => Some(Self::Receipt),
             0x70 => Some(Self::GroupMessage),
             0x71 => Some(Self::SenderKeyDistribution),
@@ -834,6 +838,89 @@ pub fn deserialize_sender_key_distribution(
     })
 }
 
+/// A demand that a peer prove it holds the group key its beacon hinted at
+/// (ADR-019).
+///
+/// The hint is public — anyone in radio range can copy one out of a beacon —
+/// so a match grants nothing until this is answered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupProofChallengePayload {
+    /// The beacon hint being challenged, so a node holding a different group
+    /// key can tell it is not the one being asked.
+    pub group_hint: [u8; 8],
+    /// Fresh per attempt, which is what makes a captured answer worthless.
+    pub nonce: [u8; 32],
+}
+
+impl GroupProofChallengePayload {
+    /// Body length after the type byte.
+    pub const BODY_SIZE: usize = 40;
+
+    /// Layout: type(1=0x51) + group_hint(8) + nonce(32)
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + Self::BODY_SIZE);
+        buf.push(WirePayloadType::GroupProofChallenge as u8);
+        buf.extend_from_slice(&self.group_hint);
+        buf.extend_from_slice(&self.nonce);
+        buf
+    }
+
+    /// Parse a challenge body (after the type byte).
+    ///
+    /// Exact length, not a minimum: nothing is appended to this payload today,
+    /// and a body with bytes to spare is a body somebody else wrote.
+    pub fn deserialize_body(data: &[u8]) -> Result<Self, CodecError> {
+        if data.len() != Self::BODY_SIZE {
+            return Err(CodecError::BufferTooShort {
+                expected: Self::BODY_SIZE,
+                actual: data.len(),
+            });
+        }
+        let mut group_hint = [0u8; 8];
+        group_hint.copy_from_slice(&data[0..8]);
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&data[8..40]);
+        Ok(Self { group_hint, nonce })
+    }
+}
+
+/// The answer to a [`GroupProofChallengePayload`]: `HMAC(proof_key, nonce ‖
+/// verifier ‖ responder)` (ADR-019).
+///
+/// It carries neither id, because neither is the sender's to assert: each side
+/// supplies both from its own view of who it is talking to, which is what
+/// keeps an answer inside the one pairing it was made for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupProofResponsePayload {
+    pub mac: [u8; 32],
+}
+
+impl GroupProofResponsePayload {
+    /// Body length after the type byte.
+    pub const BODY_SIZE: usize = 32;
+
+    /// Layout: type(1=0x52) + mac(32)
+    pub fn serialize(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + Self::BODY_SIZE);
+        buf.push(WirePayloadType::GroupProofResponse as u8);
+        buf.extend_from_slice(&self.mac);
+        buf
+    }
+
+    /// Parse a response body (after the type byte). Exact length, as above.
+    pub fn deserialize_body(data: &[u8]) -> Result<Self, CodecError> {
+        if data.len() != Self::BODY_SIZE {
+            return Err(CodecError::BufferTooShort {
+                expected: Self::BODY_SIZE,
+                actual: data.len(),
+            });
+        }
+        let mut mac = [0u8; 32];
+        mac.copy_from_slice(data);
+        Ok(Self { mac })
+    }
+}
+
 /// Receipt type for delivery/read receipts.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1515,6 +1602,14 @@ mod tests {
             Some(WirePayloadType::Beacon)
         );
         assert_eq!(
+            WirePayloadType::from_byte(0x51),
+            Some(WirePayloadType::GroupProofChallenge)
+        );
+        assert_eq!(
+            WirePayloadType::from_byte(0x52),
+            Some(WirePayloadType::GroupProofResponse)
+        );
+        assert_eq!(
             WirePayloadType::from_byte(0x60),
             Some(WirePayloadType::Receipt)
         );
@@ -1547,6 +1642,46 @@ mod tests {
             Some(WirePayloadType::EmergencyBroadcast)
         );
         assert_eq!(WirePayloadType::from_byte(0xFF), None);
+    }
+
+    #[test]
+    fn test_group_proof_challenge_roundtrip() {
+        let payload = GroupProofChallengePayload {
+            group_hint: [0xAB; 8],
+            nonce: [0xCD; 32],
+        };
+        let bytes = payload.serialize();
+        assert_eq!(bytes[0], WirePayloadType::GroupProofChallenge as u8);
+        assert_eq!(bytes.len(), 1 + GroupProofChallengePayload::BODY_SIZE);
+        assert_eq!(
+            GroupProofChallengePayload::deserialize_body(&bytes[1..]).unwrap(),
+            payload
+        );
+
+        // Neither a short body nor a padded one is this payload.
+        assert!(GroupProofChallengePayload::deserialize_body(&bytes[1..bytes.len() - 1]).is_err());
+        let mut padded = bytes[1..].to_vec();
+        padded.push(0);
+        assert!(GroupProofChallengePayload::deserialize_body(&padded).is_err());
+        assert!(GroupProofChallengePayload::deserialize_body(&[]).is_err());
+    }
+
+    #[test]
+    fn test_group_proof_response_roundtrip() {
+        let payload = GroupProofResponsePayload { mac: [0xEF; 32] };
+        let bytes = payload.serialize();
+        assert_eq!(bytes[0], WirePayloadType::GroupProofResponse as u8);
+        assert_eq!(bytes.len(), 1 + GroupProofResponsePayload::BODY_SIZE);
+        assert_eq!(
+            GroupProofResponsePayload::deserialize_body(&bytes[1..]).unwrap(),
+            payload
+        );
+
+        assert!(GroupProofResponsePayload::deserialize_body(&bytes[1..bytes.len() - 1]).is_err());
+        let mut padded = bytes[1..].to_vec();
+        padded.push(0);
+        assert!(GroupProofResponsePayload::deserialize_body(&padded).is_err());
+        assert!(GroupProofResponsePayload::deserialize_body(&[]).is_err());
     }
 
     #[test]

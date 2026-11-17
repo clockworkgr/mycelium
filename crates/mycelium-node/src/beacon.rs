@@ -14,7 +14,10 @@ pub struct Beacon {
     pub battery_level: u8,
     pub neighbor_count: u16,
     pub lamport_clock: u64,
-    /// Truncated hash of group discovery key for auto-trust matching.
+    /// `SHA-256(group key)[..8]`: a hint that this node is in that group.
+    ///
+    /// Public and static, so it is a hint and nothing more — a match earns a
+    /// challenge, and the vouch waits for the answer (§10.2, ADR-019).
     pub group_discovery_hash: Option<[u8; 8]>,
 }
 

@@ -25,9 +25,9 @@ Then, as needed:
 3. [`CONTRIBUTING.md`](CONTRIBUTING.md) — build setup, test commands, project
    structure, commit conventions.
 4. [`docs/adr/`](docs/adr/) — Architecture Decision Records (ADR-001 …
-   ADR-022). Append-only; never rewrite one. ADR-017 … ADR-021 are decided but
-   not yet implemented — one per open P0 — and each names its ROADMAP task and
-   flips its own status in the commit that implements it.
+   ADR-023). Append-only; never rewrite one. ADR-017 and ADR-020 are decided
+   but not yet implemented — one per open P0 — and each names its ROADMAP task
+   and flips its own status in the commit that implements it.
 5. [`docs/plugin-api.md`](docs/plugin-api.md) — transport plugin development
    guide (external audience).
 
@@ -66,7 +66,7 @@ default.
 
 ### Running tests
 
-- `cargo test` runs the whole workspace (currently 612 tests).
+- `cargo test` runs the whole workspace (currently 649 tests).
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -214,7 +214,7 @@ detail matters.
 ### Wire format (spec §4)
 
 - 106-byte envelope header + variable payload, little-endian throughout.
-- 17 payload types. `SenderKeyDistribution` (`0x71`) is valid only inside a
+- 20 payload types. `SenderKeyDistribution` (`0x71`) is valid only inside a
   pairwise-encrypted `SYSTEM` message, never top-level (ADR-007).
 - `DtnRelay` (`0x40`) carries `copies_remaining` + `ttl_secs` so relays spray
   onward and honour the end-to-end TTL (ADR-005).
@@ -274,6 +274,25 @@ detail matters.
 - Outbox polling: Dart polls the Rust `VecDeque` every 50 ms over FFI, and
   polls a link-directive queue beside it (`established` / `close`).
 
+### Group discovery (spec §10.2)
+
+- A group key yields two values and the key itself is dropped: the beacon hint
+  `SHA-256(key)[..8]`, and the MAC key `HKDF(key, "MyceliumGroupProof")`. They
+  are taken as a pair (`GroupProofCtx::group`), never one without the other.
+- A matching hint earns a challenge, never a vouch. The vouch waits for
+  `HMAC(proof_key, nonce ‖ verifier ‖ responder)`, and **both ids come from
+  each side's own view of the link, never from the payload** — that is what
+  makes answering a stranger's challenge safe (ADR-019).
+- `GroupProofChallenge` (`0x51`) and `GroupProofResponse` (`0x52`) are
+  link-local: `ttl = 1`, refused unless `envelope.source` is the transport peer
+  and the destination is this node. A broadcast challenge is refused.
+- One guess per nonce (30 s), one attempt per peer per 120 s, 256 outstanding
+  at most — and at capacity the table refuses rather than evicting a live
+  challenge. A fourth rate-limit book bounds the exchange at 30 messages an
+  hour per peer, flat, because this path runs before any trust exists.
+- `config.group_seed` is a 32-byte hex **key**, not a passphrase, and nothing
+  derives one from a phrase yet: the app never joins a group at all (T-51).
+
 ## Crate Dependency Order
 
 ```
@@ -296,10 +315,11 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-16: 612 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-17: 649 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
-- 10 Rust crates (~26.6k lines), 49 Dart files / 14 screens.
+- 10 Rust crates (32.1k lines of `src` outside the test modules), 49 Dart
+  files / 14 screens.
 - Local API: 38 REST endpoints (31 paths, 9 modules) + WebSocket with 7 event
   types, bearer token at `<data_dir>/api.token` (ADR-006).
 - Everything in the v0.1 scope is implemented. What remains is hardening of
@@ -309,9 +329,12 @@ clean, `flutter analyze` clean.
   Do not re-derive the list from the code; update it as tasks land.
 
 The highest-priority open items (all P0, all defects in shipped features):
-group-discovery proof of possession (`T-04`), emergency co-signer signatures
-(`T-05`, wire format and verification landed; collecting co-signatures is not
-built), identity key at rest (`T-08`).
+Wi-Fi Direct's native socket count leaking in both directions, which disables
+the transport until the service restarts (`T-56`), the app never joining a
+group at all (`T-51` — the seed-phrase screen stores the phrase locally and
+nothing reads it), emergency co-signer signatures (`T-05`, wire format and
+verification landed; collecting co-signatures is not built), identity key at
+rest (`T-08`).
 
 Landed: T-36 on 2026-11-12 (ADR-013); T-37, T-39 and T-35 on 2026-11-14
 (ADR-014, ADR-022, ADR-015); T-38 on 2026-11-15 (ADR-016) — persisted DHT
@@ -325,6 +348,11 @@ names that are not unique across a reconnection; T-01 on 2026-11-16
 re-entrancy, the node handle is reference-counted and
 `mycelium_set_node_display_name` renames the running node, with `T-49` for the
 rename not surviving a restart.
+T-04 on 2026-11-17 (ADR-019) — a beacon's group hint earns a challenge rather
+than a vouch, and the vouch waits for `HMAC(proof_key, nonce ‖ verifier ‖
+responder)`, with `T-51` for the app path that never advertises a hint in the
+first place, `T-52` for the unstretched passphrase derivation behind it and
+`T-53` for vouches being stored unsigned.
 `T-40` collects four LoRa defects found reviewing
 ADR-008 against the code. `T-41` and `T-42` are what T-35 left behind — the
 unconfirmed-handshake record is in memory, so a restart loses both the sweep

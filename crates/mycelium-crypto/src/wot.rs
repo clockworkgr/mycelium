@@ -195,6 +195,17 @@ impl TrustGraph {
         TrustScore::NONE
     }
 
+    /// Whether `voucher` has vouched for `vouchee` directly.
+    ///
+    /// Asked on the beacon path, where a vouch already held is the reason not
+    /// to challenge a peer again (ADR-019): the answer must not depend on a
+    /// path through anyone else, and must not allocate once per beacon.
+    pub fn has_vouched(&self, voucher: &NodeId, vouchee: &NodeId) -> bool {
+        self.vouches
+            .get(voucher)
+            .is_some_and(|set| set.contains(vouchee))
+    }
+
     /// Get all nodes directly vouched by a given node.
     pub fn vouched_by_node(&self, node: &NodeId) -> Vec<NodeId> {
         self.vouches
@@ -460,5 +471,27 @@ mod tests {
         let mut vouched = graph.vouched_by_node(&a);
         vouched.sort_by_key(|n| n.0);
         assert_eq!(vouched.len(), 2);
+    }
+
+    /// A direct vouch, not a trust path: `a` reaches `c` through `b`, and
+    /// still has not vouched for it.
+    #[test]
+    fn test_has_vouched_is_the_direct_edge_only() {
+        let mut graph = TrustGraph::new();
+        let a = make_node(1);
+        let b = make_node(2);
+        let c = make_node(3);
+        graph.add_vouch(a, b);
+        graph.add_vouch(b, c);
+
+        assert!(graph.has_vouched(&a, &b));
+        assert!(!graph.has_vouched(&a, &c));
+        assert!(graph.trust_score(&a, &c).value > 0.0);
+        // Directed: being vouched for is not vouching.
+        assert!(!graph.has_vouched(&b, &a));
+        assert!(!graph.has_vouched(&c, &a));
+
+        graph.remove_vouch(&a, &b);
+        assert!(!graph.has_vouched(&a, &b));
     }
 }

@@ -839,6 +839,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hkdf",
+ "hmac",
  "mycelium-protocol",
  "proptest",
  "rand 0.8.5",

@@ -398,3 +398,25 @@ The reassembly bound is unchanged; what changed is how much of it is payload.
 10. **BT Classic and LoRa still install an asserted id.** The same defect, one
     in the same shape and one that needs a different design, recorded as
     ROADMAP T-47.
+
+## Note (2026-11-17, from T-04's review): the link bound is not kept
+
+This record has Rust decide authentication and the bridges own their sockets,
+with concurrent native links bounded in the bridge. The Android Wi-Fi Direct
+bridge does not keep that bound, in two ways that pull in opposite directions.
+
+A slot counted at the accept is never released when the address is one Rust
+recently refused: `handleClient` returns before its `try`, so the `finally`
+that would release it does not run (`WifiDirectService.kt:510`). Sixteen
+attempts from a refused address exhaust the bound for the life of the service,
+and every later socket from any peer is closed on arrival.
+
+The other way, `stop()` sets the counter to zero while reader threads are
+still unwinding (`WifiDirectService.kt:236`); their `finally` then decrements
+past zero, so a restarted service admits more than sixteen. Neither cancels
+the other reliably.
+
+The refusal window and the bound both arrived with this ADR, so these are its
+defects rather than later ones. ROADMAP T-56 carries both; nothing in this
+record's reasoning changes, only the claim that the bridge honours it.
+

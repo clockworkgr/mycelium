@@ -445,3 +445,20 @@ Three more claims here are superseded by ADR-014's per-level work.
   malformed packets naming an originator silence its genuine alert. For the
   same reason the claimed-origin accounting for relayed user data now has its
   own book too, separate from the per-peer one.
+
+## Note (2026-11-17, from T-04): one mechanism in the reasoning above is gone
+
+This record twice explains why a 1-hop neighbour is the cheapest attacker by
+pointing at the group-discovery hash: "automatically because its beacon carried
+a group-discovery hash matching ours, which anyone in range can copy (ROADMAP
+T-04)". That is no longer how a beacon earns a vouch. T-04 landed ADR-019: a
+matching hint earns a challenge, and the vouch waits for
+`HMAC(proof_key, nonce ‖ verifier ‖ responder)`. Copying the hint out of a
+beacon now earns nothing.
+
+The conclusion the passage was built on is unaffected — a peer 1 hop away
+clears every threshold here and is in the tier the rate limiter does not bound
+— and the hint is still what starts that path. Only the price went up: it now
+costs the group key rather than eight bytes overheard once. Both references to
+ROADMAP T-04 should be read as references to ADR-019.
+

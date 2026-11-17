@@ -354,9 +354,9 @@ impl FloodDedup {
 /// get accepted, and the entry pushed out need not be of that level. Level 1
 /// needs only a trust score over `envelope.source`, which nothing
 /// authenticates (ROADMAP T-37); a peer already 1 hop away — vouched by hand,
-/// or auto-vouched because its beacon carried a group-discovery hash matching
-/// ours — clears every threshold and is in the tier the rate limiter does not
-/// bound at all. Ten thousand junk level-1 alerts would then evict the entry
+/// or by proving it holds the group key its beacon hinted at (ADR-019) —
+/// clears every threshold and is in the tier the rate limiter does not bound
+/// at all. Ten thousand junk level-1 alerts would then evict the entry
 /// holding a captured level-3 alert shut, and the capture could be flooded
 /// again inside its validity window.
 ///

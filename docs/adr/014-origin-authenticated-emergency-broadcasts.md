@@ -387,3 +387,42 @@ narrowest registered transport's message bound, and the API returns 400 — the
 originator learns rather than the mesh truncating silently. The co-signer entry
 is still 96 bytes, and shrinking it stays an independent option (ADR-022's
 alternatives) rather than something this record needs.
+
+## Note (2026-11-17, from T-04): the cheap vouch it names, and a fourth book
+
+Two things this record describes have moved.
+
+**The vouch.** "A vouched one (by hand, or auto-vouched because its beacon
+carried a matching group-discovery hash, which anyone in range can copy —
+ROADMAP T-04) sits in a tier with no bound at all." T-04 landed ADR-019, and a
+matching hint now earns a challenge rather than a vouch: the peer must answer
+`HMAC(proof_key, nonce ‖ verifier ‖ responder)`. The unbounded tier is still
+there and still reachable by being vouched — the point the passage was making —
+but the cheap way in is closed. Read ROADMAP T-04 here as ADR-019.
+
+**The size bound, from ADR-021 rather than from T-04.** The 2026-11-14 note
+above says a BLE message bounds an alert at 4096 bytes. That has been wrong
+since T-34: sealing a local link costs 61 bytes of counter, `MeshData` header
+and AEAD tag, so BLE's message MTU is **4035** and `raise_emergency` refuses
+anything larger (ADR-021, spec §8.4). An alert of 4036–4096 bytes is refused,
+not carried. Spec §9.5 said 4096 too and now says 4035.
+
+**The third outbox rule is narrower than it reads.** "A full outbox **refuses**
+ordinary traffic rather than evicting an alert to fit it" is true about alerts
+and silent about the rest: `PriorityOutbox::push_batch` lets ordinary traffic
+make room from *ordinary* traffic, dropping the oldest of it, and refuses only
+when ordinary frames alone cannot free enough — which is to say, only when an
+alert would otherwise have to go. The invariant worth stating is the one the
+code enforces: nothing but a larger alert batch ever evicts an alert, and a
+batch bigger than the whole outbox is refused whatever its priority. Spec §9.5
+now says that.
+
+**The books.** This record's closing argument for keeping the rate-limit books
+apart ("the books stay apart and §12 says so") was written when there were
+three. There are four: ADR-019 added a per-peer book for the group-proof
+exchange, flat at 30 messages an hour and independent of trust, because that
+exchange is the one ingress path whose purpose is to run before any trust
+exists — the unknown-peer tier would spend a real member's allowance before it
+could prove anything. The reasoning for separation is the same reasoning as
+here, applied once more, and spec §12 lists all four.
+

@@ -9,6 +9,7 @@ ed25519-dalek = { workspace = true }
 x25519-dalek = { workspace = true }
 curve25519-dalek = { workspace = true }
 hkdf = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }

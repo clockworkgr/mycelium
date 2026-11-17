@@ -1,6 +1,6 @@
 # Mycelium Roadmap
 
-**Last updated:** 2026-11-16 · **Current version:** 0.1 (pre-release)
+**Last updated:** 2026-11-17 · **Current version:** 0.1 (pre-release)
 
 The companion document is [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md), which
 specifies the protocol and describes what is built. This document tracks only
@@ -9,20 +9,25 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-16 against the working tree, after T-01's guarded FFI
-boundary:
+Verified on 2026-11-17 against the working tree, after T-04's group-discovery
+challenge:
 
 | Check | Result |
 |-------|--------|
-| `cargo test --workspace --all-targets` | **612 passed, 0 failed** |
+| `cargo test --workspace --all-targets` | **649 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
 | `./gradlew :app:compileDebugKotlin` + `flutter build apk --debug` | **builds**, FFI packaged for all three ABIs |
 | `swiftc -typecheck` of the iOS `Runner` module | **clean** |
 
-10 Rust crates (~26.6k lines), 49 Dart files, 38 REST endpoints + 7 WebSocket
-event types, 64 FFI functions, 17 wire payload types, 13 database tables.
+10 Rust crates (32.1k lines of `src` outside the test modules, 14.5k inside
+them, measured 2026-11-17 — the "~26.6k" carried here before was stale), 49
+Dart files, 38 REST endpoints + 7 WebSocket event types, 64 FFI functions, 20
+wire payload types, 13 database tables.
+
+The Kotlin, Swift and APK rows above are from 2026-11-16: T-04 changes no FFI
+function, no platform bridge and no Dart, so they were not re-run.
 
 Everything specified for v0.1 is implemented except the items below. The
 remaining work is concentrated in three places: **protocol hardening of
@@ -60,6 +65,14 @@ no longer depends on still holding the record; wildcard addresses refused in
 common admission; a per-peer share of the record store — ADR-016). What it left
 behind is T-44.
 
+**Landed 2026-11-17:** T-04 (a beacon's group hint earns a challenge, not a
+vouch: the peer must return `HMAC(proof_key, nonce ‖ verifier ‖ responder)`
+over a nonce valid for 30 s, both ids taken from each side's own view, one
+guess per nonce, link-local, in a rate-limit book of its own — ADR-019). The
+hint itself is unchanged, as ADR-019 decided. What it left behind is T-51,
+T-52 and T-53, and what it uncovered on the way is that the app never joins a
+group at all (T-51): the exchange is live only on the daemon path.
+
 **Landed 2026-11-16:** T-34 (BLE and Wi-Fi Direct prove peer identity instead
 of asserting it: ADR-011's handshake runs over their fragmentation layer, the
 NodeId is derived from the key the peer signed, and the two characteristics and
@@ -81,50 +94,101 @@ emergency broadcast's origin is not authenticated at all; and T-38 is how
 capacity eviction undoes the rollback protection ADR-011 claims.
 
 **Decided 2026-11-12.** Every P0 below has its design on record: T-14's row
-identity (ADR-017), T-04 (ADR-019) and T-08 (ADR-020). ADR-014, ADR-015,
-ADR-016, ADR-018 and ADR-021 have been implemented (T-37, T-35, T-38, T-01,
-T-34), the last of them alongside ADR-023. Each ADR names the task that
-implements it and flips its own status in that commit; the acceptance criteria
-below carry the decisions.
+identity (ADR-017) and T-08 (ADR-020). ADR-014, ADR-015, ADR-016, ADR-018,
+ADR-019 and ADR-021 have been implemented (T-37, T-35, T-38, T-01, T-04,
+T-34), ADR-018 alongside ADR-023. Each ADR names the task that implements it
+and flips its own status in that commit; the acceptance criteria below carry
+the decisions.
 
-T-37, T-35, T-38, T-34 and T-01 have landed in that order. T-14's migration is
-next by the same reasoning — severity — and the remaining two (T-04, T-08) are
-designed but unsequenced.
+T-37, T-35, T-38, T-34, T-01 and T-04 have landed in that order. T-14's
+migration is next by the same reasoning — severity — and T-08 is designed but
+unsequenced.
 
 Two standing rules from those decisions: constants are **shapes now, numbers
 later** — the DHT publisher quota, the level-1/2 reach limits and the dedup
 retention period are to be measured against the testbed (T-19) or hardware
 (T-15), not guessed — T-38 added four more to that list (`mark_capacity` 8192,
 `mark_first_seen_reserve` 512, `mark_retention_grace_secs` 86 400 and
-`max_records_per_peer` 256, each with its basis in ADR-016's 2026-11-15 note);
+`max_records_per_peer` 256, each with its basis in ADR-016's 2026-11-15 note),
+and T-04 four more (`PROOF_TTL` 30 s, `PROOF_RETRY_AFTER` 120 s,
+`MAX_PENDING_PROOFS` 256 and `PROOF_MESSAGES_PER_HOUR` 30 — reasoned from the
+beacon interval and from what one HMAC costs, measured against neither, and
+the first two are what a flaky radio will argue with first);
 and the radio features keep "Implemented, untested on hardware" until T-15's
 report, however complete the software tests are — which is why BLE and Wi-Fi
 Direct carry that marker now that T-34 has landed, rather than a better one.
 
-### T-04 · Group-discovery proof of possession
+### T-56 · Wi-Fi Direct's native socket count leaks both ways
 
-**Area:** `mycelium-crypto`, `mycelium-node` · **Spec:** §10.2 · **ADR-019**
-(design decided 2026-11-12)
+**Area:** Android Kotlin · **Spec:** §17.3 · **ADR-021**
 
-The seed-phrase group hash is 8 cleartext bytes in a beacon, and matching it
-earns an automatic vouch. Anyone who overhears one beacon can replay the hash
-and be auto-trusted by the whole group — which collapses the Sybil defence
-(§6.2) for exactly the population that onboarding is meant to protect.
+`WifiDirectService` bounds concurrent native links at `MAX_NATIVE_LINKS = 16`
+with one `AtomicInteger`. Two paths get its accounting wrong, in opposite
+directions.
 
-**Acceptance** (design per ADR-019):
-- A beacon match is a hint, not a credential. The verifier sends a fresh nonce
-  and the peer must return
-  `HMAC(group_discovery_key, nonce ‖ verifier_id ‖ responder_id)`; the vouch
-  happens only on a correct response. Both ids are in the MAC so a response
-  cannot be lifted into another pairing.
-- The beacon hash itself stays static — a rotating hint would not prove
-  possession and adds a bucket constant and a clock to agree on.
-- Two new payload types, each rate-limited per peer, since answering a
-  challenge is work a stranger can ask for.
-- The group key's two uses (discovery hash, challenge MAC) are
-  domain-separated.
-- Test: a node that knows only a captured hash fails the exchange; a node with
-  the passphrase succeeds.
+1. **The refusal path never releases.** Both paths that take a socket
+   increment the counter and then call `handleClient(socket, counted = true)`,
+   which releases it in a `finally`. `handleClient` returns early — *before*
+   that `try` — when the address is one the node recently refused
+   (`WifiDirectService.kt:510`), so the slot is never given back. Sixteen
+   attempts from a refused address exhaust the transport for the life of the
+   service: every later socket, from any peer, is closed as soon as it is
+   accepted. Getting refused is the easy part — fail the handshake once — and
+   sixteen reconnections inside the refusal window finish the job, so a
+   neighbour can do this deliberately, and a legitimate peer that fails the
+   handshake and retries with backoff can do it by accident.
+2. **`stop()` resets the count under live readers.** `stop()` closes the
+   sockets and sets the counter to zero (`WifiDirectService.kt:236`), but each
+   reader thread is still unwinding; its `finally` then decrements a counter
+   that is already zero, leaving it negative by however many readers were
+   alive. A service restarted after that admits 16 *plus* that many sockets.
+
+Neither cancels the other reliably — they depend on different peer behaviour —
+and nothing but a process restart puts the count right. Found while reviewing
+T-04; both belong to the T-34 work (ADR-021), which is where the bound and the
+refusal window came from.
+
+**Acceptance:**
+- Every path that increments `nativeSockets` releases it exactly once,
+  including the refusal path and anything else that returns before the `try`.
+- Stopping and restarting the service leaves the count at zero, whatever the
+  readers were doing — by draining counted readers before resetting, or by
+  making the accounting per service generation so a late `finally` cannot
+  touch the new one.
+- Repeated connections from a refused address leave the capacity unchanged.
+- `./gradlew :app:compileDebugKotlin` and the debug APK still build; the
+  bridge has no unit tests, so say plainly what was verified and what was not.
+
+### T-51 · The app never joins a group
+
+**Area:** `mycelium-ffi`, Flutter · **Spec:** §10.2, §10.3, §17.4
+
+The seed-phrase onboarding screen is a screen and nothing more.
+`seed_phrase_screen.dart` writes the phrase to `SharedPreferences`, and
+`mycelium_node_new` takes a data directory and a display name — there is no
+parameter for a group. So `NodeConfig::group_seed` is `None` on every app
+start, no hint is advertised, no beacon ever matches, and T-04's exchange
+never runs outside a daemon that was configured by hand. A user who types
+their community's phrase is told they have joined and has not.
+
+`derive_group_discovery_key` has no caller in the tree either: the config
+takes the 32-byte key as hex, not the phrase, so even the daemon path expects
+somebody to have run the derivation elsewhere.
+
+**Acceptance:**
+- A passphrase entered at onboarding reaches the node, and the node advertises
+  the hint derived from it — one exported function, the four FFI files, the
+  regenerated Dart bindings, and the screen that calls it.
+- The derivation happens in one place that both the app and the daemon use.
+  The daemon keeps accepting a hex key; a phrase and a key are distinguishable
+  config, not the same field read two ways.
+- Changing the passphrase, or clearing it, takes effect without reinstalling —
+  and note that the running node derives the hint at construction, so this is
+  a restart or a setter, not a config edit.
+- T-52 is settled first or in the same change: wiring a human passphrase to a
+  derivation that does not stretch it is what makes T-52 exploitable.
+- Test: a node built from a passphrase and one built from the matching hex key
+  advertise the same hint and vouch for each other.
 
 ### T-05 · Collect emergency level-3 co-signatures
 
@@ -365,10 +429,11 @@ Two related defects, found while fixing T-36:
    which scores the id in the packet rather than the peer that sent it, and is
    flooded onward. The sender needs no standing of its own — an unvouched
    stranger gets five messages an hour from the per-neighbour limit, which is
-   plenty for one alert. Being vouched (by hand, or auto-vouched because its
-   beacon carried a matching group-discovery hash, a hash anyone in range can
-   copy — T-04) removes the bound entirely. Level 3 is bound by its co-signatures, which cover
-   the originator, so this is levels 1 and 2. T-36 stopped a forgery
+   plenty for one alert. Being vouched removes the bound entirely — by hand, or
+   by proving possession of a group key, which since T-04 is the only way a
+   beacon can earn it (a matching hint used to be enough, and the hint is
+   eight bytes anyone in range can copy). Level 3 is bound by its
+   co-signatures, which cover the originator, so this is levels 1 and 2. T-36 stopped a forgery
    *suppressing* a real alert; it does not stop one being injected.
 2. **The levels do not differ in behaviour at all.** `handle_emergency_broadcast`
    floods any accepted broadcast to every peer, while spec §9.5 reserves
@@ -952,6 +1017,108 @@ only two of them change anything.
 
 ## P1 — v0.1 completeness
 
+### T-52 · A group passphrase is not stretched
+
+**Area:** `mycelium-crypto` · **Spec:** §5.6, §10.2 · **ADR-019**
+
+`derive_group_discovery_key` is one HKDF extract-and-expand over the
+passphrase bytes: no salt, no iterations, no memory cost. Every beacon
+publishes `SHA-256(key)[..8]` of the result, which is a free offline verifier
+for a guess. A human-memorable community phrase — which is what a *seed
+phrase* group is for — therefore falls to a dictionary run over eight bytes
+captured once, and the recovered key answers T-04's challenge correctly. The
+challenge cannot help: it proves possession of the key, and the attacker now
+has the key.
+
+P1 and not P0 only because no passphrase reaches a node today: the config
+takes a 32-byte hex key, which an operator generates rather than types
+(T-51). Wiring a phrase through without fixing this is what would make it
+exploitable, so it gates T-51.
+
+**Acceptance:**
+- A password hash — Argon2id, scrypt or PBKDF2 at a documented cost — stands
+  between the phrase and the key, with the parameters in §5.6 and the choice
+  in an ADR. Check the workspace dependencies before adding one.
+- The salt problem is answered explicitly: a group's members must derive the
+  same key from the same phrase, so the salt is a constant or derived from the
+  group name, and the ADR says which and what that costs against a rainbow
+  table.
+- Whether the beacon hint stays eight bytes is reconsidered in the same
+  breath: the shorter it is, the more phrases collide with it, and the cost of
+  a guess is what this task is about.
+- Test: the derivation takes a measured minimum time per attempt, and the
+  vector for a known phrase is pinned so the parameters cannot drift silently.
+
+### T-54 · A vouch the old group path granted survives the upgrade
+
+**Area:** `mycelium-node`, `mycelium-storage` · **Spec:** §10.2 · **ADR-019**
+
+Before T-04, a beacon whose group hint matched earned a vouch outright, and
+that vouch was persisted. `Node::new` reloads every stored vouch into the
+trust graph, so a peer admitted on a replayed hint is still trusted at 1 hop
+after the upgrade — and is never challenged, because `has_vouched` is exactly
+what stops this node challenging a peer it already vouches for. T-04 closed
+the door; it did not take back what went through it.
+
+The stored rows cannot be told apart. A hash-match vouch and one the user made
+in person are both unsigned and both name this node as the voucher (T-53), so
+"drop the unearned ones" has nothing to select on, and "drop the unsigned
+ones" is all of them. Automatic revocation on a failed challenge is worse than
+the problem: a member whose challenge is lost on a flaky radio would lose a
+vouch it had earned.
+
+Nothing in the tree ever sets `group_seed` (T-51), so the only database that
+can carry such a row is a daemon someone configured by hand — which is why
+this is P1 and not P0. Until it is done, the remedy is to delete the vouch
+row.
+
+**Acceptance:**
+- Vouches carry their provenance — in person, by API, by group proof — either
+  as a column or as the signature T-53 adds, and a row without it is treated
+  as what it is: unverified history, not a credential.
+- A node decides *once*, explicitly, what to do with pre-provenance rows, and
+  the decision is in an ADR rather than in a migration nobody reads.
+- A peer whose vouch did not come from a proof is challenged again when its
+  beacon claims the group, and the vouch stands or falls on the answer — with
+  silence left meaning "ask again later", never "revoke".
+- Test: a database carrying a hash-match vouch, opened by the new code, does
+  not leave that peer trusted without a fresh proof.
+
+### T-55 · A reverse route is learned from an unauthenticated source
+
+**Area:** `mycelium-node`, `mycelium-core` · **Spec:** §7.1, §14.3
+
+The ingress path learns a route from every envelope it receives, not just from
+AODV messages: when `envelope.source` is neither the sending peer nor this
+node and `hop_count > 0`, a route to that source is installed via that peer.
+`envelope.source` is cleartext and nothing authenticates it, so a neighbour
+can name any id — one it does not hold, one that is not even on the mesh — and
+have this node route traffic for that id to it, where it can be dropped.
+
+Bounded, but not harmless. The claimed hop count is at least 2, so a live
+direct link always wins; an id with no valid route, or one reachable only
+through a longer learned path, does not. Content is end-to-end encrypted, so
+this is traffic denial rather than disclosure — and it is cheap: the route is
+installed at `node.rs:2469`, before the payload type is even parsed, so no
+rate limiter has been consulted yet whatever the type. One packet per id.
+
+Found while reviewing T-04. It is not specific to the group-proof exchange —
+every payload type reaches this code, and the proof types are the two that
+cannot be used for it, since both are refused unless their source is the
+sending peer. Checking the source earlier for *those two* would fix nothing:
+an attacker would send a receipt instead.
+
+**Acceptance:**
+- A route is learned only from a source the node has grounds to believe: an
+  AODV message whose own rules cover it, a packet whose source is the peer
+  that delivered it, or a source proved some other way. The decision goes in
+  an ADR, because "which packets may teach us routing" is a protocol rule and
+  the answer affects every payload type.
+- Whatever the rule, a 1-hop link proved at the transport layer (ADR-021)
+  stays the authority on its own peer.
+- Test: a packet carrying a forged source leaves the routing table unchanged,
+  and the legitimate route for that id still decides where its traffic goes.
+
 ### T-02 · Mobile platform gaps
 
 **Area:** Android Kotlin, Flutter · **Spec:** §17.3
@@ -1139,6 +1306,32 @@ any commit.
 ---
 
 ## P2 — v0.2
+
+### T-53 · Local vouches are stored unsigned
+
+**Area:** `mycelium-crypto`, `mycelium-node`, `mycelium-api` · **Spec:** §6.1
+
+`VouchRecord::signature` is empty everywhere one is written: the group-proof
+path (§10.2), `POST /v1/contacts/:id/vouch` and the FFI both store
+`Vec::new()`. `mycelium_crypto::wot::Vouch::create` and `Vouch::verify` — which
+sign and check `voucher_id ‖ vouchee_id ‖ timestamp` against the voucher's key
+— have no caller outside their own unit tests.
+
+Harmless today, because a vouch never leaves the node that made it: the trust
+graph is rebuilt from the local database, and nothing on the wire carries a
+vouch. It stops being harmless the moment trust is transitive across nodes,
+which is what §6.1's web of trust is for — an unsigned vouch is one any node
+could invent on another's behalf, and a stored one has no way to prove which
+key made it.
+
+**Acceptance:**
+- Every vouch written is signed by the voucher's identity key, and the
+  signature is verified on load, with a stored vouch that fails verification
+  dropped rather than trusted.
+- Unsigned rows already in a database are migrated or discarded on an explicit
+  decision, not silently honoured.
+- Test: a vouch row whose signature does not match its voucher is not in the
+  trust graph after a reload.
 
 ### T-50 · A panic inside `Node::start` leaves it half-started
 

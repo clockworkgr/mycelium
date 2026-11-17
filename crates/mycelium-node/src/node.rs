@@ -14,6 +14,10 @@ use mycelium_core::routing::aodv::{
 use mycelium_core::routing::coordinator::{RoutingCoordinator, RoutingDecision};
 use mycelium_core::transport::manager::TransportManager;
 use mycelium_core::transport::{SendPriority, TransportError, TransportEvent};
+use mycelium_crypto::discovery::{
+    derive_group_proof_key, group_discovery_hint, group_proof_mac, verify_group_proof,
+    GROUP_NONCE_LEN,
+};
 use mycelium_crypto::double_ratchet::RatchetHeader;
 use mycelium_crypto::emergency::{
     BroadcastContext, EMERGENCY_MAX_CLOCK_SKEW_SECS, EMERGENCY_VALIDITY_SECS,
@@ -28,8 +32,8 @@ use mycelium_protocol::types::{
     ContentType, LamportClock, MessageFlags, MessageId, NodeId, NodeType, ProtocolVersion,
 };
 use mycelium_protocol::wire::{
-    self, EncryptedPayload, PrekeyBundlePayload, ReceiptType, SessionInitPayload, WirePayloadType,
-    WireRatchetHeader,
+    self, EncryptedPayload, GroupProofChallengePayload, GroupProofResponsePayload,
+    PrekeyBundlePayload, ReceiptType, SessionInitPayload, WirePayloadType, WireRatchetHeader,
 };
 use mycelium_storage::db::{Database, StorageError};
 use mycelium_storage::dtn::DtnBundleRecord;
@@ -40,6 +44,7 @@ use crate::battery::BatteryManager;
 use crate::config::NodeConfig;
 use crate::events::NodeEvent;
 use crate::flood_dedup::{channel_flood_key, EmergencyDedup, FloodCopy, FloodDedup, FloodMark};
+use crate::group_proof::{PendingProofs, PROOF_MESSAGES_PER_HOUR};
 use crate::rate_limiter::RateLimiter;
 
 /// Errors from high-level node operations.
@@ -339,6 +344,19 @@ pub struct Node {
     key_sent_to: Arc<RwLock<HashMap<[u8; 32], HashSet<NodeId>>>>,
     /// Truncated hash of local group discovery key for beacon matching.
     pub local_group_hash: Option<[u8; 8]>,
+    /// MAC key behind the group discovery key, derived once at construction.
+    ///
+    /// The hint above and this are everything the exchange needs, and they are
+    /// domain-separated from each other, so neither reveals the other
+    /// (ADR-019). The decoded group key is wiped after both are derived;
+    /// `config.group_seed` keeps the hex form, being the configuration.
+    group_proof_key: Option<[u8; 32]>,
+    /// Challenges we are waiting on answers to, per peer.
+    group_proofs: Arc<RwLock<PendingProofs>>,
+    /// Per-peer budget for the proof exchange. Its own book: the work is
+    /// asked for by peers no trust has been established with yet, which is
+    /// the one thing the trust-tiered books cannot price (ADR-019).
+    group_limits: Arc<RwLock<RateLimiter>>,
     /// The display name this node announces, which can change while it runs.
     ///
     /// `NodeConfig::display_name` is the configured *initial* value and nothing
@@ -370,6 +388,37 @@ pub struct EmergencyDraft {
     pub signed_at: u64,
     pub level: wire::EmergencyLevel,
     pub message: Vec<u8>,
+}
+
+/// Everything the group-discovery proof exchange needs (ADR-019).
+///
+/// One struct rather than four more parameters on handlers that already take
+/// twenty: a beacon, a challenge and a response all need the same four things,
+/// and they belong together — the hint says which group, the key answers for
+/// it, the table remembers what we asked, and the book bounds what we will do
+/// for a stranger.
+struct GroupProofCtx<'a> {
+    /// What our beacons advertise. `None` when this node is in no group, which
+    /// is when the whole exchange is off.
+    hint: Option<[u8; 8]>,
+    /// The MAC key behind that hint.
+    proof_key: Option<[u8; 32]>,
+    /// Nonces we are waiting on.
+    pending: &'a RwLock<PendingProofs>,
+    /// Per-peer budget for the exchange.
+    limits: &'a RwLock<RateLimiter>,
+}
+
+impl GroupProofCtx<'_> {
+    /// The hint and key together, or `None` when this node is in no group.
+    ///
+    /// Always taken as a pair: a hint without its key could challenge and
+    /// never check the answer, and a key without its hint could answer for a
+    /// group it does not advertise. They are set together or not at all, and
+    /// asking for both at once is what keeps that true at every use.
+    fn group(&self) -> Option<([u8; 8], [u8; 32])> {
+        Some((self.hint?, self.proof_key?))
+    }
 }
 
 /// Everything the send pipeline needs. Built from `&Node` for public
@@ -422,19 +471,24 @@ impl Node {
 
         let (event_tx, _) = tokio::sync::broadcast::channel(256);
 
-        // Compute local group discovery hash from config
-        let local_group_hash = config.group_seed.as_ref().and_then(|hex_str| {
-            let key_bytes = hex::decode(hex_str).ok()?;
-            if key_bytes.len() == 32 {
-                use sha2::{Digest, Sha256};
-                let hash = Sha256::digest(&key_bytes);
-                let mut truncated = [0u8; 8];
-                truncated.copy_from_slice(&hash[..8]);
-                Some(truncated)
-            } else {
-                None
-            }
+        // Two values come out of the group key and the node works from those:
+        // the hint its beacons carry and the MAC key behind it, neither of
+        // which can be turned back into the other (ADR-019). The decoded key
+        // is wiped once they are derived — though `config.group_seed` still
+        // holds it as hex, because that is the configuration, and on the
+        // daemon path it is sitting in a TOML file besides (ROADMAP T-08).
+        let mut group_key = config.group_seed.as_ref().and_then(|hex_str| {
+            let mut bytes = hex::decode(hex_str).ok()?;
+            let key: Option<[u8; 32]> = bytes.as_slice().try_into().ok();
+            bytes.zeroize();
+            key
         });
+        if config.group_seed.is_some() && group_key.is_none() {
+            warn!("group_seed is not a 32-byte hex key; group discovery is off");
+        }
+        let local_group_hash = group_key.as_ref().map(group_discovery_hint);
+        let group_proof_key = group_key.as_ref().map(derive_group_proof_key);
+        group_key.zeroize();
 
         let display_name = config.display_name.clone();
 
@@ -480,6 +534,9 @@ impl Node {
             ))),
             key_sent_to: Arc::new(RwLock::new(HashMap::new())),
             local_group_hash,
+            group_proof_key,
+            group_proofs: Arc::new(RwLock::new(PendingProofs::new())),
+            group_limits: Arc::new(RwLock::new(RateLimiter::new())),
             display_name: Arc::new(std::sync::RwLock::new(display_name)),
         }
     }
@@ -681,12 +738,21 @@ impl Node {
         let seen_emergency_broadcasts = self.seen_emergency_broadcasts.clone();
         let key_sent_to = self.key_sent_to.clone();
         let local_group_hash = self.local_group_hash;
+        let group_proof_key = self.group_proof_key;
+        let group_proofs = self.group_proofs.clone();
+        let group_limits = self.group_limits.clone();
         let cancel = self.cancel.clone();
         let node_id = self.node_id;
         let identity_bytes = self.identity.to_bytes();
 
         tokio::spawn(async move {
             let mut rx = transport_manager.events();
+            let group = GroupProofCtx {
+                hint: local_group_hash,
+                proof_key: group_proof_key,
+                pending: &group_proofs,
+                limits: &group_limits,
+            };
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
@@ -720,7 +786,7 @@ impl Node {
                                     &event_tx,
                                     &seen_channel_messages,
                                     &seen_emergency_broadcasts,
-                                    local_group_hash,
+                                    &group,
                                     &key_sent_to,
                                 ).await;
                             }
@@ -748,6 +814,8 @@ impl Node {
         let seen_emergency_m = self.seen_emergency_broadcasts.clone();
         let origin_limits_m = self.origin_limits.clone();
         let emergency_limits_m = self.emergency_limits.clone();
+        let group_limits_m = self.group_limits.clone();
+        let group_proofs_m = self.group_proofs.clone();
         let cancel_m = self.cancel.clone();
         let db_m = self.db.clone();
         let mut spk_rotation_counter: u32 = 0;
@@ -904,6 +972,17 @@ impl Node {
                         {
                             let mut rl = emergency_limits_m.write().await;
                             rl.cleanup();
+                        }
+                        // Same for the group-proof book and the challenges it
+                        // bounds: both are keyed by a peer that may never be
+                        // heard from again, and an attempt nobody can answer
+                        // any more is only taking up room (ADR-019).
+                        {
+                            let mut rl = group_limits_m.write().await;
+                            rl.cleanup();
+                        }
+                        {
+                            group_proofs_m.write().await.sweep_now();
                         }
 
                         // Expire prekey bundles older than 7 days
@@ -2180,7 +2259,7 @@ impl Node {
         event_tx: &tokio::sync::broadcast::Sender<NodeEvent>,
         seen_channel_messages: &RwLock<FloodDedup>,
         seen_emergency_broadcasts: &RwLock<EmergencyDedup>,
-        local_group_hash: Option<[u8; 8]>,
+        group: &GroupProofCtx<'_>,
         key_sent_to: &RwLock<HashMap<[u8; 32], HashSet<NodeId>>>,
     ) {
         let ctx = SendCtx {
@@ -2419,6 +2498,14 @@ impl Node {
                 // Exempt protocol messages (AODV, prekey, session init, DTN relay,
                 // beacon) from rate limiting — these are required for mesh
                 // infrastructure and establishing sessions with new peers.
+                //
+                // The group-proof exchange is exempt for a sharper reason: it
+                // runs before any trust exists, so the tier it would be
+                // charged on is the unknown-peer one — five messages an hour,
+                // shared with everything else that peer sends. A real member
+                // would be refused the chance to prove itself. It is bounded
+                // instead by a book of its own, charged inside the handlers
+                // along with the blacklist this exemption skips (ADR-019).
                 let is_protocol_message = matches!(
                     payload_type,
                     WirePayloadType::AodvRreq
@@ -2429,6 +2516,8 @@ impl Node {
                         | WirePayloadType::SessionInit
                         | WirePayloadType::Beacon
                         | WirePayloadType::DtnRelay
+                        | WirePayloadType::GroupProofChallenge
+                        | WirePayloadType::GroupProofResponse
                 );
 
                 if !is_protocol_message {
@@ -2481,6 +2570,35 @@ impl Node {
                 if is_flood && !is_broadcast {
                     debug!(
                         "{:?} from {} is addressed to {} rather than broadcast, dropping",
+                        payload_type, envelope.source, envelope.destination
+                    );
+                    return;
+                }
+
+                // Link-local traffic: a beacon and the two group-proof types
+                // are for whoever was handed them, and are never carried
+                // onward (§10.1, §10.2). Refused here rather than in the
+                // handlers, because the generic forwarder below sits between
+                // the two and would relay a unicast one — a single hop, but
+                // relayed on the protocol-message exemption, which is the
+                // very exemption that lets a beacon and this exchange run
+                // before any trust exists. Addressing a challenge past us
+                // would buy routing work from a peer that is over its budget
+                // or blacklisted outright (ADR-019).
+                //
+                // Broadcast is left to the handlers: it is how a beacon
+                // normally arrives, and a broadcast challenge has to be
+                // refused with the rest of the destination check rather than
+                // here, where a beacon would be refused with it.
+                let is_link_local = matches!(
+                    payload_type,
+                    WirePayloadType::Beacon
+                        | WirePayloadType::GroupProofChallenge
+                        | WirePayloadType::GroupProofResponse
+                );
+                if is_link_local && !is_broadcast && envelope.destination != local_id {
+                    debug!(
+                        "{:?} from {} is addressed to {} rather than to us, dropping",
                         payload_type, envelope.source, envelope.destination
                     );
                     return;
@@ -2725,7 +2843,35 @@ impl Node {
                             trust_graph,
                             routing,
                             local_id,
-                            local_group_hash,
+                            transport_manager,
+                            rate_limiter,
+                            group,
+                        )
+                        .await;
+                    }
+                    WirePayloadType::GroupProofChallenge => {
+                        Self::handle_group_proof_challenge(
+                            &envelope,
+                            *peer,
+                            body,
+                            group,
+                            rate_limiter,
+                            transport_manager,
+                            lamport_clock,
+                            local_id,
+                        )
+                        .await;
+                    }
+                    WirePayloadType::GroupProofResponse => {
+                        Self::handle_group_proof_response(
+                            &envelope,
+                            *peer,
+                            body,
+                            group,
+                            rate_limiter,
+                            trust_graph,
+                            db,
+                            local_id,
                             identity.public_key_bytes(),
                         )
                         .await;
@@ -4674,8 +4820,9 @@ impl Node {
         trust_graph: &RwLock<TrustGraph>,
         routing: &RwLock<RoutingCoordinator>,
         local_id: NodeId,
-        local_group_hash: Option<[u8; 8]>,
-        local_identity_key: [u8; 32],
+        transport_manager: &TransportManager,
+        rate_limiter: &RwLock<RateLimiter>,
+        group: &GroupProofCtx<'_>,
     ) {
         if envelope.source == local_id {
             return; // Ignore our own beacons
@@ -4691,7 +4838,8 @@ impl Node {
 
         // The beacon body names its node. It must be the node we actually
         // heard it from; otherwise any neighbor could rename other contacts,
-        // register arbitrary nodes as supernodes or redirect the auto-vouch.
+        // register arbitrary nodes as supernodes, or aim our group-membership
+        // challenge at a node that never claimed the group.
         if beacon.node_id != peer || envelope.source != peer {
             debug!(
                 "Beacon from {} claims node_id {} (envelope source {}), dropping",
@@ -4754,27 +4902,320 @@ impl Node {
 
         let _ = db.save_contact(&contact);
 
-        // Auto-trust peers with matching group discovery hash
-        if let (Some(local_hash), Some(peer_hash)) = (local_group_hash, beacon.group_discovery_hash)
-        {
-            if local_hash == peer_hash {
-                info!(
-                    "Group discovery match with {} — auto-vouching",
-                    beacon.node_id
-                );
-                let mut tg = trust_graph.write().await;
-                tg.add_vouch(local_id, beacon.node_id);
-                let vouch = mycelium_storage::vouches::VouchRecord {
-                    voucher_id: local_id,
-                    vouchee_id: beacon.node_id,
-                    voucher_public_key: local_identity_key.to_vec(),
-                    display_name: beacon.display_name.clone(),
-                    signature: Vec::new(), // Auto-vouch, no cryptographic sig
-                    timestamp: now_secs,
-                };
-                let _ = db.save_vouch(&vouch);
+        // A beacon hint is a hint, not a credential. It is eight public
+        // bytes anyone in range can copy out of one beacon, so the vouch it
+        // used to earn outright now waits for an answer to a challenge
+        // (ADR-019).
+        if let Some((local_hint, _)) = group.group() {
+            if beacon.group_discovery_hash == Some(local_hint) {
+                Self::challenge_group_membership(
+                    peer,
+                    group,
+                    trust_graph,
+                    rate_limiter,
+                    transport_manager,
+                    lamport_clock,
+                    local_id,
+                )
+                .await;
             }
         }
+    }
+
+    // --- Group discovery proof of possession (ADR-019) ---
+
+    /// Ask a peer whose beacon hinted at our group to prove it holds the key.
+    ///
+    /// Nothing is granted here and nothing is refused: a peer that cannot
+    /// answer simply never becomes vouched, and hears nothing that would tell
+    /// it whether it was close.
+    #[allow(clippy::too_many_arguments)]
+    async fn challenge_group_membership(
+        peer: NodeId,
+        group: &GroupProofCtx<'_>,
+        trust_graph: &RwLock<TrustGraph>,
+        rate_limiter: &RwLock<RateLimiter>,
+        transport_manager: &TransportManager,
+        lamport_clock: &RwLock<LamportClock>,
+        local_id: NodeId,
+    ) {
+        let Some((hint, _)) = group.group() else {
+            return;
+        };
+
+        // Already vouched for by us: the hint says nothing new, and a
+        // challenge per beacon would be a message every 10–30 s for as long
+        // as the peer is in range.
+        //
+        // Each guard is read into a local and released before the next line,
+        // here and below. Nothing in this path needs two of these locks at
+        // once, and a guard still held while the next one is taken — or while
+        // anything logs — is how a subscriber that reads node state turns a
+        // debug line into a deadlock (ADR-018).
+        let vouched = trust_graph.read().await.has_vouched(&local_id, &peer);
+        if vouched {
+            return;
+        }
+
+        // A peer the node has stopped doing work for does not get work done
+        // for it here either. Its next beacon after the hour is up starts the
+        // exchange again.
+        let blacklisted = rate_limiter.read().await.is_blacklisted(&peer);
+        if blacklisted {
+            return;
+        }
+
+        let mut nonce = [0u8; GROUP_NONCE_LEN];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+        // Recorded before it is sent, and only sent if it was recorded: an
+        // answer to a nonce we did not keep cannot be checked, and the same
+        // table is what refuses a second attempt inside the cooldown. A send
+        // that then fails keeps the cooldown, which is the right answer for a
+        // link that has just failed.
+        let opened = group.pending.write().await.open(peer, nonce);
+        if !opened {
+            return;
+        }
+
+        let payload = GroupProofChallengePayload {
+            group_hint: hint,
+            nonce,
+        }
+        .serialize();
+        Self::send_link_local(peer, payload, transport_manager, lamport_clock, local_id).await;
+        debug!("Challenged {} to prove group membership", peer);
+    }
+
+    /// Answer a challenge about the group this node advertises.
+    ///
+    /// Safe to answer for a stranger because of what the MAC covers: this
+    /// node's own id sits in the responder's place, and the id of the peer
+    /// that asked sits in the verifier's. Nothing can move either, so an
+    /// answer collected this way proves nothing in any other pairing —
+    /// which is the whole reason a challenge can be answered without first
+    /// deciding whether to trust the asker (ADR-019).
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_group_proof_challenge(
+        envelope: &Envelope,
+        peer: NodeId,
+        body: &[u8],
+        group: &GroupProofCtx<'_>,
+        rate_limiter: &RwLock<RateLimiter>,
+        transport_manager: &TransportManager,
+        lamport_clock: &RwLock<LamportClock>,
+        local_id: NodeId,
+    ) {
+        let Some((hint, proof_key)) = group.group() else {
+            return;
+        };
+        if !Self::is_link_local_group_proof(envelope, peer, local_id, "challenge") {
+            return;
+        }
+        if !Self::group_proof_work_allowed(peer, group, rate_limiter).await {
+            return;
+        }
+
+        let challenge = match GroupProofChallengePayload::deserialize_body(body) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("Bad group proof challenge from {}: {}", peer, e);
+                return;
+            }
+        };
+
+        // A challenge about a group this node is not in gets no answer: a MAC
+        // under a key the asker does not hold tells it nothing, and refusing
+        // is cheaper than computing one.
+        if challenge.group_hint != hint {
+            debug!("Group proof challenge from {} names another group", peer);
+            return;
+        }
+
+        let mac = group_proof_mac(&proof_key, &challenge.nonce, &peer, &local_id);
+        let payload = GroupProofResponsePayload { mac }.serialize();
+        Self::send_link_local(peer, payload, transport_manager, lamport_clock, local_id).await;
+        debug!("Answered group proof challenge from {}", peer);
+    }
+
+    /// Vouch for a peer that answered our challenge correctly.
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_group_proof_response(
+        envelope: &Envelope,
+        peer: NodeId,
+        body: &[u8],
+        group: &GroupProofCtx<'_>,
+        rate_limiter: &RwLock<RateLimiter>,
+        trust_graph: &RwLock<TrustGraph>,
+        db: &Database,
+        local_id: NodeId,
+        local_identity_key: [u8; 32],
+    ) {
+        let Some((_, proof_key)) = group.group() else {
+            return;
+        };
+        if !Self::is_link_local_group_proof(envelope, peer, local_id, "response") {
+            return;
+        }
+        if !Self::group_proof_work_allowed(peer, group, rate_limiter).await {
+            return;
+        }
+
+        let response = match GroupProofResponsePayload::deserialize_body(body) {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("Bad group proof response from {}: {}", peer, e);
+                return;
+            }
+        };
+
+        // The nonce is spent by this one answer, right or wrong: a peer that
+        // guesses does not get to guess again until the cooldown is up.
+        let outstanding = group.pending.write().await.answer(&peer);
+        let Some(nonce) = outstanding else {
+            debug!(
+                "Group proof response from {} answers nothing outstanding",
+                peer
+            );
+            return;
+        };
+
+        // Our id in the verifier's place, theirs in the responder's — the
+        // same way round the responder built it, and the one way round that
+        // cannot be lifted out of another pairing.
+        if !verify_group_proof(&proof_key, &nonce, &local_id, &peer, &response.mac) {
+            debug!("Group proof from {} does not verify — no vouch", peer);
+            return;
+        }
+
+        // The name the peer's own beacon put on its contact, which the beacon
+        // handler saved before this exchange began.
+        let display_name = db
+            .get_contact(&peer)
+            .map(|c| c.display_name)
+            .unwrap_or_default();
+        let vouch = mycelium_storage::vouches::VouchRecord {
+            voucher_id: local_id,
+            vouchee_id: peer,
+            voucher_public_key: local_identity_key.to_vec(),
+            display_name,
+            signature: Vec::new(), // Local vouches are not signed; see T-53.
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+
+        // Stored first, then the in-memory edge. The database owns the vouch —
+        // the graph is rebuilt from it at construction — so granting trust the
+        // store refused would be a mirror of state nothing holds: invisible,
+        // because `has_vouched` would then stop us ever challenging this peer
+        // again, and gone after a restart. Failing closed instead leaves the
+        // peer exactly where it was, to be challenged again once the cooldown
+        // is up (ADR-018's rule about one commit point per piece of state).
+        if let Err(e) = db.save_vouch(&vouch) {
+            warn!(
+                "{} proved group membership but the vouch would not store ({}) — not trusted",
+                peer, e
+            );
+            return;
+        }
+        trust_graph.write().await.add_vouch(local_id, peer);
+        info!("{} proved group membership — vouching", peer);
+    }
+
+    /// Whether a group-proof message is one a neighbour sent us for itself.
+    ///
+    /// The hint it answers is link-local — a beacon carries `ttl = 1` and is
+    /// never forwarded — so the exchange is too. The peer that handed us the
+    /// packet must be the node the envelope names, and the packet must be
+    /// addressed to this node and no one else. That is what makes both ids in
+    /// the MAC the ones the link itself proved (ADR-021), and it is what stops
+    /// a challenge broadcast to everyone in range from turning every member
+    /// into an answering service.
+    fn is_link_local_group_proof(
+        envelope: &Envelope,
+        peer: NodeId,
+        local_id: NodeId,
+        what: &str,
+    ) -> bool {
+        if envelope.source != peer || peer == local_id {
+            debug!(
+                "Group proof {} from {} claims source {}, dropping",
+                what, peer, envelope.source
+            );
+            return false;
+        }
+        if envelope.destination != local_id {
+            debug!(
+                "Group proof {} from {} is addressed to {}, dropping",
+                what, peer, envelope.destination
+            );
+            return false;
+        }
+        true
+    }
+
+    /// Charge a peer for one piece of proof-exchange work, and say whether it
+    /// may have it.
+    ///
+    /// Answering a challenge and checking a response are both cheap, and both
+    /// are work a stranger can ask for, so they share one per-peer budget.
+    /// Charged to the peer that delivered the packet rather than to the id the
+    /// envelope names, so nobody can spend another node's allowance and keep
+    /// it from ever being vouched.
+    async fn group_proof_work_allowed(
+        peer: NodeId,
+        group: &GroupProofCtx<'_>,
+        rate_limiter: &RwLock<RateLimiter>,
+    ) -> bool {
+        let blacklisted = rate_limiter.read().await.is_blacklisted(&peer);
+        if blacklisted {
+            debug!(
+                "Dropping group proof traffic from blacklisted peer {}",
+                peer
+            );
+            return false;
+        }
+        let allowed = group
+            .limits
+            .write()
+            .await
+            .check_budget(&peer, PROOF_MESSAGES_PER_HOUR);
+        if !allowed {
+            debug!("Rate-limited group proof traffic from {}", peer);
+        }
+        allowed
+    }
+
+    /// Send a payload straight to a neighbour, one hop, no routing.
+    async fn send_link_local(
+        peer: NodeId,
+        payload: Vec<u8>,
+        transport_manager: &TransportManager,
+        lamport_clock: &RwLock<LamportClock>,
+        local_id: NodeId,
+    ) {
+        let clock_val = {
+            let mut clock = lamport_clock.write().await;
+            clock.tick()
+        };
+        let envelope = Envelope {
+            source: local_id,
+            destination: peer,
+            message_id: MessageId::random(),
+            ttl: 1, // link-local: never forwarded, like the beacon it answers
+            hop_count: 0,
+            flags: MessageFlags::SYSTEM,
+            lamport_clock: clock_val.0,
+            device_timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            protocol_version: ProtocolVersion::CURRENT,
+            payload,
+        };
+        let _ = transport_manager.send(&peer, &envelope.serialize()).await;
     }
 
     // --- Flooding ---
