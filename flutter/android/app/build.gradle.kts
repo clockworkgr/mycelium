@@ -54,6 +54,9 @@ tasks.configureEach {
 
 dependencies {
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")
+    // Unit tests for the bridge logic that does not touch the Android
+    // framework. Run with `./gradlew :app:testDebugUnitTest`.
+    testImplementation("junit:junit:4.13.2")
 }
 
 flutter {

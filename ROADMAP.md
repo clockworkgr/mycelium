@@ -1,6 +1,6 @@
 # Mycelium Roadmap
 
-**Last updated:** 2026-11-17 · **Current version:** 0.1 (pre-release)
+**Last updated:** 2026-11-18 · **Current version:** 0.1 (pre-release)
 
 The companion document is [`MYCELIUM_SPEC.md`](MYCELIUM_SPEC.md), which
 specifies the protocol and describes what is built. This document tracks only
@@ -9,12 +9,13 @@ compliance matrix (§20), in [`docs/adr/`](docs/adr/) and in the git history.
 
 ## Baseline
 
-Verified on 2026-11-17 against the working tree, after T-04's group-discovery
-challenge:
+Verified on 2026-11-18 against the working tree, after T-56's socket
+accounting:
 
 | Check | Result |
 |-------|--------|
 | `cargo test --workspace --all-targets` | **649 passed, 0 failed** |
+| `make android-test` (Kotlin bridge, on the JVM) | **16 passed, 0 failed** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
 | `cargo fmt --check` | **clean** |
 | `cd flutter && flutter analyze` | **no issues** |
@@ -26,8 +27,10 @@ them, measured 2026-11-17 — the "~26.6k" carried here before was stale), 49
 Dart files, 38 REST endpoints + 7 WebSocket event types, 64 FFI functions, 20
 wire payload types, 13 database tables.
 
-The Kotlin, Swift and APK rows above are from 2026-11-16: T-04 changes no FFI
-function, no platform bridge and no Dart, so they were not re-run.
+The Kotlin tests are counted apart from the 649 and are run by neither
+`cargo test` nor `make check`; they cover the bridge logic that touches no
+Android framework class. The Swift row is from 2026-11-16: T-56 changes no
+Swift, no Rust, no FFI function and no Dart.
 
 Everything specified for v0.1 is implemented except the items below. The
 remaining work is concentrated in three places: **protocol hardening of
@@ -73,6 +76,59 @@ hint itself is unchanged, as ADR-019 decided. What it left behind is T-51,
 T-52 and T-53, and what it uncovered on the way is that the app never joins a
 group at all (T-51): the exchange is live only on the daemon path.
 
+**Landed 2026-11-18:** T-56 (the Wi-Fi Direct bridge keeps the sixteen-socket
+bound ADR-021 gives it, in both directions). The two defects this task named
+were symptoms of one mistake: the bound was an `AtomicInteger`, and a count
+answers only one of the three questions a socket's slot has to answer. A slot
+is now a **token**, so the count is the number outstanding and cannot drift —
+a double release frees one slot, a release of a token never issued does
+nothing, `stop()` drops tokens rather than zeroing a count, and a handler
+delayed across a stop *and* a start can ask whether its own slot survived,
+which a restart cannot change the answer to. A slot also carries **the socket
+it counts**, so dropping it closes what `stop()` used to leave open, and **the
+generation it was taken in**, which has to be read where the work was justified
+and not where it runs: stamped where the connection event is seen rather than
+inside `requestConnectionInfo`'s callback, and fixed for the life of an accept
+loop along with the one listener that loop owns. The dial takes its slot
+*before* it connects, so the five seconds a connect can take are not five
+seconds of a socket nothing counts and no stop can close. A group disconnect
+begins a new generation as well: leaving it valid let a queued `startServer`
+bind after the teardown and keep this device listening on 9740 even when the
+next group made it a client, a role ADR-003 gives no listener.
+
+The field that holds the listener is only ever changed under `lifecycleLock` —
+deciding, binding and publishing in one critical section, closing and
+unpublishing in another, and both teardowns in theirs — which `stop()` was not
+taking at all and which a bare check-then-assign could not substitute for
+across three threads. The one unlocked read is `startServer`'s early-out, and
+what the field can tell it is that a listener is published and not yet cleaned
+up, which is weaker than healthy: nobody can observe a *closed* listener,
+because closing and unpublishing are one critical section, but a listener that
+has just failed its accept stays published until its `finally` runs. A callback
+landing in that instant schedules nothing, which is part of `T-58`.
+
+Sixteen defects fixed in the bridge: the two the task named, thirteen of the
+review's twenty-four numbered findings, and one pre-existing defect the review
+exposed without naming it. Seven of the thirteen were in the fix rather than in
+the original code, created, worsened or left half-finished by an earlier round
+of it. A rejected
+`executor.execute` is handled too, though nothing shuts that pool down today,
+and one fix is unrelated to the bound: `MAX_FRAME` was the 65535-byte *message*
+limit where what crosses this layer is a 16384-byte *fragment*, so the bridge
+was accepting a frame four times larger than Rust can send. It left `T-58`
+behind — recovery from a failed listener is now possible, but still nothing
+triggers it — and it brought the Kotlin bridges their first unit tests
+(`make android-test`) — but only for the accounting: most of the above is a
+call site, which needs the Android framework, so those are verified by compile,
+by the debug APK and by reading, and the transport has still never run on a
+radio (T-15). Two pre-existing defects turned up on the way: one accept error
+stopped a group owner listening for the rest of that group's life, fixed here
+and recorded in ADR-003's note, and the bridge has no read deadline of its own,
+which since this change holds a slot as well as a thread — left as `T-57`. A
+third, found last: every deadline either platform's bridges keep is measured on
+a wall clock rather than a monotonic one, where Rust measures the same kind of
+deadline from `Instant` — left as `T-59`.
+
 **Landed 2026-11-16:** T-34 (BLE and Wi-Fi Direct prove peer identity instead
 of asserting it: ADR-011's handshake runs over their fragmentation layer, the
 NodeId is derived from the key the peer signed, and the two characteristics and
@@ -87,11 +143,19 @@ and the flood-dedup set expires by age instead of clearing itself — ADR-013).
 T-35's bookkeeping half landed the day before (ADR-012); what remains of it is
 below.
 
-T-34, T-35, T-37 and T-38 came out of reviewing ADRs against the code: T-34
-was the defect T-09 fixed, still open on the local transports; T-35 is a defect
-in the T-06 work; T-37 is what reviewing ADR-010 during T-36 turned up next — an
-emergency broadcast's origin is not authenticated at all; and T-38 is how
-capacity eviction undoes the rollback protection ADR-011 claims.
+T-34, T-35, T-37, T-38, T-56, T-57, T-58 and T-59 came out of reviewing ADRs
+against the code:
+T-34 was the defect T-09 fixed, still open on the local transports; T-35 is a
+defect in the T-06 work; T-37 is what reviewing ADR-010 during T-36 turned up
+next — an emergency broadcast's origin is not authenticated at all; T-38 is how
+capacity eviction undoes the rollback protection ADR-011 claims; T-56 is what
+reviewing ADR-021 during T-04 turned up — the bound that record relies on was
+not kept by the bridge that owns it; and T-57, T-58 and T-59 are what reviewing
+the same records during T-56 turned up next — the sweep ADR-021 gives
+every bridge as a liveness backstop does not reach an established Wi-Fi Direct
+link, the group owner ADR-003 describes does not get its listener back without
+an external event, and every deadline either bridge keeps is measured on a
+clock that NTP can move under it.
 
 **Decided 2026-11-12.** Every P0 below has its design on record: T-14's row
 identity (ADR-017) and T-08 (ADR-020). ADR-014, ADR-015, ADR-016, ADR-018,
@@ -117,47 +181,6 @@ the first two are what a flaky radio will argue with first);
 and the radio features keep "Implemented, untested on hardware" until T-15's
 report, however complete the software tests are — which is why BLE and Wi-Fi
 Direct carry that marker now that T-34 has landed, rather than a better one.
-
-### T-56 · Wi-Fi Direct's native socket count leaks both ways
-
-**Area:** Android Kotlin · **Spec:** §17.3 · **ADR-021**
-
-`WifiDirectService` bounds concurrent native links at `MAX_NATIVE_LINKS = 16`
-with one `AtomicInteger`. Two paths get its accounting wrong, in opposite
-directions.
-
-1. **The refusal path never releases.** Both paths that take a socket
-   increment the counter and then call `handleClient(socket, counted = true)`,
-   which releases it in a `finally`. `handleClient` returns early — *before*
-   that `try` — when the address is one the node recently refused
-   (`WifiDirectService.kt:510`), so the slot is never given back. Sixteen
-   attempts from a refused address exhaust the transport for the life of the
-   service: every later socket, from any peer, is closed as soon as it is
-   accepted. Getting refused is the easy part — fail the handshake once — and
-   sixteen reconnections inside the refusal window finish the job, so a
-   neighbour can do this deliberately, and a legitimate peer that fails the
-   handshake and retries with backoff can do it by accident.
-2. **`stop()` resets the count under live readers.** `stop()` closes the
-   sockets and sets the counter to zero (`WifiDirectService.kt:236`), but each
-   reader thread is still unwinding; its `finally` then decrements a counter
-   that is already zero, leaving it negative by however many readers were
-   alive. A service restarted after that admits 16 *plus* that many sockets.
-
-Neither cancels the other reliably — they depend on different peer behaviour —
-and nothing but a process restart puts the count right. Found while reviewing
-T-04; both belong to the T-34 work (ADR-021), which is where the bound and the
-refusal window came from.
-
-**Acceptance:**
-- Every path that increments `nativeSockets` releases it exactly once,
-  including the refusal path and anything else that returns before the `try`.
-- Stopping and restarting the service leaves the count at zero, whatever the
-  readers were doing — by draining counted readers before resetting, or by
-  making the accounting per service generation so a late `finally` cannot
-  touch the new one.
-- Repeated connections from a refused address leave the capacity unchanged.
-- `./gradlew :app:compileDebugKotlin` and the debug APK still build; the
-  bridge has no unit tests, so say plainly what was verified and what was not.
 
 ### T-51 · The app never joins a group
 
@@ -1119,6 +1142,111 @@ an attacker would send a receipt instead.
 - Test: a packet carrying a forged source leaves the routing table unchanged,
   and the legitimate route for that id still decides where its traffic goes.
 
+### T-57 · A Wi-Fi Direct reader has no liveness deadline of its own
+
+**Area:** Android Kotlin · **Spec:** §8.4, §17.3 · **ADR-021**, **ADR-003**
+
+ADR-021 says a bridge must not depend on the directive queue it polls for a
+socket's lifetime — "a queue it polls is the wrong place to keep a socket's
+lifetime" — and gives each bridge a five-second sweep as its own backstop. One
+of that sweep's listed duties does not exist in the Wi-Fi Direct bridge, and
+the gap is wider than the duty.
+
+`readFrame` reads a type byte, a length, and then the body with
+`readFully`. No socket timeout is set anywhere in `WifiDirectService`, so every
+one of those reads blocks until TCP gives up, which for a peer that vanished
+silently — a phone carried out of range, a process the OS killed — means
+minutes or hours, not seconds. BLE has nothing equivalent to fix because it
+reassembles GATT writes into a frame and can age the partial buffer out
+(`REASSEMBLY_TTL_MS`, swept); a TCP stream has no buffer to sweep, only a
+blocked thread.
+
+Neither sweep covers it, and no `close` arrives. The bridge's sweep closes a
+link **announced but never established**, so a peer that stalls before
+completing ADR-011's handshake is reaped in twenty seconds. Rust's link sweep
+expires only `Stage::Handshaking` past `HANDSHAKE_DEADLINE`, and every other
+`Close` it issues answers an event rather than silence — `link.rs` says it
+outright where it handles `Outcome::Close`: "a proved one does not reach here,
+because a bad frame is dropped". So once the handshake completes, nothing on
+either side of the FFI closes that socket because its peer went quiet.
+Recovery needs TCP to give up, which with no keepalive can take hours, or the
+group to tear down, or the service to stop. T-56 made a group teardown release
+them, so the exposure is bounded by the group's life. A peer whose process
+*dies* is not the case to worry about — the OS closes its descriptors, the
+reader sees EOF or a reset and releases its slot on the way out. The cases that
+hold a slot are a peer that is alive and has stopped reading or writing, and a
+path that fails silently with no FIN or RST, both with the group still up.
+
+Since T-56 this also holds a **budget slot**, so the consequence is the bound
+again: sixteen established links whose peers vanish or stall leave the
+transport unable to accept anything until the service restarts. The token
+accounting cannot see it — the slot is legitimately held by a reader that has
+not finished — which is why it is a separate task and not part of T-56.
+
+Not P0 because it needs a completed handshake, where T-56's refusal leak needed
+only a failed one, and because the unauthenticated case is already swept. Not
+P2 because the outcome is the same dead transport, and the accidental trigger —
+a peer walking out of range — is ordinary use rather than an attack.
+
+**Acceptance:**
+- An established Wi-Fi Direct link whose peer stops reading or writing is
+  closed by the bridge itself, without Rust asking, within a stated bound.
+- The mechanism distinguishes a read stalled **mid-frame** from an idle link
+  between frames: a blanket `soTimeout` would close a healthy link that simply
+  has nothing to say, which is most links most of the time. Either a deadline
+  armed only once a header has been read, or a keepalive whose failure is what
+  closes the link.
+- The slot a stalled reader held is released when it is closed, with the
+  release going through the same `finally` as every other exit.
+- ADR-021's sweep list says which bridges expire a partial frame and which do
+  not, or the duty is implemented on both. The claim and the code agree either
+  way.
+- `make android-test` and `./gradlew :app:compileDebugKotlin` still pass. The
+  bridge has no instrumentation harness, so state what was verified by running
+  it and what by reading.
+
+---
+
+### T-58 · The Wi-Fi Direct group owner does not restore its own listener
+
+**Area:** Android Kotlin · **Spec:** §17.3 · **ADR-003**, **ADR-021**
+
+ADR-003 has the group owner run a `ServerSocket` on 9740 and accept
+connections. The accept loop breaks out on any accept error, and `startServer`
+is reached from exactly one place — the `requestConnectionInfo` callback — so
+after such an error the owner listens again only when another connection event
+arrives, or when the next group forms. Peers already linked keep working;
+nothing new can join.
+
+T-56 fixed the half of this that made recovery impossible: the loop used to
+leave the listener field set, and `startServer` returns early whenever it is,
+so no later callback could help either. It now closes and unpublishes in one
+critical section. What is left is that nothing *triggers* a retry, plus a much
+smaller window on the same path: a listener that has just failed is still
+published until its `finally` runs, so a callback landing in that instant
+schedules nothing and is spent.
+
+The obvious fix — re-enter `startServer` from the `finally` when the exit was
+unexpected (`running` still true, generation unchanged) — needs a bound. A
+listener whose accept fails immediately and repeatedly would otherwise rebind
+and fail in a hot loop, which is worse than not listening.
+
+**Acceptance:**
+- An accept error on the group owner's listener is followed by the bridge
+  listening again, without waiting for a connection event or a new group.
+- Retrying is bounded: a listener that cannot be re-established does not spin.
+  State the bound and what happens when it is exhausted — a log line nobody
+  reads is not an answer, so say where it surfaces.
+- A retry does not fire for an exit that was *not* unexpected: a stop, a group
+  teardown, or a generation that has moved on.
+- A callback that arrives between a listener failing and its cleanup is not
+  silently spent; or if it is, the retry above is what covers it.
+- `make android-test` and `./gradlew :app:compileDebugKotlin` still pass. The
+  bridge has no instrumentation harness, so say what was verified by running
+  it and what by reading.
+
+---
+
 ### T-02 · Mobile platform gaps
 
 **Area:** Android Kotlin, Flutter · **Spec:** §17.3
@@ -1306,6 +1434,47 @@ any commit.
 ---
 
 ## P2 — v0.2
+
+### T-59 · Native deadlines are measured on the wall clock
+
+**Area:** Android Kotlin · iOS Swift · **Spec:** §8.4, §17.3 · **ADR-021**
+
+Every deadline the bridges keep is computed from a wall clock:
+`System.currentTimeMillis()` in both Kotlin bridges, `Date()` in the Swift one.
+A wall clock is not monotonic — NTP corrects it on network attach, and the user
+can set it — so a backward correction holds a link past its deadline and a
+forward one expires a link, or a partial frame, that is making progress. Rust
+gets this right on the other side of the same FFI: `link.rs` and `internet.rs`
+measure from `Instant`, and `sweep` takes its `now` as a parameter, which is
+also why it is tested.
+
+Measured this way: the twenty-second stale-link sweep and the refusal backoff
+on both Android bridges, plus BLE's ten-second reassembly TTL, its write
+quarantine and its pending-setup deadline, and the same set on iOS. Since T-56
+a Wi-Fi Direct link held past its sweep holds a budget slot with it.
+
+P2 rather than P1 because the bridge sweep is a backstop and the deadline that
+matters for an unproved link is Rust's `HANDSHAKE_DEADLINE`, which is monotonic
+and unaffected — so a clock jump mis-times a backstop rather than leaving an
+unproved link open indefinitely.
+
+**Acceptance:**
+- No deadline in a bridge is computed from a wall clock. Android has
+  `SystemClock.elapsedRealtime()`; the Darwin candidates differ in whether time
+  asleep counts. Name the clock each platform uses, and say for each deadline
+  whether sleep should count towards it — a radio that was suspended is not a
+  peer that went silent.
+- A correction in either direction cannot expire a link or a partial frame that
+  is progressing, and cannot extend one past its deadline.
+- The check takes its `now` as a parameter, the way Rust's `sweep` does, so
+  `make android-test` can cover it without a device: a test per deadline that
+  moves the clock backwards and forwards.
+- `make android-test`, `./gradlew :app:compileDebugKotlin` and `swiftc
+  -typecheck` of the iOS `Runner` module all pass. Say what was verified by
+  running it and what by reading; neither bridge has an instrumentation
+  harness (T-15).
+
+---
 
 ### T-53 · Local vouches are stored unsigned
 

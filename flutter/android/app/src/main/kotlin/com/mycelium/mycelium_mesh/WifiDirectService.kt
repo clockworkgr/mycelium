@@ -23,7 +23,6 @@ import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Wi-Fi Direct transport service using Android WifiP2pManager.
@@ -53,7 +52,21 @@ class WifiDirectService(private val context: Context) {
         private const val MSG_FRAME: Byte = 0x02
 
         /** Largest frame accepted in either direction. */
-        private const val MAX_FRAME = 65535
+        /**
+         * Largest frame this layer will read or write.
+         *
+         * It carries *fragments*, so this is the Rust transport's
+         * `WIFI_FRAME_MTU` (16 KB), not its `WIFI_MAX_MESSAGE` (65535). It
+         * held the message limit until T-56 — a leftover from before ADR-022
+         * gave this transport a fragmentation layer — which let a peer's
+         * length prefix claim four times what Rust can emit, and the
+         * reassembler above never sees a frame that long.
+         *
+         * Paired with `WIFI_FRAME_MTU` in `transport/wifi_direct.rs`: a
+         * fragment is a 6-byte header plus `frame_mtu - 6` bytes of payload,
+         * so exactly this many bytes at most.
+         */
+        private const val MAX_FRAME = 16_384
 
         /**
          * How long a link may stay announced without being established
@@ -103,7 +116,10 @@ class WifiDirectService(private val context: Context) {
     // TCP I/O thread pool
     private val executor = Executors.newCachedThreadPool()
 
-    // Group Owner server
+    // Group Owner server. Installed, closed and cleared under
+    // `lifecycleLock`; volatile because `startServer`'s early-out reads it
+    // without the lock, and a stale read there would decide whether to listen.
+    @Volatile
     private var serverSocket: ServerSocket? = null
 
     // Live links: link id -> socket
@@ -120,11 +136,10 @@ class WifiDirectService(private val context: Context) {
     // would never match the socket it is meant to hold off.
     private val refusedUntil = ConcurrentHashMap<String, Long>()
 
-    // Accepted sockets, counted from the accept rather than from
-    // registration: a handler is scheduled asynchronously, so a burst would
-    // otherwise see an empty table and give every socket a reader thread
-    // before anything refused it.
-    private val nativeSockets = AtomicInteger(0)
+    // Native sockets held, bounded at MAX_NATIVE_LINKS. Why they are
+    // counted from the accept rather than from registration, and why a slot
+    // is a token rather than a number, is in LinkBudget.
+    private val linkBudget = LinkBudget(MAX_NATIVE_LINKS)
 
     // Sweep timer
     private var sweeper: ScheduledExecutorService? = null
@@ -228,19 +243,42 @@ class WifiDirectService(private val context: Context) {
         sweeper?.shutdownNow()
         sweeper = null
 
-        for ((linkId, link) in links) {
-            closeQuietly(link)
-            listener?.onLinkDown(linkId)
-        }
-        links.clear()
-        nativeSockets.set(0)
-        linkOpenedAt.clear()
-        establishedLinks.clear()
-        refusedUntil.clear()
+        // Under the lifecycle lock, like every other change to the link
+        // table: a handler that has passed its own checks is mid-registration
+        // and would otherwise install a link after this loop walked past it,
+        // leaving a socket in a table the next service generation keeps. With
+        // the lock held, a registration either finishes first and is torn
+        // down here, or starts afterwards and finds its slot gone — and a
+        // listener cannot be mid-bind, because binding and publishing happen
+        // under this same lock.
+        synchronized(lifecycleLock) {
+            // The listener first: an accept loop blocked on a live server
+            // socket can return a connection at any moment, and nothing
+            // should arrive after this point (ROADMAP T-56).
+            try { serverSocket?.close() } catch (_: Exception) {}
+            serverSocket = null
 
-        // Close server socket
-        try { serverSocket?.close() } catch (_: Exception) {}
-        serverSocket = null
+            for ((linkId, link) in links) {
+                closeQuietly(link)
+                listener?.onLinkDown(linkId)
+            }
+            links.clear()
+            // The link table's two companions, cleared with it rather than
+            // after it: `dropLink` only ever changes them under this lock.
+            linkOpenedAt.clear()
+            establishedLinks.clear()
+            // Dropped rather than zeroed, which does three things a count
+            // could not: the reader threads still unwinding release tokens
+            // that are already gone, so nothing drives the count negative;
+            // a socket accepted but not yet registered is closed here rather
+            // than being left to a handler that has not run; and the new
+            // generation keeps a socket that arrived before this stop out of
+            // the next service (ROADMAP T-56).
+            linkBudget.clear()
+        }
+        // Address-keyed backoff, not link state, and maintained outside the
+        // lock by the sweep.
+        refusedUntil.clear()
 
         // Unregister service and receiver
         manager?.let { mgr ->
@@ -419,42 +457,108 @@ class WifiDirectService(private val context: Context) {
 
     // --- Group Connection Handling ---
 
-    private fun onConnectionInfoAvailable(info: WifiP2pInfo) {
+    private fun onConnectionInfoAvailable(info: WifiP2pInfo, generation: Int) {
         if (!info.groupFormed) return
+
+        // `requestConnectionInfo` answers asynchronously, so this callback can
+        // arrive after the service that asked has been stopped and another
+        // started. Everything below belongs to the group that was current when
+        // the connection event was seen: the role, the listener and the dial
+        // (ROADMAP T-56).
+        if (generation != linkBudget.currentGeneration()) {
+            Log.d(TAG, "Ignoring connection info: the service that asked has been stopped")
+            return
+        }
 
         isGroupOwner = info.isGroupOwner
         Log.i(TAG, "Group formed. isGroupOwner=$isGroupOwner, GO address=${info.groupOwnerAddress}")
 
         if (isGroupOwner) {
-            startServer()
+            startServer(generation)
         } else {
             val goAddress = info.groupOwnerAddress
             if (goAddress != null) {
-                executor.execute { connectToGroupOwner(goAddress.hostAddress ?: return@execute) }
+                executor.execute {
+                    connectToGroupOwner(goAddress.hostAddress ?: return@execute, generation)
+                }
             }
         }
     }
 
     // --- TCP Server (Group Owner) ---
 
-    private fun startServer() {
+    /**
+     * Listen for group clients.
+     *
+     * The loop belongs to **one** listener and **one** service generation,
+     * both fixed before it starts. Reading the `serverSocket` field on each
+     * accept instead let a loop whose service had been stopped accept on the
+     * *replacement* listener, and then refuse that connection as stale —
+     * taking a healthy peer's socket away from the service that was supposed
+     * to have it (ROADMAP T-56).
+     */
+    private fun startServer(generation: Int) {
+        // Unlocked. What the field says is that a listener is published and
+        // has not been cleaned up — not that it is healthy: no one can
+        // observe a *closed* listener here, because closing and unpublishing
+        // happen in one critical section, but a listener that has just failed
+        // its accept is still published until its `finally` runs. A callback
+        // landing in that instant schedules nothing, and since this is the
+        // only caller, the group owner then waits for the next connection
+        // event or the next group (ROADMAP T-58). The authoritative check is
+        // taken again under the lock below.
         if (serverSocket != null) return
 
         executor.execute {
+            // Deciding, binding and publishing are one step, under the lock
+            // `stop()` closes the listener with. Separately, a task scheduled
+            // by a service that has since stopped would bind, pause before
+            // publishing, and escape the teardown entirely — still holding
+            // port $TCP_PORT, so the replacement's own bind fails, while this
+            // task goes on to exit on its stale generation and leave no
+            // listener at all. Nothing retries: `startServer` is only called
+            // from the connection-info callback (ROADMAP T-56).
+            var bound: ServerSocket? = null
+            synchronized(lifecycleLock) {
+                if (generation != linkBudget.currentGeneration()) {
+                    Log.d(TAG, "Not listening: the service that asked has been stopped")
+                } else if (serverSocket != null) {
+                    Log.d(TAG, "Not listening: this service already has a listener")
+                } else {
+                    try {
+                        bound = ServerSocket(TCP_PORT).also { serverSocket = it }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Server start error: ${e.message}")
+                    }
+                }
+            }
+            val server = bound ?: return@execute
+
             try {
-                serverSocket = ServerSocket(TCP_PORT)
                 Log.i(TAG, "TCP server listening on port $TCP_PORT")
 
-                while (running.get()) {
+                while (running.get() && generation == linkBudget.currentGeneration()) {
                     try {
-                        val client = serverSocket?.accept() ?: break
-                        if (nativeSockets.incrementAndGet() > MAX_NATIVE_LINKS) {
-                            nativeSockets.decrementAndGet()
-                            Log.w(TAG, "Refusing a socket: $MAX_NATIVE_LINKS already held")
+                        val client = server.accept()
+                        val slot = linkBudget.take(generation, client)
+                        if (slot == null) {
+                            Log.w(
+                                TAG,
+                                "Closing a socket: $MAX_NATIVE_LINKS already held, " +
+                                    "or the service stopped as it arrived"
+                            )
                             try { client.close() } catch (_: Exception) {}
                             continue
                         }
-                        executor.execute { handleClient(client, counted = true) }
+                        try {
+                            executor.execute { handleClient(client, slot) }
+                        } catch (e: RejectedExecutionException) {
+                            // No reader means no `finally`, so the slot is
+                            // given back here instead.
+                            Log.w(TAG, "No thread to read an accepted socket: ${e.message}")
+                            linkBudget.release(slot)
+                            try { client.close() } catch (_: Exception) {}
+                        }
                     } catch (e: Exception) {
                         if (running.get()) {
                             Log.w(TAG, "Server accept error: ${e.message}")
@@ -462,15 +566,41 @@ class WifiDirectService(private val context: Context) {
                         break
                     }
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Server start error: ${e.message}")
+            } finally {
+                // Closed *and* unpublished in one critical section, under the
+                // lock that installs a listener and the lock both teardowns
+                // take. Two reasons it is not a bare check and assignment:
+                //
+                // A loop that passed the identity check and then paused while
+                // a restart installed a replacement would erase the
+                // replacement's reference, after which no `stop()` can close
+                // it and every later bind fails on the port it still holds.
+                //
+                // And closing before unpublishing leaves the field pointing at
+                // a dead listener for that moment. `startServer` returns early
+                // whenever the field is set, so a connection-info callback
+                // arriving in that window would schedule nothing at all and
+                // leave the group owner with no listener until the next event
+                // — which is the window the early-out's safety depends on not
+                // existing.
+                //
+                // Unpublishing at all is what stops one accept error from
+                // ending the group owner's listening for the rest of that
+                // group's life: the loop breaks out, and `startServer`
+                // returns early for as long as this field is set. That part
+                // is a pre-existing defect, visible once the loop owned its
+                // socket.
+                synchronized(lifecycleLock) {
+                    if (serverSocket === server) serverSocket = null
+                    try { server.close() } catch (_: Exception) {}
+                }
             }
         }
     }
 
     // --- TCP Client (Group Client) ---
 
-    private fun connectToGroupOwner(goIp: String) {
+    private fun connectToGroupOwner(goIp: String, generation: Int) {
         // Checked before the socket is opened: the group's own callbacks
         // fire on every reconnection, and dialling a peer we just refused
         // only to close its socket in `handleClient` is not the holdoff the
@@ -479,19 +609,44 @@ class WifiDirectService(private val context: Context) {
             Log.d(TAG, "Not dialling $goIp: refused recently")
             return
         }
+        val socket = Socket()
+        // The slot is taken before the connect, not after it: the connect
+        // waits up to five seconds, and a socket that exists without a slot
+        // is one the bound does not count and `stop()` cannot close. Repeated
+        // connection-info callbacks each schedule a dial, so several such
+        // sockets can be in flight at once. Taking the slot first also means
+        // a stop closes this socket out from under the connect, which ends it
+        // rather than leaving five seconds of dialling for a service that is
+        // gone (ROADMAP T-56).
+        //
+        // `generation` was taken when the connection event was seen, not
+        // here: this task may already have waited for a thread.
+        val slot = linkBudget.take(generation, socket)
+        if (slot == null) {
+            Log.w(
+                TAG,
+                "Not dialling the GO: $MAX_NATIVE_LINKS already held, " +
+                    "or the service stopped before this dial began"
+            )
+            try { socket.close() } catch (_: Exception) {}
+            return
+        }
+
+        // `handleClient` owns the slot once it has been handed over, and
+        // releases it in its own `finally`.
+        var handedOver = false
         try {
             Log.i(TAG, "Connecting to Group Owner at $goIp:$TCP_PORT")
-            val socket = Socket()
             socket.connect(InetSocketAddress(goIp, TCP_PORT), 5000)
-            if (nativeSockets.incrementAndGet() > MAX_NATIVE_LINKS) {
-                nativeSockets.decrementAndGet()
-                Log.w(TAG, "Not keeping the GO socket: $MAX_NATIVE_LINKS already held")
-                try { socket.close() } catch (_: Exception) {}
-                return
-            }
-            handleClient(socket, counted = true)
+            handedOver = true
+            handleClient(socket, slot)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to connect to GO: ${e.message}")
+        } finally {
+            if (!handedOver) {
+                linkBudget.release(slot)
+                try { socket.close() } catch (_: Exception) {}
+            }
         }
     }
 
@@ -501,18 +656,23 @@ class WifiDirectService(private val context: Context) {
     private fun linkIdFor(socket: Socket): String =
         "${socket.inetAddress?.hostAddress ?: "?"}:${socket.port}"
 
-    private fun handleClient(socket: Socket, counted: Boolean) {
+    private fun handleClient(socket: Socket, slot: Long) {
         val linkId = linkIdFor(socket)
         var announced = false
         // This reader's own connection, so its cleanup cannot remove a
         // replacement that reused the name.
         var mine: LinkConnection? = null
-        if (refused(socket.inetAddress?.hostAddress)) {
-            Log.d(TAG, "Dropping a socket from a peer we just refused: $linkId")
-            try { socket.close() } catch (_: Exception) {}
-            return
-        }
+        // Nothing between the slot being taken and this `try` may return:
+        // the `finally` is the only thing that gives it back, so a return
+        // before the `try` leaves the socket counted for the life of the
+        // service (ROADMAP T-56). The refusal check therefore sits inside
+        // it, and leaves closing the socket to the unannounced branch of
+        // the `finally`, which is what it did by hand.
         try {
+            if (refused(socket.inetAddress?.hostAddress)) {
+                Log.d(TAG, "Dropping a socket from a peer we just refused: $linkId")
+                return
+            }
             val input = DataInputStream(BufferedInputStream(socket.getInputStream()))
             val output = DataOutputStream(BufferedOutputStream(socket.getOutputStream()))
 
@@ -531,6 +691,19 @@ class WifiDirectService(private val context: Context) {
             )
             val connection = LinkConnection(socket, output, writer)
             synchronized(lifecycleLock) {
+                // Two windows, both of which would leave a link from a
+                // stopped service in the table a restarted one keeps,
+                // holding a socket that counts against nothing. `running`
+                // catches a stop already under way; the slot catches one
+                // that has finished, including a stop *and* start that both
+                // happened while this handler waited for a thread — after
+                // which `running` is true again and only the dropped slot
+                // still says so (ROADMAP T-56).
+                if (!running.get() || !linkBudget.holds(slot)) {
+                    writer.shutdownNow()
+                    Log.d(TAG, "Dropping $linkId: its slot did not outlive a stop")
+                    return
+                }
                 val existing = links.putIfAbsent(linkId, connection)
                 if (existing != null) {
                     // The previous socket of the same name may already be
@@ -582,9 +755,7 @@ class WifiDirectService(private val context: Context) {
             } else {
                 try { socket.close() } catch (_: Exception) {}
             }
-            if (counted) {
-                nativeSockets.decrementAndGet()
-            }
+            linkBudget.release(slot)
         }
     }
 
@@ -638,8 +809,13 @@ class WifiDirectService(private val context: Context) {
                             WifiP2pManager.EXTRA_NETWORK_INFO
                         )
                         if (networkInfo?.isConnected == true) {
+                            // Stamped where the event is observed. The
+                            // callback below may not run until after a stop
+                            // and a start, and by then the only thing that
+                            // still says which service asked is this value.
+                            val generation = linkBudget.currentGeneration()
                             manager?.requestConnectionInfo(channel) { info ->
-                                onConnectionInfoAvailable(info)
+                                onConnectionInfoAvailable(info, generation)
                             }
                         } else {
                             handleGroupDisconnected()
@@ -658,15 +834,37 @@ class WifiDirectService(private val context: Context) {
 
     // --- Disconnect Handling ---
 
+    /**
+     * The group went away, which ends every piece of work the group justified.
+     *
+     * All of it under the lifecycle lock, for the reason `stop()` holds it: a
+     * close followed by a clear is two steps, and a queued `startServer`
+     * publishing between them would have its live listener's reference erased,
+     * after which nothing can close it and every later bind fails on the port
+     * it still holds.
+     */
     private fun handleGroupDisconnected() {
         Log.i(TAG, "Wi-Fi Direct group disconnected")
-        for (linkId in links.keys) {
-            dropLink(linkId)
-        }
+        synchronized(lifecycleLock) {
+            // The listener first, so nothing new arrives during the teardown.
+            try { serverSocket?.close() } catch (_: Exception) {}
+            serverSocket = null
 
-        // Close server socket so it can be restarted on next group formation
-        try { serverSocket?.close() } catch (_: Exception) {}
-        serverSocket = null
+            for (linkId in links.keys.toList()) {
+                dropLink(linkId)
+            }
+
+            // Every socket this bridge holds lived inside the group that has
+            // just gone, so there is nothing left for them to count, and a
+            // reader still blocked on one would otherwise hold its slot until
+            // TCP gave up (ROADMAP T-57). Clearing also begins a new
+            // generation, which is what keeps work the *old* group justified
+            // out of the next one: a queued `startServer` would otherwise
+            // still pass its check and leave this device listening on 9740
+            // even when the next group makes it a client, and a queued dial
+            // would still dial (ROADMAP T-56).
+            linkBudget.clear()
+        }
     }
 
     /**

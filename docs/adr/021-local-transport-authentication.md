@@ -420,3 +420,232 @@ The refusal window and the bound both arrived with this ADR, so these are its
 defects rather than later ones. ROADMAP T-56 carries both; nothing in this
 record's reasoning changes, only the claim that the bridge honours it.
 
+## Note (2026-11-18, T-56): the link bound is kept now
+
+The note above recorded that the Android Wi-Fi Direct bridge did not hold the
+sixteen-socket bound this record gives it. It does now. What the fix took is
+worth setting down, because the two defects that note named were symptoms of
+one mistake, and finding them all took four rounds of review.
+
+The bound was an `AtomicInteger`, incremented when a socket was accepted or
+dialled and decremented in the reader's `finally`. A count like that is only
+as good as the pairing of its two halves, and nothing in the code made that
+pairing visible — so it was wrong in both directions at once: a path that
+returned before the `finally` spent a slot for the life of the service, and
+`stop()` zeroing the counter while readers were still unwinding let their
+decrements take it below zero.
+
+A socket's slot has to answer three questions, and a number answers only the
+first:
+
+**Is it still counted?** A slot is now a **token**, and the count is the
+number of tokens outstanding — so releasing one twice frees one slot,
+releasing a token that was never issued does nothing, and the count cannot go
+below zero because a set has no negative size. `stop()` drops every token
+instead of zeroing a count, so a reader unwinding afterwards releases
+something that is already gone. Tokens are never reused, which is what lets a
+handler delayed across a stop *and* a start ask whether its own slot survived:
+a restart cannot change that answer, where the `running` flag is true again
+and says nothing.
+
+**What is it holding?** A slot carries the socket it counts, so dropping a
+slot closes it. `stop()` closed only the links in its table, which left every
+socket that had been accepted but not yet registered open — each would have
+closed itself on reaching its first check, so this was a race rather than a
+leak, but it meant a stopped service still owned sockets while its replacement
+was admitting sixteen more.
+
+**Whose service accepted it?** A slot carries the **generation** it was taken
+in, which `stop()` bumps. This is the one that took three rounds, because it
+is not enough to have the generation: it has to be read where the work was
+*justified*, not where it runs.
+
+- A socket accepted or dialled before a stop can have its slot taken after the
+  restart, from the new service's own budget. The token is legitimate then, so
+  no token check can catch it; a generation stamped before the blocking accept
+  or the five-second connect does.
+- `stop()` cleared the budget inside `lifecycleLock` but closed the listening
+  socket after that block, so an accept loop resuming in between read the
+  *new* generation and accepted a connection belonging to the group being torn
+  down. `stop()` now closes the listener first, which is the right order in
+  any case: stop accepting before tearing down what has been accepted.
+- The accept loop read the `serverSocket` field on every accept, so a loop
+  whose service had been stopped could accept on the *replacement* listener
+  and then refuse that connection as stale — taking a healthy peer's socket
+  away from the service that should have had it. A loop is now bound to one
+  listener and one generation, both fixed before it starts.
+- A **group disconnect** ends the group's work as surely as a stop does, and
+  did not touch the generation: a queued `startServer` still passed its check
+  and left the device listening on 9740 even when the next group made it a
+  client, which is not a role this design gives a group client, and a queued
+  dial still dialled. The disconnect path now clears the budget, which both
+  begins a new generation and closes the sockets — every one of which lived
+  inside the group that has gone.
+- `requestConnectionInfo` answers asynchronously, so its callback can arrive
+  after a stop and a start and stamp the old group's role and dial with the
+  new generation. The stamp is taken where the connection event is observed
+  and carried through the callback into the listener and the dial. On Wi-Fi
+  Direct the group owner's address is the same on both sides of a restart, so
+  a stale dial reaches whatever now answers on it — including this node's own
+  server, which Rust refuses as a link naming us, at the cost of a socket and
+  the handshake deadline.
+
+Two more, in the same work. `stop()` was changing the link table without
+`lifecycleLock` — the lock every other change to it takes — so a handler
+already past its own checks could install a link after the teardown loop had
+walked past it; it now holds the lock, so a registration either finishes first
+and is torn down or starts afterwards and finds its slot gone. And the accept
+loop gives its slot back if there is no thread to read the socket, which is
+unreachable today, since nothing shuts that pool down, but the accounting
+should not rest on that.
+
+**The listener needed the same discipline, and for the same reason.** Deciding
+to listen, binding, publishing the socket, closing it and clearing the field
+were separate steps on a plain `var` written from three threads: the accept
+task, the connection-info callback and `stop()`. A listener could bind and be
+descheduled before publishing, escaping a teardown while still holding port
+9740 — so the replacement's bind failed and, because the escaped task then
+exited on its stale generation, there was no listener at all and nothing to
+retry. A thread checking that the field was still its own and then clearing it
+could erase a replacement installed in between, with the same result. Every
+**mutation** of that field, and every check a decision rests on, is now under
+`lifecycleLock`: the decision,
+the bind and the publish as one critical section — which is also why a bind can
+never be in flight during a teardown — and the two teardowns that read it in
+order to close it.
+
+An accept loop closes the listener it owns inside that same critical section
+as it unpublishes it, which is not where the first version of this note put it.
+Closing first and unpublishing after left the field pointing at a dead listener
+for that moment, and `startServer` returns early whenever the field is set, so
+a connection-info callback arriving in the window scheduled nothing and left
+the group owner with no listener.
+
+One read stays outside the lock: `startServer`'s early-out, which is why the
+field is `@Volatile`. It is worth being exact about what that read can and
+cannot be told. Nobody can observe a *closed* listener, because closing and
+unpublishing are one critical section. But a listener that has just failed its
+accept stays published until its `finally` runs, so the field means "published
+and not yet cleaned up" rather than "healthy", and a callback in that instant
+schedules nothing. Since that callback is the only caller, what follows is a
+group owner waiting for the next connection event or the next group — recorded
+as **ROADMAP T-58**, because closing it means the bridge restoring its own
+listener rather than anything about this record's bound. The liveness half of
+this belongs to ADR-003, whose claim that a group owner accepts connections is
+the one that was not kept, and it has a note there.
+
+One behaviour change beyond the leaks: a slot is refused by comparing before
+taking rather than by incrementing and rolling back, so the count never rises
+above the bound even momentarily, and a concurrent accept cannot be refused a
+slot that was free.
+
+**A pre-existing defect fixed on the way, named because it is not this one.**
+The accept loop breaks out on any accept error, and left `serverSocket`
+pointing at the dead listener; `startServer` returns early while that field is
+set, so a single accept error stopped a group owner listening for the rest of
+that group's life — recovery needed the group to drop, because the disconnect
+path is the only other thing that cleared the field. The loop now closes its
+own listener and clears the field if it is still its own. This became visible
+only once the loop owned its socket, and it is unrelated to the bound. ADR-003
+has the fuller note, since it is that record's claim about a listening group
+owner that was not kept.
+
+### The sweep list, against what the bridges do
+
+That list is described as every bridge's, and on Wi-Fi Direct one of its two
+frame duties was wrong and the other is absent.
+
+**"Refuses one longer than a Rust frame"** was true of the shape and wrong by
+a factor of four. The bridge's `MAX_FRAME` was 65535 — the transport's
+`WIFI_MAX_MESSAGE`, which bounds a *message* — while what crosses this layer
+since ADR-022 gave the transport a fragmentation layer is a *fragment*,
+bounded by `WIFI_FRAME_MTU` at 16 KB. A peer's length prefix could therefore
+claim four times what Rust can emit, for a frame the reassembler above would
+never see. `MAX_FRAME` is now 16384, which is exactly a 6-byte fragment header
+plus `frame_mtu - 6` of payload, so it cannot refuse anything legitimate. The
+limits are per transport and not interchangeable: 512 bytes on BLE, 16384 on
+Wi-Fi Direct.
+
+**"Expires a partial frame after ten seconds"** is simply absent here. BLE does
+that — it reassembles GATT writes into a frame, so a partial frame is a buffer
+with a start time (`REASSEMBLY_TTL_MS`), and the sweep ages it out. The Wi-Fi
+Direct bridge has
+no such buffer: it reads a length-prefixed frame off a TCP stream with
+`readFully`, so a "partial frame" is not a data structure but a blocked read,
+and no socket timeout is set anywhere in that bridge. A peer that sends a
+header announcing a frame and then stops holds the reader thread for as long as
+the TCP connection survives. The sweep cannot help, because it closes links
+that never became *established*, and this one did.
+
+The gap is wider than the duty, and it matters to this note rather than only to
+the sweep. Between frames, `readByte` blocks the same way, so an established
+link whose peer vanished silently — out of range, or killed — is held until TCP
+gives up, and since T-56 it is held *with its slot*. Sixteen of those and the
+bound is exhausted again, by a route the token accounting cannot see, because
+the slot is legitimately held by a reader that has not finished.
+
+Nothing closes such a link at the application level, on either side of the FFI.
+The bridge's sweep closes a link announced but never *established*. The Rust
+link sweep expires only `Stage::Handshaking` past `HANDSHAKE_DEADLINE`, and
+every other `Close` it issues answers an event — not accepting, the link bound,
+a failed handshake queue, a frame on a link nobody announced, our own identity
+on the far end — never silence on a link that is already proved; `link.rs` says
+as much where it handles `Outcome::Close`: "a proved one does not reach here,
+because a bad frame is dropped". So recovery needs TCP itself
+to give up, which with no keepalive set can take hours, or the group to tear
+down, or the service to stop. Since this change a group teardown does release
+them, because the disconnect path clears the budget and closes what it was
+counting.
+
+A peer whose process *dies* is not the case: the OS closes its descriptors, and
+the EOF or reset reaches the reader, which releases its slot on the way out.
+What holds a slot is a peer that is alive and has stopped reading or writing —
+a hung or frozen process — or a path that fails without a FIN or an RST, in
+either case with the group still up.
+
+It is left as **ROADMAP T-57** rather than fixed here. A read deadline is a
+change to the frame reader rather than to the accounting, and the obvious
+implementation — a blanket `soTimeout` — would also close a healthy link that
+simply has nothing to say, so it needs the mid-frame case distinguished from
+the between-frames case, or a keepalive instead. There is no harness here to
+test either.
+
+And a third thing about this list, which applies to every deadline on it rather
+than to one duty: the bridges measure them on a **wall clock**.
+`System.currentTimeMillis()` in both Kotlin bridges, `Date()` in the Swift one.
+That is not a monotonic clock — NTP corrects it when a phone attaches to a
+network, and the user can set it — so a backward correction holds a link past
+its deadline and a forward one expires a link, or a partial frame, that is
+making progress. It is worth naming here because the other side of this same
+FFI gets it right: `link.rs` measures from `Instant`, and its `sweep` takes
+`now` as a parameter, which is why it has tests. The bridges' sweeps read the
+clock themselves, which is why they do not.
+
+This is pre-existing — the deadlines came in with T-34, the change this note's
+record is about — and it is left as **ROADMAP T-59** rather than fixed here,
+because it spans three bridge files and two platforms, and because which clock
+is right is a decision per deadline rather than a substitution: on Android
+`elapsedRealtime()` counts time asleep and `uptimeMillis()` does not, and a
+radio that was suspended is not a peer that went silent. The severity is
+bounded by what still works: an unproved link's real deadline is Rust's
+`HANDSHAKE_DEADLINE`, which is monotonic, so a clock jump mis-times a backstop
+rather than leaving an unproved socket open for good.
+
+### What this is verified by
+
+`LinkBudget` touches no Android framework class, which is the point of its
+being its own file: it has 16 JVM unit tests, the first the Kotlin bridges have
+had, run by `make android-test` and counted apart from the Rust workspace's.
+Eight of the sixteen fail against the old accounting, reimplemented behind the
+same API to check: the capacity after a double release, after a release of a
+token never issued, and after a stop with readers still unwinding; token
+reuse; both generation tests; and the two that ask whether a dropped slot
+closed its socket and a released one did not.
+
+The call sites are **not** covered by those tests, and most of what is
+described above is a call site. They need `WifiP2pManager`,
+`android.util.Log`, a real `ServerSocket` and the broadcast receiver's
+threading, and there is no instrumentation harness in this repository: what
+each call site does with a slot is verified by `:app:compileDebugKotlin`, by
+the debug APK build, and by reading the control flow. Nothing here has run on
+a radio — ROADMAP T-15.

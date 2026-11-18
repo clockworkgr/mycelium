@@ -173,6 +173,21 @@ cargo test -- --nocapture           # With stdout
 RUST_LOG=debug cargo test           # With tracing output
 ```
 
+### Android Bridge Tests
+
+```bash
+make android-test     # cd flutter/android && ./gradlew :app:testDebugUnitTest
+```
+
+JVM unit tests for the Kotlin bridges — the parts that touch no Android
+framework class, so they need neither a device nor an emulator. `LinkBudget`,
+the Wi-Fi Direct socket bound, is the first of them. They are **not** part of
+the 649 above: `cargo test` does not run them, and neither does `make check`.
+
+Gradle 8.10.2 needs JDK 21. A newer JDK fails it with nothing but the version
+number as the error, so `make android-test` uses the JDK Android Studio ships
+unless `JAVA_HOME` is already set.
+
 ### Flutter Tests
 
 ```bash

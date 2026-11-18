@@ -2,7 +2,7 @@
        ios ios-release \
        openwrt openwrt-release \
        flutter-get flutter-gen flutter-analyze flutter-apk flutter-run \
-       check help
+       android-test check help
 
 # --- Rust ---
 
@@ -33,6 +33,21 @@ android:
 
 android-release:
 	./scripts/build-android.sh --release
+
+# JVM unit tests for the Kotlin bridges — the parts that touch no Android
+# framework class, so they need neither a device nor an emulator. Gradle
+# 8.10.2 needs JDK 21 and fails on a newer one with nothing but the version
+# number as the error, so point it at the JDK Android Studio ships — but only
+# when JAVA_HOME is unset *and* that JDK is actually there, so a Linux box or
+# an SDK-only install keeps Gradle's own Java discovery rather than being
+# handed a path that does not exist.
+ANDROID_STUDIO_JBR := /Applications/Android Studio.app/Contents/jbr/Contents/Home
+
+android-test:
+	cd flutter/android && \
+	  jbr="$(ANDROID_STUDIO_JBR)"; \
+	  if [ -z "$$JAVA_HOME" ] && [ -d "$$jbr" ]; then export JAVA_HOME="$$jbr"; fi; \
+	  ./gradlew :app:testDebugUnitTest
 
 # --- iOS Cross-Compilation ---
 
@@ -94,6 +109,7 @@ help:
 	@echo "  Android:"
 	@echo "    android          Cross-compile FFI for Android (debug)"
 	@echo "    android-release  Cross-compile FFI for Android (release)"
+	@echo "    android-test     JVM unit tests for the Kotlin bridges"
 	@echo ""
 	@echo "  iOS:"
 	@echo "    ios              Cross-compile FFI for iOS (debug)"

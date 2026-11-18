@@ -97,3 +97,61 @@ is refused by the receiver's counter floor, which is ADR-021's reason for
 caring.
 
 Appended rather than edited in place, because these records are append-only.
+
+## Note (2026-11-18, T-56)
+
+"The GO runs a `ServerSocket` on port 9740 and accepts TCP connections" was
+not reliably true of the implementation, for a reason that has nothing to do
+with the decision above and everything to do with how the listener was kept.
+
+The accept loop broke out of itself on any accept error, and left the service's
+`serverSocket` field pointing at the dead listener. `startServer` returns early
+whenever that field is set, so **one accept error stopped a group owner
+listening for the rest of that group's life** — silently, because the loop logs
+the error and exits, and nothing retries. Recovery needed the group to drop:
+`handleGroupDisconnected` clears the field, so the next formation could listen
+again, but within one group it never could, however many connection-changed
+broadcasts arrived. The loop now owns its listener, closes it, and clears the
+field if it is still its own, so a group that is still up gets a listener back
+at its next connection event.
+
+An earlier draft of this note said "for the life of the service", which is
+wrong: the disconnect path already cleared the field. The window is one group,
+not the process.
+
+Every mutation of the field that holds the listener, and every check a decision
+rests on, is also serialised under the bridge's lifecycle lock now: the
+decision to listen, the bind and the publish as one critical section, and the
+two teardowns that read it in order to close it. Those were separate steps
+written from three different threads (the accept task, the connection-info
+callback and `stop()`), which let a listener bind and escape a teardown while
+still holding port 9740, and let one thread's clear erase another's live
+listener. Both ended with no listener and a port that nothing could release.
+
+An accept loop closes the listener it owns in the same critical section as it
+unpublishes it: closing first left the field pointing at a dead listener, and
+`startServer` returns early whenever that field is set, so a callback arriving
+in the window scheduled nothing at all.
+
+`startServer`'s early-out is the one read outside the lock, and the field it
+reads means "published and not yet cleaned up", not "healthy" — a listener that
+has just failed its accept is still published until its `finally` runs. A
+callback in that instant schedules nothing, so recovery waits for the next
+connection event or the next group. Restoring a failed listener without waiting
+for an external event is **ROADMAP T-58**; this note's fix is what makes such a
+recovery possible at all, since before it the field stayed set for good.
+
+One more thing this record implies and the bridge did not keep: **"GCs connect
+to the GO's IP"** says a group client does not listen. A `startServer` task
+queued by a group in which this device was the owner survived that group's
+disconnect — nothing invalidated work the old group had justified — so it could
+bind afterwards and leave the device listening on 9740 while the *next* group
+made it a client. The disconnect path now ends the group's work, closing the
+listener, dropping the links and starting a new generation that such a task
+fails.
+
+The GO/GC role split, the port, and both roles sharing one `handleClient` flow
+are unchanged. ROADMAP T-56 was about ADR-021's socket bound; this part of it
+belongs here, because it is this record's claim that was not kept.
+
+Appended rather than edited in place, because these records are append-only.

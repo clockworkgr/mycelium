@@ -1152,7 +1152,11 @@ prefix: the same proof BLE runs now runs here (ADR-021, ROADMAP T-34), over
 the same fragmentation layer, with links named by the remote socket endpoint.
 TCP handles segmentation, so a 16 KB fragment is one TCP frame, and the
 transport MTU is `WIFI_MAX_MESSAGE` (65535) less the 61 bytes sealing costs —
-**65474 bytes per message**. Links are capped at 16.
+**65474 bytes per message**. Links are capped at 16. The Android bridge
+refuses a frame whose length prefix exceeds the *fragment* MTU rather than the
+message MTU — 16384, paired with `WIFI_FRAME_MTU` — because a fragment is what
+crosses that layer (T-56 corrected a 65535 there, left behind when ADR-022
+gave this transport a fragmentation layer).
 
 **LoRa (ADR-008).** Messages are fragmented into frames with a 6-byte header
 (sender tag u16, fragment id u16, index u8, count u8), sized for the peer's
@@ -2383,6 +2387,26 @@ foreground service that keeps the node alive when the UI dies. Permissions:
 `BLUETOOTH_SCAN` (with `neverForLocation`), `BLUETOOTH_ADVERTISE`,
 `BLUETOOTH_CONNECT`, `ACCESS_FINE_LOCATION`, `CAMERA`.
 
+`WifiDirectService` holds at most sixteen native sockets, counted from the
+accept rather than from registration, because a handler is scheduled
+asynchronously and a burst would otherwise get a reader thread each before
+anything refused it. `LinkBudget` keeps that count, and a slot is a token
+rather than a number, so the count is the number outstanding: releasing one
+twice frees one slot, and a reader still unwinding from a stopped service
+releases a token the stop dropped, which cannot spend a slot the restarted
+service holds and cannot drive the count below zero. A slot also carries the
+socket it counts, so a stop closes what it drops instead of leaving it to a
+handler that has not run, and the generation it was taken in, which answers
+"did this service accept this socket". That generation is read where the work
+was justified rather than where it runs: when the connection event is seen,
+carried through `requestConnectionInfo`'s callback, and fixed for the life of
+an accept loop along with the one listener it belongs to. A handler that
+waited for a thread across a stop checks that its own token survived before it
+registers the link, and `stop()` closes the listener before it tears down what
+it accepted. The `AtomicInteger` this replaced leaked in both
+directions (ROADMAP T-56, fixed 2026-11-18); `LinkBudget` has the bridges' only
+unit tests, run by `make android-test` and counted apart from the workspace's.
+
 **iOS** — Swift. `BleService` is dual-role CoreBluetooth with state
 restoration (`CBCentralManagerOptionRestoreIdentifierKey`), `LoraService` is a
 GATT client for external radios, `AppDelegate` hosts the platform channels. The
@@ -2633,7 +2657,7 @@ point into [`ROADMAP.md`](ROADMAP.md).
 | 7.2 | DTN spray-and-wait | **Implemented** | Copies/TTL on the wire (ADR-005), quotas, origin-aware eviction, persisted origin + spray history |
 | 7.4 | Geographic hash overlay | **Planned** | v0.4 |
 | 8.1 | BLE | **Implemented, untested** | Dual-role GATT, fragmentation, write queue, Android + iOS. Peer identity proved by ADR-011's handshake over the frame layer, NodeId derived from the proved key (ADR-021); never run on a radio (T-15) |
-| 8.1 | Wi-Fi Direct | **Implemented, untested** | ADR-003, Android only. Same proved identity as BLE; the bare-NodeId `Hello` is gone (ADR-021); never run on hardware (T-15) |
+| 8.1 | Wi-Fi Direct | **Implemented, untested** | ADR-003, Android only. Same proved identity as BLE; the bare-NodeId `Hello` is gone (ADR-021); the bridge's sixteen-socket bound is kept in both directions (T-56); never run on hardware (T-15) |
 | 8.1 | BT Classic | **Implemented, untested** | Rust + Kotlin SPP + Dart bridge; no hardware test (T-15) |
 | 8.1 | LoRa | **Implemented, untested** | Fragmentation, ADR, duty cycle, broadcast beacons (ADR-008); no hardware test (T-15) |
 | 8.1 | Internet tunnel | **Implemented** | Keyed mutually authenticated channel with per-frame AEAD, binary framing, enforced connection cap, signed and expiring DHT records, bounded iterative lookup (ADR-011) |

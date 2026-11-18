@@ -59,6 +59,7 @@ make flutter-get      # flutter pub get
 make flutter-gen      # dart run ffigen  (after C header changes)
 make flutter-analyze  # flutter analyze
 make flutter-apk      # flutter build apk --debug
+make android-test     # ./gradlew :app:testDebugUnitTest (Kotlin bridges)
 ```
 
 Flutter SDK is at `/Volumes/Tendermint/flutter/` and is not on `PATH` by
@@ -67,6 +68,9 @@ default.
 ### Running tests
 
 - `cargo test` runs the whole workspace (currently 649 tests).
+- `make android-test` runs the Kotlin bridges' JVM tests — the logic that
+  touches no Android framework class. They are **not** part of the 649, and
+  `make check` does not run them.
 - Some `mycelium-node` integration tests take 60+ seconds (DTN fallback).
 - `cargo test -p <crate>` for one crate; `RUST_LOG=debug cargo test` for
   tracing.
@@ -92,6 +96,13 @@ suppress a legitimate warning.
 
 ```bash
 cd flutter && flutter analyze    # zero issues
+```
+
+If any Kotlin file changed:
+
+```bash
+make android-test                # zero failures
+cd flutter/android && ./gradlew :app:compileDebugKotlin
 ```
 
 ### Step 3 — Documentation
@@ -315,7 +326,7 @@ because `mycelium-api` depends on the node library. Run it with
 
 ## Current State
 
-v0.1, pre-release. Verified 2026-11-17: 649 tests pass, clippy clean, fmt
+v0.1, pre-release. Verified 2026-11-18: 649 tests pass, clippy clean, fmt
 clean, `flutter analyze` clean.
 
 - 10 Rust crates (32.1k lines of `src` outside the test modules), 49 Dart
@@ -329,12 +340,10 @@ clean, `flutter analyze` clean.
   Do not re-derive the list from the code; update it as tasks land.
 
 The highest-priority open items (all P0, all defects in shipped features):
-Wi-Fi Direct's native socket count leaking in both directions, which disables
-the transport until the service restarts (`T-56`), the app never joining a
-group at all (`T-51` — the seed-phrase screen stores the phrase locally and
-nothing reads it), emergency co-signer signatures (`T-05`, wire format and
-verification landed; collecting co-signatures is not built), identity key at
-rest (`T-08`).
+the app never joining a group at all (`T-51` — the seed-phrase screen stores
+the phrase locally and nothing reads it), emergency co-signer signatures
+(`T-05`, wire format and verification landed; collecting co-signatures is not
+built), identity key at rest (`T-08`).
 
 Landed: T-36 on 2026-11-12 (ADR-013); T-37, T-39 and T-35 on 2026-11-14
 (ADR-014, ADR-022, ADR-015); T-38 on 2026-11-15 (ADR-016) — persisted DHT
@@ -353,6 +362,14 @@ than a vouch, and the vouch waits for `HMAC(proof_key, nonce ‖ verifier ‖
 responder)`, with `T-51` for the app path that never advertises a hint in the
 first place, `T-52` for the unstretched passphrase derivation behind it and
 `T-53` for vouches being stored unsigned.
+T-56 on 2026-11-18 (ADR-021) — the Wi-Fi Direct bridge keeps the sixteen-socket
+bound it was always documented to keep. A slot is a token, so the count cannot
+leak upward when a path returns early or downward when `stop()` runs under live
+readers; it carries the socket it counts, so a stop closes what it drops; and it
+carries the generation it was taken in, read where the work was justified rather
+than where it runs, so nothing accepted by a stopped service is admitted by its
+replacement. `LinkBudget` brings the Kotlin bridges their first unit tests
+(`make android-test`), which cover the accounting and not the call sites.
 `T-40` collects four LoRa defects found reviewing
 ADR-008 against the code. `T-41` and `T-42` are what T-35 left behind — the
 unconfirmed-handshake record is in memory, so a restart loses both the sweep
